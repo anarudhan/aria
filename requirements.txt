@@ -1,0 +1,18 @@
+# ARIA Framework — Core Requirements
+# ====================================
+# ARIA has NO mandatory pip dependencies.
+# The framework runs on Python standard library alone.
+# Install only what you need based on your LLM provider.
+
+# ── LLM Providers (pick one or both) ─────────────────────────────────────────
+# anthropic>=0.30.0          # Claude (recommended)
+# openai>=1.30.0             # GPT-4o fallback
+
+# ── REST API Server (optional) ───────────────────────────────────────────────
+# fastapi>=0.110.0
+# uvicorn[standard]>=0.29.0
+# websockets>=12.0
+# pydantic>=2.0.0
+
+# ── Install everything at once ───────────────────────────────────────────────
+# pip install aria-framework[all]

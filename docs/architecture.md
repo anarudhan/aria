@@ -1,0 +1,284 @@
+# ARIA Architecture Deep Dive
+
+> For developers who want to understand how the internals work before building on top of ARIA.
+
+---
+
+## The execution pipeline
+
+When you call `aria.run(task, user_id)`, this is the exact sequence of events:
+
+```
+1. PERMISSION CHECK
+   Extract required_capabilities from the call.
+   Check each against the PermissionEngine for this user_id.
+   Fail immediately with PermissionDeniedError if any are missing.
+   No LLM call is made. No work is done.
+
+2. MEMORY RECALL
+   Search the four-ring memory system for context relevant to this task.
+   Flash ring: most recent exchanges (volatile, fast).
+   Hot ring: frequently accessed memories.
+   Warm ring: session-level context.
+   Cold ring: long-term learned patterns.
+
+3. LESSON RECALL (v1.1+)
+   Query the SelfImprovementEngine for lessons from similar past tasks.
+   Inject relevant lessons into the decomposition prompt.
+   "Last time we tried this, the routing to agent X failed because..."
+
+4. TASK DECOMPOSITION
+   Call the LLM with the task + context + lessons.
+   Produce a TaskGenome — a DAG of TaskNode objects.
+   Each node has: description, required_capabilities, dependencies, quality_threshold.
+   Simple tasks produce a single-node genome. Complex tasks produce a multi-layer DAG.
+
+5. COALITION FORMATION
+   For each node in the genome, find the best agent.
+   Match required_capabilities against registered agents using TF-IDF fingerprinting.
+   Blend semantic score (0.6 weight) with empirical routing weight (0.4 weight).
+   Form a coalition: {node_id → agent_id}.
+
+6. PARALLEL EXECUTION
+   Execute the DAG respecting dependency order.
+   Nodes in the same layer run in parallel (asyncio.gather).
+   Each agent receives: node, context (with user_id), memory reference.
+   Agent returns a string result. Node is marked COMPLETED or FAILED.
+
+7. RETROSPECTIVE
+   Score the overall execution quality.
+   Update the Bayesian trust ledger for each agent that participated.
+   Agents that produced high-quality results get higher trust scores.
+   Trust scores influence future coalition formation.
+
+8. LEARNING (v1.1+)
+   Call SelfImprovementEngine.learn_from_execution().
+   Analyze outcome, identify root cause if failed.
+   Record a Lesson with adjustment for next time.
+   Update routing weights for all (agent, task_category) pairs.
+   Check if failure pattern has hit the gap threshold (3 failures).
+   If so, identify a CapabilityGap and propose a solution.
+
+9. MEMORY WRITE (if MEMORY_WRITE permission granted)
+   Store the task, result, and key context in the appropriate memory ring.
+   Future executions can recall this via step 2.
+```
+
+---
+
+## The TaskGenome
+
+The TaskGenome is how ARIA thinks about complex work. Instead of running one big prompt, ARIA decomposes the task into a DAG of smaller, more focused subtasks. Each subtask is assigned to the agent best suited for it.
+
+```python
+@dataclass
+class TaskNode:
+    node_id: str                    # "n1", "n2", etc.
+    description: str                # What this specific subtask does
+    required_capabilities: list[str] # What kind of agent should handle it
+    dependencies: list[str]         # node_ids that must complete first
+    quality_threshold: float        # Minimum acceptable quality (0-1)
+    status: TaskStatus              # PENDING, RUNNING, COMPLETED, FAILED
+    result: Optional[Any]           # The agent's output
+    error: Optional[str]            # Error message if failed
+
+@dataclass
+class TaskGenome:
+    original_task: str
+    nodes: dict[str, TaskNode]
+    execution_layers: list[list[str]]  # Nodes grouped by parallel execution layer
+```
+
+A three-layer genome looks like this:
+
+```
+Layer 1 (parallel):   [n1: Research topic A]  [n2: Research topic B]
+Layer 2 (parallel):   [n3: Synthesize findings]  (depends on n1, n2)
+Layer 3:              [n4: Format final output]   (depends on n3)
+```
+
+---
+
+## The four-ring memory system
+
+```
+┌─────────────────────────────────────────────────────┐
+│  FLASH RING (500 entries, volatile)                 │
+│  Current session context. Cleared on restart.       │
+│  Speed: instant lookup                              │
+├─────────────────────────────────────────────────────┤
+│  HOT RING (2,000 entries)                           │
+│  Frequently accessed, recently used context.        │
+│  Eviction: LRU when capacity is reached.            │
+├─────────────────────────────────────────────────────┤
+│  WARM RING (10,000 entries)                         │
+│  Session-level learning and context.                │
+│  Entries decay in relevance over time.              │
+├─────────────────────────────────────────────────────┤
+│  COLD RING (20,000 entries)                         │
+│  Long-term learned patterns and preferences.        │
+│  Lowest access frequency. Compressed storage.       │
+└─────────────────────────────────────────────────────┘
+```
+
+Memory entries bubble up (cold → warm → hot → flash) as they are accessed more frequently. Entries that are never accessed sink toward cold storage and eventually expire.
+
+---
+
+## The trust ledger
+
+Every agent has a trust record that gets updated after every task it participates in.
+
+```python
+@dataclass
+class TrustRecord:
+    agent_id: str
+    executions: int         # Total tasks participated in
+    successes: int          # Tasks completed above quality threshold
+    failures: int           # Tasks failed or below threshold
+    avg_quality: float      # Running average quality score
+    trust_score: float      # Bayesian-updated trust, 0.0 to 1.0
+    last_updated: float
+```
+
+The trust score influences coalition formation. An agent with trust_score=0.9 on research tasks beats one with trust_score=0.5 even if their semantic similarity scores are equal. Trust is per-agent globally — it is not per-(agent, task_category). The routing weight system (in improvement.py) provides the per-task-category empirical layer.
+
+---
+
+## The permission engine internals
+
+```
+PermissionEngine
+├── _grants: dict[str, list[PermissionGrant]]  # user_id → active grants
+│   Each grant has: grant_id, user_id, capability, scope,
+│                   expires_at, max_uses, uses_so_far
+│
+├── _audit: list[AuditEvent]                    # Append-only, hash-chained
+│   Each event has: timestamp, user_id, capability, scope,
+│                   action (granted/denied/revoked), hash_chain
+│
+└── check(user_id, capability, scope) → bool
+    Iterates active grants for user_id.
+    Checks: capability matches AND scope matches (or grant scope is "*")
+    Checks: not expired (expires_at > now())
+    Checks: not exhausted (max_uses is None or uses < max_uses)
+    If all pass: increment uses_so_far, log audit event, return True.
+    Otherwise: log denied event, return False.
+```
+
+The hash chain in audit events links each event to the previous one via SHA256. This makes the audit trail tamper-evident — if anyone modifies an old event, all subsequent hashes become invalid.
+
+---
+
+## The security scanner internals
+
+Two-pass analysis:
+
+**Pass 1: Regex patterns**
+
+Scans each line of each .py file against a dictionary of regex patterns. Each pattern maps to a severity, category, description, suggestion, and patch_safe flag. Fast. Catches well-known vulnerability patterns.
+
+**Pass 2: AST structural analysis**
+
+Parses each file into an AST. Walks the tree looking for structural issues that regex cannot catch:
+- `str.format_map()` or `str.format()` called with user-controlled input (injection risk)
+- `assert` statements used for security checks (disabled with python -O)
+- Functions that accept `*args` or `**kwargs` without validation
+
+The two passes run independently and their findings are merged into a single ScanReport.
+
+---
+
+## The self-improvement learning cycle
+
+```
+After every task execution:
+
+learn_from_execution(task, result, coalition, genome)
+    │
+    ├── Classify outcome: success / failure / poor_quality / timeout
+    │
+    ├── Analyze root cause:
+    │     If LLM available: send failure details to LLM, get structured analysis
+    │     Heuristic fallback: pattern match on error messages
+    │     Root causes: wrong_agent, decomposition_error, capability_gap,
+    │                  contract_violation, tool_error, ambiguous_task
+    │
+    ├── Record Lesson:
+    │     task_fingerprint (MD5 of normalized task text)
+    │     task_sample (first 100 chars)
+    │     outcome, root_cause, agents_used
+    │     adjustment (what to do differently)
+    │     tags (email, research, writing, etc.)
+    │
+    ├── Update RoutingWeight for each (agent, task_category) pair:
+    │     Incremental running average of quality and success_rate
+    │     Once executions >= 5, weight is "reliable"
+    │
+    └── Track failure patterns:
+          key = f"{task_category}_{root_cause}"
+          _failure_patterns[key] += 1
+          If count >= 3: handle_capability_gap()
+                            Identify gap, propose new agent
+                            If LLM available: get specific proposal
+                            Log gap to _gaps dict
+```
+
+---
+
+## Adding a new agent
+
+The minimum viable agent:
+
+```python
+from aria.agents.base import aria_agent
+
+@aria_agent(
+    capabilities=["list", "of", "capability", "strings"],
+    domains=["domain_name"],
+)
+async def my_agent(node, context, memory):
+    """What this agent does — used for semantic matching."""
+    task = node.description
+    user_id = context.get("user_id")
+    # do the work
+    return "result as string"
+```
+
+Register it:
+
+```python
+aria.register_agents([my_agent])
+```
+
+That is it. ARIA handles routing, quality scoring, trust tracking, and learning from this agent's performance automatically.
+
+---
+
+## Security model
+
+**What ARIA cannot do by default:**
+- Access any resource (files, network, email, calendar)
+- Store anything in long-term memory
+- Spawn or register new agents
+- Modify its own source code
+
+**What grants are required for each category:**
+- Reading user files: `FILE_READ`
+- Writing user files: `FILE_WRITE`
+- Any network call: `NETWORK`
+- Email inbox access: `EMAIL_READ`
+- Email sending (1-hour expiry default): `EMAIL_SEND`
+- Teams channel reading: `TEAMS_READ`
+- Teams posting (1-hour expiry default): `TEAMS_POST`
+- Running generated code: `CODE_EXECUTE`
+- Storing in long-term memory: `MEMORY_WRITE`
+- Security self-patching (30-min expiry): `SELF_MODIFY`
+- Registering new agents: `AGENT_SPAWN`
+
+**Protected files (cannot be auto-patched):**
+- `permissions/engine.py`
+- `security/scanner.py`
+- `security/patcher.py`
+
+These files are excluded from the self-patcher's auto-patch list. Any changes to them require manual human review and application. This prevents a compromised patch from disabling the permission system or falsifying scan results.

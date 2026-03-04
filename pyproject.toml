@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aria-framework"
+version = "1.1.0"
+description = "ARIA — Autonomous Reasoning and Intelligence Architecture. A production grade, self improving, zero trust multi agent AI framework."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Sathis Anarudhan", email = "" }
+]
+keywords = [
+    "ai", "agents", "multi-agent", "autonomous", "llm",
+    "self-improving", "zero-trust", "orchestration"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# No mandatory dependencies — ARIA is deliberately lean.
+# LLM provider SDKs are optional based on which one you use.
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.30.0"]
+openai = ["openai>=1.30.0"]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "websockets>=12.0",
+    "pydantic>=2.0.0",
+]
+all = [
+    "anthropic>=0.30.0",
+    "openai>=1.30.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "websockets>=12.0",
+    "pydantic>=2.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/anarudhan/aria"
+Documentation = "https://github.com/anarudhan/aria/blob/main/README.md"
+Issues = "https://github.com/anarudhan/aria/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aria*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

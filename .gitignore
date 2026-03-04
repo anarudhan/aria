@@ -1,0 +1,107 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables and secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+*.env
+secrets.json
+secrets.yaml
+config.local.yaml
+*_token.txt
+*_key.txt
+
+# ARIA runtime data — generated at runtime, not source code
+aria/data/
+aria_data/
+improvement_data.json
+.patch_backups/
+*.aria_memory
+*.sqlite
+*.db
+
+# Logs
+*.log
+logs/
+log/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Distribution
+*.tar.gz
+*.zip
+dist/
+build/
+
+# ARIA runtime dirs (created automatically)
+.patch_backups/
+aria_data/
