@@ -46,14 +46,13 @@ a plain English description of the risk, and a suggested fix.
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import time
 import uuid
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
 
 # ─── Vulnerability Record ─────────────────────────────────────────────────────
 
@@ -330,7 +329,7 @@ class SecurityScanner:
         scan_dirs = include_dirs or ["core", "agents", "plugins", "permissions", "security"]
         all_vulns: list[Vulnerability] = []
 
-        print(f"\n[Security Scanner] 🔍 Starting scan of ARIA source code...")
+        print("\n[Security Scanner] 🔍 Starting scan of ARIA source code...")
         files_scanned = 0
 
         for subdir in scan_dirs:

@@ -22,18 +22,22 @@ from __future__ import annotations
 
 import asyncio
 import time
-import traceback
-from typing import Optional, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 from .models import (
-    TaskGenome, TaskNode, TaskStatus, ExecutionContract,
-    TaskResult, MemoryRing, AgentMessage, MessageType
+    AgentMessage,
+    ExecutionContract,
+    MemoryRing,
+    TaskGenome,
+    TaskNode,
+    TaskResult,
+    TaskStatus,
 )
 
 if TYPE_CHECKING:
+    from .memory import TemporalMemory
     from .registry import CapabilityRegistry
     from .trust import TrustLedger
-    from .memory import TemporalMemory
 
 
 # ─── Execution Graph Printer ──────────────────────────────────────────────────
@@ -75,7 +79,7 @@ def print_execution_graph(genome: TaskGenome, coalition: dict[str, str]):
 class ExecutionEngine:
     """
     Runs TaskGenome instances, enforcing contracts and managing agent lifecycle.
-    
+
     Usage:
         engine = ExecutionEngine(registry, trust_ledger, memory)
         result = await engine.run(genome, coalition, contract)
@@ -224,7 +228,7 @@ class ExecutionEngine:
     ) -> Any:
         """
         Execute a single node with retry logic and contract enforcement.
-        
+
         Retry strategy: if the first attempt fails and retries are available,
         we try a different agent (not the same one that just failed).
         This is a key ARIA feature — automatic failover to backup agents.

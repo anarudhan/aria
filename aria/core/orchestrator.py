@@ -26,20 +26,17 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
-from .models import (
-    ARIAConfig, ExecutionContract, TaskResult, TaskStatus,
-    MemoryRing, ExecutionMode
-)
-from .registry import CapabilityRegistry
-from .trust import TrustLedger
-from .memory import TemporalMemory
+from ..agents.base import BaseAgent
+from ..permissions.engine import Capability, PermissionDeniedError, PermissionEngine
 from .decomposer import TaskDecomposer
 from .executor import ExecutionEngine
-from ..agents.base import BaseAgent, aria_agent
-from ..permissions.engine import PermissionEngine, Capability, PermissionDeniedError
+from .memory import TemporalMemory
+from .models import ARIAConfig, ExecutionContract, MemoryRing, TaskResult, TaskStatus
+from .registry import CapabilityRegistry
 from .self_aware.consciousness import SelfConsciousness
+from .trust import TrustLedger
 
 
 class ARIAOrchestrator:
@@ -256,7 +253,7 @@ class ARIAOrchestrator:
             self.memory.store(
                 content  = f"Task: {task} → Result: {(result.final_answer or '')[:300]}",
                 ring     = MemoryRing.HOT,
-                tags     = [f"task", f"quality:{result.quality_score:.1f}"],
+                tags     = ["task", f"quality:{result.quality_score:.1f}"],
                 metadata = {"genome_id": genome.genome_id, "agents": list(agents_in_coalition),
                             "quality": result.quality_score, "seconds": result.total_seconds},
                 user_id  = user_id,
@@ -367,7 +364,7 @@ class ARIAOrchestrator:
             print(f"    • {agent['agent_id']:<28} [{', '.join(agent['domains'])}] "
                   f"trust={trust_score:.2f} load={agent['load']}/{agent['max_load']}{suspended}")
 
-        print(f"\n  Memory Rings:")
+        print("\n  Memory Rings:")
         for ring, stats in s['memory'].items():
             if not isinstance(stats, dict):
                 continue
@@ -387,12 +384,17 @@ class ARIAOrchestrator:
 
     def _assess_quality(self, task: str, result: TaskResult) -> float:
         score = 0.5
-        if result.status == TaskStatus.COMPLETED:   score += 0.2
-        elif result.status == TaskStatus.FAILED:    return 0.1
+        if result.status == TaskStatus.COMPLETED:
+            score += 0.2
+        elif result.status == TaskStatus.FAILED:
+            return 0.1
         answer_len = len(result.final_answer or "")
-        if answer_len > 200:    score += 0.15
-        elif answer_len > 50:   score += 0.05
-        elif answer_len < 10:   score -= 0.2
+        if answer_len > 200:
+            score += 0.15
+        elif answer_len > 50:
+            score += 0.05
+        elif answer_len < 10:
+            score -= 0.2
         if result.error_messages:
             score -= 0.1 * len(result.error_messages)
         return max(0.0, min(1.0, score))

@@ -25,13 +25,12 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .models import CapabilityFingerprint, TrustRecord
+    from .models import CapabilityFingerprint
 
-from .models import CapabilityFingerprint, AgentStatus
-
+from .models import AgentStatus, CapabilityFingerprint
 
 # ─── TF-IDF Utilities ─────────────────────────────────────────────────────────
 
@@ -102,16 +101,16 @@ class AgentRegistration:
 class CapabilityRegistry:
     """
     Central registry for all agents in an ARIA deployment.
-    
+
     Agents register their capabilities as natural language text.
     The registry builds TF-IDF vectors for each agent and uses cosine
     similarity to match task requirements to the best available agent.
-    
+
     The IDF (Inverse Document Frequency) component ensures that rare,
     specific capabilities get more weight than common terms like "text" or "process".
     An agent who says it can "generate matplotlib visualization charts" matches
     a "create a chart" task much better than one who just says "handle data".
-    
+
     Usage:
         registry = CapabilityRegistry()
         registry.register(fingerprint, agent_instance)
@@ -164,7 +163,7 @@ class CapabilityRegistry:
     def _rebuild_idf(self):
         """
         Rebuild Inverse Document Frequency weights across all registered agents.
-        
+
         A term that appears in every agent's fingerprint (like "text") gets a low
         IDF weight. A term that appears in only one agent (like "playwright") gets
         a high IDF weight, making that agent strongly preferred for browser tasks.
@@ -206,15 +205,15 @@ class CapabilityRegistry:
     ) -> Optional[str]:
         """
         Find the best available agent for a given task description.
-        
+
         Scoring formula:
             final_score = semantic_similarity * trust_weight * tool_match_bonus
-        
+
         Where:
             semantic_similarity = cosine(task_tfidf, agent_tfidf)
             trust_weight        = agent.trust_score (0.0 to 1.0, default 0.6)
             tool_match_bonus    = 1.2 if agent has all required tools, else 1.0
-        
+
         Returns the agent_id of the best match, or None if no agents available.
         """
         self._rebuild_idf()
@@ -277,9 +276,9 @@ class CapabilityRegistry:
     ) -> dict[str, str]:
         """
         Form a coalition by finding the best agent for each task node.
-        
+
         Returns a mapping of {node_id: agent_id}.
-        
+
         Coalition formation is aware that the same agent may be assigned
         to multiple nodes — it tracks load and avoids overloading any
         single agent when alternatives exist.
