@@ -10,8 +10,6 @@ ECHO never draws conclusions without enough evidence to back them up.
 from __future__ import annotations
 
 import json
-import time
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,10 +18,8 @@ from aria.core.echo import (
     ARIACharacter,
     CharacterTrait,
     ECHOEngine,
-    RelationshipMoment,
     UserProfile,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
