@@ -476,7 +476,6 @@ class PRISMEngine:
         prior = 0.60  # Bayesian prior — our starting estimate
         total_weight = 1.0  # The prior has a weight of 1
 
-        task_lower = task.lower()
         score_sum = prior
 
         # Pull from improvement engine lessons if available
@@ -488,7 +487,6 @@ class PRISMEngine:
 
             if relevant:
                 successes = sum(1 for lsn in relevant if getattr(lsn, 'outcome', '') == "success")
-                sum(1 for lsn in relevant if getattr(lsn, 'outcome', '') == "failure")
                 total     = len(relevant)
 
                 if total > 0:
@@ -499,7 +497,6 @@ class PRISMEngine:
 
         # Pull from trust summaries if available
         if trust_summaries:
-            set(re.findall(r'\b\w{4,}\b', task_lower))
             for agent_id, summary in trust_summaries.items():
                 if not isinstance(summary, dict):
                     continue

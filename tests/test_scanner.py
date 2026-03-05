@@ -1,10 +1,10 @@
 """
 Tests for ARIA Security Scanner
 """
+
 import pytest
-import tempfile
-from pathlib import Path
-from aria.security.scanner import SecurityScanner, ScanReport, Vulnerability
+
+from aria.security.scanner import SecurityScanner
 
 
 @pytest.fixture
