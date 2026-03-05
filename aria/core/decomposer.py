@@ -13,7 +13,7 @@ The decomposer uses an LLM to:
   3. Identify dependencies between subtasks (what must finish before what)
   4. Estimate effort and set execution contracts per subtask
   5. Identify which capabilities and tools each subtask needs
-  
+
 The decomposer also checks the memory system for similar past tasks —
 if we've solved something like this before, we can reuse the genome
 structure and skip the LLM call entirely (or use it as a starting point).
@@ -28,14 +28,9 @@ from __future__ import annotations
 
 import json
 import re
-import time
-from typing import Optional, Any
+from typing import Optional
 
-from .models import (
-    TaskGenome, TaskNode, TaskStatus, ExecutionContract,
-    ARIAConfig, MemoryRing
-)
-
+from .models import ARIAConfig, ExecutionContract, TaskGenome, TaskNode
 
 # ─── Decomposition Prompt Template ────────────────────────────────────────────
 
@@ -88,11 +83,11 @@ RULES:
 class TaskDecomposer:
     """
     Uses an LLM to decompose a natural language task into a TaskGenome.
-    
+
     The decomposer is the most LLM-intensive part of ARIA — it runs once
     per task (not once per subtask). After decomposition, the actual execution
     uses the genome structure to orchestrate agents efficiently.
-    
+
     Memory integration: before calling the LLM, the decomposer searches
     HOT and WARM memory for similar past genomes and provides them as
     context. This improves decomposition quality and reduces hallucination
@@ -119,13 +114,13 @@ class TaskDecomposer:
     ) -> TaskGenome:
         """
         Decompose a task into a TaskGenome.
-        
+
         Args:
             task:             The plain English task description
             agent_summaries:  List of dicts describing available agents
             memory_context:   Relevant past context from memory recall
             contract:         The execution contract for the whole task
-        
+
         Returns:
             A TaskGenome ready for the executor to run
         """
@@ -229,7 +224,7 @@ class TaskDecomposer:
         Compute topological sort in layers.
         Each layer contains nodes that can run in parallel.
         Layer N+1 only starts when all nodes in layer N are done.
-        
+
         Uses Kahn's algorithm for topological sorting.
         """
         in_degree: dict[str, int] = {nid: 0 for nid in genome.nodes}
@@ -277,8 +272,10 @@ class TaskDecomposer:
         word_count = len(tokens)
 
         # Length heuristic
-        if word_count > 50:  score += 0.3
-        elif word_count > 20: score += 0.15
+        if word_count > 50:
+            score += 0.3
+        elif word_count > 20:
+            score += 0.15
 
         # Multi-step keywords
         multi_step_words = {"then", "after", "next", "also", "additionally",

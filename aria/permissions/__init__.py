@@ -1,1 +1,17 @@
-from .engine import PermissionEngine, PermissionGrant, Capability, PermissionDeniedError, CAPABILITY_DESCRIPTIONS, RISK_LEVEL
+from .engine import (
+    CAPABILITY_DESCRIPTIONS,
+    RISK_LEVEL,
+    Capability,
+    PermissionDeniedError,
+    PermissionEngine,
+    PermissionGrant,
+)
+
+__all__ = [
+    "CAPABILITY_DESCRIPTIONS",
+    "RISK_LEVEL",
+    "Capability",
+    "PermissionDeniedError",
+    "PermissionEngine",
+    "PermissionGrant",
+]

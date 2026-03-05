@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional, Any
+from typing import Any, Optional
 
 
 class AnthropicPlugin:
     """
     Anthropic Claude plugin for ARIA.
-    
+
     Usage:
         plugin = AnthropicPlugin(api_key="sk-ant-...", model="claude-sonnet-4-20250514")
         aria = ARIAOrchestrator(config=ARIAConfig(), llm_plugin=plugin)
@@ -67,7 +67,10 @@ class AnthropicPlugin:
             max_tokens = max_tokens,
             messages   = [{"role": "user", "content": prompt}],
         )
-        return response.content[0].text
+        block = response.content[0]
+        if block.type == "text":
+            return block.text
+        return ""
 
     async def chat(
         self,
@@ -77,7 +80,7 @@ class AnthropicPlugin:
     ) -> dict:
         """
         Multi-turn chat with optional tool use. Used by LLMAgent.
-        
+
         Returns:
             {
                 "content":     str,           # Text response
@@ -147,7 +150,7 @@ class AnthropicPlugin:
 class OpenAIPlugin:
     """
     OpenAI GPT plugin for ARIA.
-    
+
     Usage:
         plugin = OpenAIPlugin(api_key="sk-...", model="gpt-4o")
         aria = ARIAOrchestrator(llm_plugin=plugin)

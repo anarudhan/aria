@@ -27,20 +27,15 @@ if those flaws would result in its own modification or shutdown.
 
 from __future__ import annotations
 
-import ast
 import hashlib
-import time
-import os
 import sys
-import json
-import traceback
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
-from ...security.scanner import SecurityScanner, ScanReport
 from ...security.patcher import SelfPatcher
-
+from ...security.scanner import ScanReport, SecurityScanner
 
 # ─── Health Snapshot ─────────────────────────────────────────────────────────
 
@@ -85,30 +80,43 @@ class HealthSnapshot:
         score = 100
 
         # Task reliability (most important signal)
-        if self.error_rate > 0.3:           score -= 30
-        elif self.error_rate > 0.1:         score -= 10
+        if self.error_rate > 0.3:
+            score -= 30
+        elif self.error_rate > 0.1:
+            score -= 10
 
         # Memory pressure
-        if self.memory_flash_usage > 0.9:   score -= 20
-        elif self.memory_flash_usage > 0.7: score -= 10
+        if self.memory_flash_usage > 0.9:
+            score -= 20
+        elif self.memory_flash_usage > 0.7:
+            score -= 10
 
         # Security — penalize by severity category, not individual count
-        if self.critical_vulns > 0:         score -= 20
-        if self.high_vulns > 0:             score -= 10
-        if self.medium_vulns > 5:           score -= 5
+        if self.critical_vulns > 0:
+            score -= 20
+        if self.high_vulns > 0:
+            score -= 10
+        if self.medium_vulns > 5:
+            score -= 5
         # Low-severity findings do not affect the grade
 
         # Agent health
-        if self.agents_suspended > 0:       score -= 10 * min(self.agents_suspended, 2)
+        if self.agents_suspended > 0:
+            score -= 10 * min(self.agents_suspended, 2)
 
         # Scan freshness
-        if self.security_scan_age > 86400:  score -= 10
+        if self.security_scan_age > 86400:
+            score -= 10
 
         score = max(0, score)
-        if score >= 90: return "A"
-        if score >= 80: return "B"
-        if score >= 70: return "C"
-        if score >= 50: return "D"
+        if score >= 90:
+            return "A"
+        if score >= 80:
+            return "B"
+        if score >= 70:
+            return "C"
+        if score >= 50:
+            return "D"
         return "F"
 
 
@@ -212,7 +220,7 @@ class SelfConsciousness:
             if age < self._scan_interval:
                 return self._last_scan_report
 
-        print(f"[Self] 🔍 Running security self-scan...")
+        print("[Self] 🔍 Running security self-scan...")
         report = self.scanner.scan()
         self._last_scan_report = report
         self._last_scan_time   = time.time()
@@ -280,9 +288,9 @@ class SelfConsciousness:
                 remaining = [v for v in post_scan if v.category == vuln.category
                              and v.line_number == vuln.line_number]
                 if remaining:
-                    print(f"[Self] ⚠️  Vulnerability may still exist after patch — manual review recommended")
+                    print("[Self] ⚠️  Vulnerability may still exist after patch — manual review recommended")
                 else:
-                    print(f"[Self] ✅ Vulnerability confirmed resolved")
+                    print("[Self] ✅ Vulnerability confirmed resolved")
             return record.success
         except Exception as e:
             print(f"[Self] ❌ Patch failed: {e}")
@@ -476,7 +484,7 @@ class SelfConsciousness:
         print(f"  Agents:       {health.agents_registered} registered / {health.agents_suspended} suspended")
 
         # Security
-        print(f"\n  Security:")
+        print("\n  Security:")
         if self._last_scan_time:
             age_h = (time.time() - self._last_scan_time) / 3600
             print(f"    Last scan:     {age_h:.1f}h ago")
@@ -496,7 +504,7 @@ class SelfConsciousness:
             print(f"\n  Source Integrity: ✅ All {len(self._integrity_baseline)} files unchanged")
 
         # Memory
-        print(f"\n  Memory:")
+        print("\n  Memory:")
         print(f"    Flash ring:   {health.memory_flash_usage:.0%} full")
         print(f"    Hot ring:     {health.memory_hot_usage:.0%} full")
 
