@@ -20,17 +20,11 @@ Test groups:
 """
 
 import json
-import time
-import tempfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
 
 from aria.core.prism import CalibrationRecord, DriftEvent, PRISMEngine, PRISMState
-
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -129,7 +123,7 @@ class TestPRISMState:
         state.chosen_strategy = "confident"
         state.actual_quality = 0.85
         d = state.to_dict()
-        serialised = json.dumps(d)   # Must not raise
+        json.dumps(d)   # Must not raise
         assert "task_id" in d
         assert "chosen_strategy" in d
         assert d["user_id"] == "alice"

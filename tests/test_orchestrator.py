@@ -2,7 +2,8 @@
 Tests for ARIA Orchestrator
 """
 import pytest
-from aria import ARIAOrchestrator, ARIAConfig, ExecutionContract, aria_agent, Capability
+
+from aria import ARIAConfig, ARIAOrchestrator, Capability, ExecutionContract, aria_agent
 from aria.core.models import TaskStatus
 
 
