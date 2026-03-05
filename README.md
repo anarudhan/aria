@@ -1,16 +1,16 @@
 # ARIA — Autonomous Reasoning and Intelligence Architecture
 
-> Version 1.1.0 | Zero Trust | Self Aware | Self Healing | Self Improving
+> Version 1.2.0 | Zero Trust | Self Aware | Self Healing | Self Improving | Web Native
 
-ARIA is a production grade Python framework for building multi agent AI systems that are genuinely trustworthy. It is not a wrapper around another AI framework. It is built from scratch with four principles that most agent frameworks completely ignore.
+ARIA is a production-grade Python framework for building multi-agent AI systems that are genuinely trustworthy. It is not a wrapper around another AI framework. It is built from scratch with four principles that most agent frameworks completely ignore.
 
 **Zero trust by default.** ARIA cannot read your email, browse the web, write files, or do anything else until you explicitly grant it permission. Every permission has an expiry time and a use limit. There are no hidden capabilities.
 
-**Self awareness.** ARIA knows what it is, what it can and cannot do, and reports its own health and vulnerabilities honestly  even unflattering ones. It hashes its own source files at startup and detects any unexpected changes.
+**Self-awareness.** ARIA knows what it is, what it can and cannot do, and reports its own health and vulnerabilities honestly including the unflattering ones. It hashes its own source files at startup and detects any unexpected changes.
 
-**Self healing.** ARIA scans its own source code for security vulnerabilities, identifies which ones it can safely patch automatically, and applies those patches with your explicit approval. Every patch creates a backup and rolls back automatically if verification fails.
+**Self-healing.** ARIA scans its own source code for security vulnerabilities, identifies which ones it can safely patch automatically, and applies those patches with your explicit approval. Every patch creates a backup and rolls back automatically if verification fails.
 
-**Self improvement.** ARIA learns from every task it runs — what went wrong, which agents performed well, and what gaps exist in its capabilities. When it repeatedly fails at a class of tasks, it identifies the gap, proposes a solution, and with your permission synthesizes a brand new agent to fill that gap.
+**Self-improvement.** ARIA learns from every task it runs including what went wrong, which agents performed well, and what gaps exist in its capabilities. When it repeatedly fails at a class of tasks, it identifies the gap, proposes a solution, and with your permission synthesizes a brand new agent to fill that gap.
 
 ---
 
@@ -25,10 +25,12 @@ Most agent frameworks give you a way to chain LLM calls. ARIA gives you a system
 | Self patching | Yes, with rollback | Not present |
 | Learning from mistakes | Yes, 3 learning layers | Not present |
 | Capability synthesis | Yes, generates new agents | Not present |
-| Health monitoring | Yes, graded A-F | Not present |
+| Health monitoring | Yes, graded A through F | Not present |
 | Source integrity checks | Yes, SHA256 per file | Not present |
 | Human in the loop | Yes, for all side effects | Varies |
-| LLM dependencies | Zero mandatory | Usually 1-3 required |
+| Web search | Claude-native, memory-first | Third-party API |
+| Memory persistence | SQLite, four ring temporal | Flat store or none |
+| LLM dependencies | Zero mandatory | Usually 1 to 3 required |
 
 ---
 
@@ -46,18 +48,22 @@ Most agent frameworks give you a way to chain LLM calls. ARIA gives you a system
 └──┬──────────┬──────────┬──────────┬──────────┬───────────┘
    │          │          │          │          │
 ┌──▼──┐  ┌───▼───┐  ┌───▼───┐  ┌──▼──┐  ┌───▼────────────┐
-│PERM │  │SELF   │  │SECU   │  │MEM  │  │SELF-IMPROVEMENT│
+│PERM │  │SELF   │  │SECU   │  │MEM  │  │SELF IMPROVEMENT│
 │ISSION  │AWARE  │  │RITY   │  │ORY  │  │LEARNING ENGINE │
-│ENGINE  │NESS   │  │SCANNER│  │     │  │                │
+│ENGINE  │NESS   │  │SCANNER│  │SQLite  │                │
 └──┬──┘  └───────┘  └──┬────┘  └─────┘  └────────────────┘
-   │                   │
-   │  grants required  │  findings
    │                   │
 ┌──▼───────────────────▼──────────────────────────────────┐
 │                   AGENT REGISTRY                        │
 │  Registered agents with capability fingerprints         │
 │  Trust ledger updated per outcome                       │
 │  Empirical routing weights from learning engine         │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  WEB AGENT (aria/agents/web_agent.py)           │   │
+│  │  Memory-first → Claude search → DDG fallback    │   │
+│  │  Domain trust scoring — persistent across runs  │   │
+│  └─────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -72,15 +78,17 @@ Most agent frameworks give you a way to chain LLM calls. ARIA gives you a system
 git clone https://github.com/anarudhan/aria.git
 cd aria
 
-# With your LLM provider (pick one)
-pip install anthropic          # for Claude
-pip install openai             # for GPT-4o
+# With Claude (recommended — enables Claude-native web search)
+pip install anthropic httpx
+
+# Optional — full JS page rendering for web browsing
+pip install playwright && playwright install chromium
 ```
 
 ### Run the demo (no API key needed)
 
 ```bash
-# The demo uses a mock LLM — shows all 9 features without any API key
+# The demo uses a mock LLM and shows all features without any API key
 PYTHONPATH=. python examples/demo_v11.py
 ```
 
@@ -131,10 +139,10 @@ asyncio.run(main())
 
 ### `aria/permissions/engine.py` — Zero Trust Permission Engine
 
-Every capability ARIA has is gated by an explicit user grant. The engine uses a default-deny model — if a permission hasn't been granted, the action fails immediately before any LLM call is even made.
+Every capability ARIA has is gated by an explicit user grant. The engine uses a default deny model. If a permission has not been granted, the action fails immediately before any LLM call is even made.
 
 ```python
-# Grant a permission (with expiry and optional use limit)
+# Grant a permission with expiry and optional use limit
 aria.permissions.grant("user_id", Capability.EMAIL_SEND, hours=1, max_uses=5)
 
 # Check a permission (returns bool)
@@ -174,71 +182,142 @@ Capability.WEB_BROWSE         # Browse specific URLs
 
 ---
 
-### `aria/core/improvement.py` — Self Improvement Engine
+### `aria/core/memory.py` — Four Ring Temporal Memory with SQLite
+
+ARIA organises memory into four time-based rings modelled on CPU cache hierarchy. Memory moves between rings automatically. Frequently accessed entries are promoted to faster rings and old untouched entries are demoted.
+
+```
+FLASH  → Session only. RAM only. No persistence. Working variables.
+HOT    → Last 2 hours.  SQLite. Fast recall.
+WARM   → Last 24 hours. SQLite. Today's context.
+COLD   → Up to 30 days. SQLite. Long-term knowledge.
+```
+
+The SQLite backend writes one row per `store()` call regardless of total entry count, consistently under 1ms per write at any scale. The previous JSON design rewrote the entire file on every write and degraded to roughly 100ms per write at 10,000 entries. FLASH stays RAM-only by design because session working memory should never outlive the conversation.
+
+```python
+from aria.core.memory import TemporalMemory
+from aria.core.models import MemoryRing
+
+memory = TemporalMemory(persist_path=".aria/memory.db")
+
+# Store something that survives process restarts for HOT, WARM and COLD rings
+entry_id = memory.store(
+    "User prefers bullet point summaries",
+    ring=MemoryRing.WARM,
+    tags=["preference", "formatting"],
+    user_id="alice",
+)
+
+# Recall by semantic similarity using TF-IDF with no embedding API needed
+results = memory.recall("formatting preference", user_id="alice", top_k=5)
+
+# Recall by exact tag
+results = memory.recall_by_tag("preference", rings=[MemoryRing.HOT, MemoryRing.WARM])
+
+# See ring stats
+print(memory.stats())
+
+# Run maintenance to demote stale entries and evict expired ones
+memory.maintain()
+```
+
+---
+
+### `aria/agents/web_agent.py` — Web Browsing and Search Agent
+
+ARIA's native web agent. Not a tool wrapper but a thinking agent with memory, trust scoring, and permission gates built in from the ground up.
+
+**Search priority**
+
+ARIA checks her own temporal memory first and serves fresh cached results instantly with zero network cost. If nothing fresh is found she uses Claude-native search via Anthropic's `web_search_20260209` tool which is Brave-powered and returns a reasoned cited answer in one API call. If no API key is set she falls back to DuckDuckGo lite which requires zero dependencies.
+
+**Browse strategy**
+
+ARIA checks her own temporal memory first and serves fresh cached page content if the URL was browsed recently. If nothing is cached she tries Playwright for full JS rendering when it is installed, then falls back to requests and finally to urllib which is always available.
+
+**What makes it different from other frameworks' web tools**
+
+Every other framework gives you a function that fetches a URL and returns a string. ARIA's web agent checks its own memory before touching the internet, gates every action through the real permission engine, tracks domain reliability over time with Bayesian scoring, and stores what it learns in the right temporal ring for future use. The Claude search integration means ARIA gets a reasoned synthesised answer rather than raw results that need a second LLM pass to process.
+
+```python
+import os
+from aria.agents.web_agent import create_web_agent
+from aria.permissions.engine import Capability
+
+# Grant permissions first — always required
+aria.permissions.grant("alice", Capability.WEB_SEARCH, hours=4)
+aria.permissions.grant("alice", Capability.WEB_BROWSE, hours=4)
+
+# Create and register the web agent
+web_agent = create_web_agent(
+    permissions=aria.permissions,
+    memory=aria.memory,
+    anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY"),
+    freshness_hours=2,
+    domain_trust_path=".aria/domain_trust.json",
+    max_claude_searches=3,
+)
+aria.register_agent(web_agent)
+```
+
+Domain trust scoring lets ARIA learn which sources are reliable over time:
+
+```python
+print(web_agent.trust_report())
+# [ARIA Web Agent — Domain Trust Report]
+# ██████████  0.95  docs.anthropic.com
+# █████████░  0.90  arxiv.org
+# ███████░░░  0.72  medium.com
+# ████░░░░░░  0.45  somespamsite.com
+```
+
+---
+
+### `aria/core/improvement.py` — Self-Improvement Engine
 
 Three learning layers that run after every task.
 
-**Layer 1: Mistake learning**
+**Layer 1 — Mistake learning**
 
-After every task, ARIA analyses what happened — whether it succeeded, failed, produced poor quality results, or timed out. If the LLM is available, it does a root cause analysis. Otherwise it falls back to heuristic pattern matching. Either way, a lesson is recorded with the root cause and a concrete adjustment for next time. Before future similar tasks, relevant lessons are injected into the decomposition and planning stage.
+After every task ARIA analyses what happened. If the LLM is available it does a root cause analysis. Otherwise it falls back to heuristic pattern matching. A lesson is recorded with the root cause and a concrete adjustment for next time. Relevant lessons are injected into planning before future similar tasks.
 
 ```python
-# Lessons are recalled automatically before each task.
-# You can also query them directly:
 lessons = aria.learning.recall_lessons("write a quarterly report", limit=5)
 for lesson in lessons:
     print(f"{lesson.outcome}: {lesson.adjustment}")
 ```
 
-**Layer 2: Capability gap detection**
+**Layer 2 — Capability gap detection**
 
-When the same category of task fails 3 or more times with the root cause being a missing capability, ARIA identifies a gap and proposes a solution.
+When the same category of task fails 3 or more times with a missing capability as the root cause, ARIA identifies the gap and proposes a solution.
 
 ```python
-# See open gaps
 gaps = aria.learning.get_open_gaps()
 for gap in gaps:
     print(f"{gap.task_type}: failed {gap.failure_count}x")
     print(f"Proposed: {gap.proposed_cap} — {gap.proposed_desc}")
 ```
 
-**Layer 3: Capability synthesis**
+**Layer 3 — Capability synthesis**
 
-With `AGENT_SPAWN` and `CODE_EXECUTE` permissions granted, ARIA can write a new Python agent using its LLM, show you the code for review, and load it into the running system after your explicit approval.
+With `AGENT_SPAWN` and `CODE_EXECUTE` permissions granted, ARIA writes a new Python agent, shows you the code for review, and loads it into the running system after your explicit approval.
 
 ```python
-# Synthesise a new agent to fill a gap
 synth = await aria.learning.synthesize_capability(
     gap_id="abc123",
     user_id="alice",
     permission_engine=aria.permissions,
 )
-# Shows you the generated code. You review it.
-
-# Approve it (your explicit action required)
 aria.learning.approve_capability(synth.cap_id, "alice")
-
-# Load it into the live system
-await aria.learning.load_approved_capability(
-    synth.cap_id, aria, aria.permissions, "alice"
-)
-# ARIA now has a new registered agent
-```
-
-**Routing refinement**
-
-ARIA tracks real observed performance for every (agent, task_category) pair. After 5 executions, the empirical score blends with semantic fingerprint similarity for routing decisions. Agents that claim broad capabilities but consistently underperform get lower routing priority for those task types over time.
-
-```python
-# See the learning summary at any time
-aria.learning.print_learning_report()
+await aria.learning.load_approved_capability(synth.cap_id, aria, aria.permissions, "alice")
 ```
 
 ---
 
 ### `aria/security/scanner.py` — Security Self Scanner
 
-ARIA reads its own source code and identifies vulnerabilities. Two passes: regex pattern matching for known dangerous patterns, and AST structural analysis for deeper issues.
+ARIA reads its own source code and identifies vulnerabilities using two passes — regex pattern matching and AST structural analysis.
 
 ```python
 from aria.security.scanner import SecurityScanner
@@ -247,38 +326,27 @@ scanner = SecurityScanner("/path/to/aria")
 report = scanner.scan()
 report.print_report()
 
-# Filter by severity
 for vuln in report.critical:
-    print(f"{vuln.file_path}:{vuln.line_number} — {vuln.description}")
+    print(f"{vuln.file_path} line {vuln.line_number} — {vuln.description}")
 
-# See what can be auto-patched vs what needs human review
 print(f"Auto-patchable: {len(report.auto_patchable)}")
-print(f"Needs human:    {len(report.requires_human)}")
+print(f"Needs human review: {len(report.requires_human)}")
 ```
-
-Detected vulnerability categories: `arbitrary_code_execution`, `dynamic_import`, `hardcoded_secret`, `unsafe_deserialization`, `shell_injection`, `missing_timeout`, `tls_disabled`, `exception_swallowed`, `insecure_random`, `flagged_debt`, `missing_docstring`.
 
 ---
 
-### `aria/security/patcher.py` — Self-Patcher
+### `aria/security/patcher.py` — Self Patcher
 
-Applies security patches to ARIA's own code with a strict safety protocol: permission check, backup, apply, syntax verify, rollback on failure.
+Applies security patches to ARIA's own code with a strict safety protocol. It performs a permission check, creates a backup, applies the transformation, verifies syntax, and rolls back automatically if verification fails.
 
 ```python
-# Run through the full scan-to-patch flow
-report = scanner.scan()
-
-# Request SELF_MODIFY permission (two-step approval)
 token = aria.self_awareness.request_patch_approval("alice", report, aria.permissions)
-# User sees full details of what will change and confirms
-
 aria.self_awareness.apply_approved_patch(vuln_id, "alice", aria.permissions)
-# Patch applied, backed up, verified. Rolls back automatically if broken.
 
-# Roll back any patch by ID
+# Roll back a specific patch
 patcher.rollback(patch_id)
 
-# Emergency: roll back everything
+# Emergency rollback of everything
 patcher.rollback_all()
 ```
 
@@ -286,26 +354,13 @@ patcher.rollback_all()
 
 ### `aria/core/self_aware/consciousness.py` — Self Consciousness
 
-ARIA's introspective awareness of its own state, health, and integrity.
-
 ```python
-# Full self-report (printed to stdout)
-aria.self_report()
+aria.self_report()                    # Full self-report printed to stdout
 
-# What ARIA knows about itself (returned as string)
-description = aria.what_i_am()
-
-# Health snapshot
 health = aria.health_report()
-print(f"Grade: {health['grade']}")       # A, B, C, D, or F
-print(f"Healthy: {health['is_healthy']}")
-print(f"Error rate: {health['error_rate']:.1%}")
+print(f"Grade: {health['grade']}")   # A, B, C, D, or F
 
-# Source integrity — detects unexpected file changes
-violations = aria.integrity_check()
-if violations:
-    for v in violations:
-        print(f"[{v['change_type']}] {v['file']}")
+violations = aria.integrity_check()   # Detects unexpected file changes
 ```
 
 ---
@@ -322,30 +377,20 @@ from aria.agents.base import aria_agent
 async def email_agent(node, context, memory):
     """
     Handles everything related to email.
-    Reads inbox, searches threads, drafts replies.
-    Never sends without human approval — drafts only.
+    Reads inbox, searches threads, and drafts replies.
+    Never sends without human approval.
     """
-    task = node.description
+    task    = node.description
     user_id = context.get("user_id")
-
-    # Your implementation here
-    # node.description  — the specific subtask for this agent
-    # context           — dict with user_id, tenant_id, etc.
-    # memory            — access to ARIA's memory system
-
     return "Agent result as a string"
 ```
-
-Agents are automatically scored on quality after each execution. The trust ledger updates per agent per task type. Low performing agents get deprioritized for the task types they underperform on.
 
 ---
 
 ## LLM plugins
 
-ARIA is LLM agnostic. Swap providers by changing the plugin.
-
 ```python
-# Anthropic Claude (recommended)
+# Anthropic Claude — recommended, also enables Claude-native web search
 from aria.plugins.llm_plugins import AnthropicPlugin
 plugin = AnthropicPlugin(api_key="sk-ant-...")
 
@@ -353,7 +398,7 @@ plugin = AnthropicPlugin(api_key="sk-ant-...")
 from aria.plugins.llm_plugins import OpenAIPlugin
 plugin = OpenAIPlugin(api_key="sk-...")
 
-# Mock (no API key needed — for testing and demos)
+# Mock — no API key needed, great for testing and demos
 from aria.plugins.llm_plugins import MockPlugin
 plugin = MockPlugin()
 ```
@@ -362,47 +407,9 @@ plugin = MockPlugin()
 
 ## Running the full demo
 
-The demo shows all nine capabilities in sequence. No API key needed — it uses a mock LLM.
-
 ```bash
 PYTHONPATH=. python examples/demo_v11.py
 ```
-
-What each demo shows:
-
-1. Zero trust permission model — granting capabilities, denying unchecked ones
-2. Self awareness — health grade, uptime, agent inventory, memory rings
-3. Security self scan — ARIA reading its own 21 files, finding 22 vulnerabilities in itself
-4. Source integrity — SHA256 hash comparison of all source files
-5. Task execution with learning — running a real task and recording a lesson from the outcome
-6. Failure simulation and gap detection — 3 repeated failures trigger capability gap identification
-7. Capability synthesis — ARIA writes a new agent, shows the code, you approve, it loads live
-8. Empirical routing — blending semantic fingerprinting with real observed performance data
-9. Full learning report — lessons, routing weights, gaps, synthesized capabilities
-
----
-
-## Connecting your GitHub to Claude
-
-Once you push this to GitHub, share the repo with Claude in your Claude Project and Claude will have direct access to the full source. To connect it:
-
-1. Push to GitHub: `git push origin main`
-2. In your Claude Project settings, add the GitHub repository as a connected source
-3. Claude will index all files and can answer questions about specific functions, suggest improvements, write new agents, and debug issues with full context of the codebase
-
----
-
-## Roadmap
-
-These are clean extension points — each one is a new node in the agent graph, no rearchitecting needed.
-
-- Microsoft Graph API integration (Outlook + Teams) — connects to the org AI assistant platform
-- Tavily web search agent — live information retrieval
-- Playwright web browsing agent — full page content extraction
-- python-docx document agent — formatted Word document generation
-- REST API server — FastAPI wrapper exposing ARIA over HTTP/WebSocket
-- LangGraph bridge — run ARIA agents inside a LangGraph supervisor graph
-- Async batch execution — run multiple independent tasks in parallel pipelines
 
 ---
 
@@ -410,47 +417,49 @@ These are clean extension points — each one is a new node in the agent graph, 
 
 ```
 aria/
-├── aria/                          # Core framework package
-│   ├── __init__.py                # Public API exports
+├── aria/
+│   ├── __init__.py
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   └── base.py                # BaseAgent, aria_agent decorator, registry
+│   │   ├── base.py                # BaseAgent, aria_agent decorator, registry
+│   │   └── web_agent.py           # Web search and browsing agent (Claude-native)
 │   ├── core/
 │   │   ├── __init__.py
-│   │   ├── models.py              # ARIAConfig, TaskGenome, TaskResult, etc.
-│   │   ├── orchestrator.py        # ARIAOrchestrator — the main entry point
-│   │   ├── decomposer.py          # Task → DAG decomposition
-│   │   ├── executor.py            # Parallel DAG execution engine
-│   │   ├── memory.py              # Four-ring memory system
-│   │   ├── registry.py            # Agent registry with semantic fingerprinting
-│   │   ├── trust.py               # Bayesian trust ledger per agent
-│   │   ├── improvement.py         # Self-improvement and learning engine
+│   │   ├── models.py
+│   │   ├── orchestrator.py
+│   │   ├── decomposer.py
+│   │   ├── executor.py
+│   │   ├── memory.py              # Four-ring temporal memory with SQLite backend
+│   │   ├── registry.py
+│   │   ├── trust.py
+│   │   ├── improvement.py
 │   │   └── self_aware/
 │   │       ├── __init__.py
-│   │       └── consciousness.py   # Health monitoring, source integrity
+│   │       └── consciousness.py
 │   ├── permissions/
 │   │   ├── __init__.py
-│   │   └── engine.py              # Zero-trust permission engine
+│   │   └── engine.py
 │   ├── security/
 │   │   ├── __init__.py
-│   │   ├── scanner.py             # Source code vulnerability scanner
-│   │   └── patcher.py             # Self-patcher with rollback
+│   │   ├── scanner.py
+│   │   └── patcher.py
 │   └── plugins/
 │       ├── __init__.py
-│       └── llm_plugins.py         # Anthropic, OpenAI, Mock plugins
+│       └── llm_plugins.py
 ├── examples/
-│   ├── demo_v11.py                # Full v1.1.0 demo (all 9 features)
-│   └── full_demo.py               # Original v1.0 demo
+│   ├── demo_v11.py
+│   └── full_demo.py
 ├── tests/
 │   ├── test_permissions.py
 │   ├── test_improvement.py
 │   ├── test_scanner.py
-│   └── test_orchestrator.py
+│   ├── test_orchestrator.py
+│   └── test_web_agent.py
 ├── docs/
 │   └── architecture.md
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                 # GitHub Actions CI pipeline
+│       └── ci.yml
 ├── pyproject.toml
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -463,21 +472,22 @@ aria/
 
 ## Version history
 
+**v1.2.0** (March 2026)
+
+SQLite memory backend bringing 27x faster writes and proper persistence across restarts. FLASH ring stays RAM-only by design because session working memory should never touch disk. Web agent with Claude native search using tool version web_search_20260209 powered by Brave. Memory first retrieval checks temporal memory before any network call. Domain trust scoring uses Bayesian reliability tracking that persists across sessions. DuckDuckGo lite fallback works with zero dependencies when no API key is set. Playwright and requests and urllib form a graceful degradation chain for page browsing. Content fingerprinting detects page changes and avoids redundant re fetches. 70 tests passing across all modules.
+
 **v1.1.0** (March 2026)
-- Zero trust permission engine with 17 capability types
-- Self consciousness module with health grading and source integrity
-- Security self scanner with two-pass analysis across 21 source files
-- Self-patcher with automatic rollback on verification failure
-- Self-improvement engine: mistake learning, capability gap detection, capability synthesis
-- Empirical routing weights blending semantic fingerprinting with real performance data
+
+Zero-trust permission engine with 17 capability types. Self-consciousness module with health grading and source integrity checking. Security self-scanner with two-pass analysis across 21 source files. Self patcher with automatic rollback on verification failure. Self improvement engine covering mistake learning, gap detection, and capability synthesis. Empirical routing weights blending semantic fingerprinting with real observed performance data.
 
 **v1.0.0** (February 2026)
-- Multi agent orchestrator with supervisor pattern
-- TaskGenome DAG decomposition
-- Four ring temporal memory system
-- Bayesian trust ledger per agent
-- LLM plugin system (Anthropic, OpenAI, Mock)
+
+Multi-agent orchestrator with supervisor pattern. TaskGenome DAG decomposition. Four-ring temporal memory system. Bayesian trust ledger per agent. LLM plugin system supporting Anthropic, OpenAI, and Mock.
 
 ---
 
-*Built with zero mandatory dependencies. Runs on Python 3.10+.*
+*Built with zero mandatory dependencies. Runs on Python 3.10 and above.*
+
+*Web search requires httpx and an Anthropic API key for Claude native search.*
+
+*Page browsing with full JS rendering requires playwright.*
