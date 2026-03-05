@@ -7,16 +7,14 @@ domain trust scoring, and graceful degradation.
 """
 
 import asyncio
-import json
 import os
-import tempfile
 import time
+
 import pytest
 
+from aria.agents.web_agent import DomainTrustStore, WebAgent, _clean_text, _fingerprint
 from aria.core.memory import TemporalMemory
-from aria.core.models import MemoryRing, TaskNode, ExecutionContract
-from aria.agents.web_agent import WebAgent, DomainTrustStore, _clean_text, _fingerprint
-
+from aria.core.models import ExecutionContract, MemoryRing, TaskNode
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -29,7 +27,7 @@ class MockPermissions:
     def require(self, user_id: str, capability):
         cap_name = capability.value if hasattr(capability, "value") else str(capability)
         if cap_name in self._denied or cap_name not in self._granted:
-            from aria.permissions.engine import PermissionDeniedError, Capability
+            from aria.permissions.engine import Capability, PermissionDeniedError
             # Find matching Capability enum or use first as placeholder
             cap_enum = capability if isinstance(capability, Capability) else Capability.NETWORK
             raise PermissionDeniedError(user_id=user_id, capability=cap_enum)
@@ -309,7 +307,6 @@ class TestWebAgent:
             user_id  = "user1",
         )
         # Override created_at to be old
-        import aria.core.memory as m_module
         for ring_store in mem._rings.values():
             for entry in ring_store.values():
                 if "old-article" in " ".join(entry.tags):

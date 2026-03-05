@@ -1,11 +1,12 @@
 """
 Tests for ARIA Self-Improvement Engine
 """
-import pytest
-import asyncio
 import time
-from aria.core.improvement import SelfImprovementEngine, Lesson, CapabilityGap
-from aria.core.models import TaskResult, TaskStatus, TaskGenome, TaskNode
+
+import pytest
+
+from aria.core.improvement import Lesson, SelfImprovementEngine
+from aria.core.models import TaskGenome, TaskNode, TaskResult, TaskStatus
 
 
 @pytest.fixture
