@@ -42,6 +42,7 @@ from typing import Optional
 from ..agents.base import BaseAgent
 from ..permissions.engine import Capability, PermissionDeniedError, PermissionEngine
 from .decomposer import TaskDecomposer
+from .echo import ECHOEngine
 from .executor import ExecutionEngine
 from .memory import TemporalMemory
 from .models import ARIAConfig, ExecutionContract, MemoryRing, TaskResult, TaskStatus
@@ -115,12 +116,15 @@ class ARIAOrchestrator:
         # PRISM — cognitive engine that runs before, during, and after every task
         self.prism = PRISMEngine(persist_path=self.config.memory_persist_path)
 
+        # ECHO — identity engine that builds relational and character models over time
+        self.echo = ECHOEngine(persist_path=self.config.memory_persist_path)
+
         # Initialize self-awareness baseline
         self.self_awareness.initialize(self)
 
         print("=" * 62)
         print("  ARIA — Autonomous Reasoning and Intelligence Architecture")
-        print("  Version 1.2.0 | Zero-Trust | Self-Aware | PRISM-Guided")
+        print("  Version 1.3.0 | Zero-Trust | PRISM-Guided | ECHO-Aware")
         print("=" * 62)
 
     # ── Agent Registration ─────────────────────────────────────────────────────
@@ -232,12 +236,16 @@ class ARIAOrchestrator:
         )
 
         # Inject PRISM context into memory context so the decomposer
-        # LLM knows exactly what PRISM thinks before it plans the task
+        # LLM knows exactly what PRISM thinks before it plans the task.
+        # Then inject ECHO context so the LLM also knows who this person
+        # is and how to communicate with them from the very first word.
         prism_context = prism_state.to_context_string()
+        echo_context  = self.echo.enrich_context(user_id=user_id, task=task)
+        combined_context = f"{prism_context}\n\n{echo_context}"
         if memory_context:
-            memory_context = prism_context + "\n\n" + memory_context
+            memory_context = combined_context + "\n\n" + memory_context
         else:
-            memory_context = prism_context
+            memory_context = combined_context
 
         # ── Step 2: Decompose ──────────────────────────────────────────────────
         if skip_decomposition:
@@ -324,6 +332,22 @@ class ARIAOrchestrator:
         # Attach PRISM state to result metadata for downstream inspection
         result.metadata = getattr(result, "metadata", {})
         result.metadata["prism"] = prism_state.to_dict()
+
+        # ── Step 5c: ECHO Observe ──────────────────────────────────────────────
+        # ECHO learns from this interaction — who this person is, how they work,
+        # and what ARIA's own behavioral patterns look like across all users.
+        # This is what makes ARIA more personal and more herself over time.
+        self.echo.observe(
+            user_id    = user_id,
+            task       = task,
+            quality    = result.quality_score,
+            status     = outcome,
+            prism_state = prism_state,
+        )
+        result.metadata["echo_profile"] = (
+            self.echo.get_profile(user_id).to_dict()
+            if self.echo.get_profile(user_id) else {}
+        )
 
         # ── Step 6: Retrospective ──────────────────────────────────────────────
         if self.config.enable_retrospective and result.status == TaskStatus.COMPLETED:
@@ -441,6 +465,43 @@ class ARIAOrchestrator:
         Useful for dashboards, logging, or programmatic inspection.
         """
         return self.prism.calibration_report()
+
+    # ── ECHO Interface ────────────────────────────────────────────────────────
+
+    def echo_report(self) -> None:
+        """
+        Print ECHO's character report.
+
+        Shows who ARIA has become through accumulated experience — her
+        defining traits, her domain strengths, and her relational network.
+        Also shows what ECHO knows about each person she has worked with.
+        """
+        self.echo.print_character_report()
+
+    def echo_character(self) -> dict:
+        """Return ARIA's full character profile as a dictionary."""
+        return self.echo.character_report()
+
+    def echo_user_profile(self, user_id: str) -> None:
+        """Print everything ECHO knows about a specific user."""
+        self.echo.print_user_profile(user_id)
+
+    def echo_stats(self) -> dict:
+        """
+        Return a summary of ECHO's current state — user count,
+        character maturity, and relationship depths.
+        """
+        char = self.echo.character_report()
+        profiles = {
+            uid: self.echo.get_profile(uid).to_dict()
+            for uid in self.echo.all_user_ids()
+            if self.echo.get_profile(uid)
+        }
+        return {
+            "character":       char,
+            "user_profiles":   profiles,
+            "users_known":     len(profiles),
+        }
 
     # ── Inspection and Management ──────────────────────────────────────────────
 
