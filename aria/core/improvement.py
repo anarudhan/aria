@@ -40,17 +40,15 @@ User permission is still required for any code modification.
 from __future__ import annotations
 
 import ast
-import asyncio
+import hashlib
 import json
 import re
 import textwrap
 import time
 import uuid
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Any
-
+from typing import Optional
 
 # ─── Lesson ──────────────────────────────────────────────────────────────────
 
@@ -321,9 +319,9 @@ class SelfImprovementEngine:
         Find lessons relevant to an incoming task.
         Called by the orchestrator before decomposition — lessons shape planning.
         """
-        relevant = [l for l in self._lessons if l.matches(task)]
+        relevant = [ls for ls in self._lessons if ls.matches(task)]
         # Sort: failures first (more important to avoid), then by recency
-        relevant.sort(key=lambda l: (l.outcome != "failure", -l.learned_at))
+        relevant.sort(key=lambda ls: (ls.outcome != "failure", -ls.learned_at))
         return relevant[:limit]
 
     def format_lessons_for_prompt(self, task: str) -> str:
@@ -332,9 +330,9 @@ class SelfImprovementEngine:
         if not lessons:
             return ""
         lines = ["Past experience with similar tasks:"]
-        for l in lessons:
-            icon = "❌" if l.outcome == "failure" else "⚠️" if l.outcome == "poor_quality" else "✅"
-            lines.append(f"{icon} {l.task_sample[:60]}: {l.adjustment[:100]}")
+        for ls in lessons:
+            icon = "❌" if ls.outcome == "failure" else "⚠️" if ls.outcome == "poor_quality" else "✅"
+            lines.append(f"{icon} {ls.task_sample[:60]}: {ls.adjustment[:100]}")
         return "\n".join(lines)
 
     # ── Routing Intelligence ───────────────────────────────────────────────────
@@ -585,7 +583,7 @@ class SelfImprovementEngine:
                     break
 
             if not loaded_agent:
-                print(f"[Learning] ❌ No @aria_agent found in generated code")
+                print("[Learning] ❌ No @aria_agent found in generated code")
                 return False
 
             orchestrator.register_agent(loaded_agent)
@@ -616,24 +614,24 @@ class SelfImprovementEngine:
 
         print(f"\n  Lessons Learned: {len(self._lessons)}")
         outcomes = {}
-        for l in self._lessons:
-            outcomes[l.outcome] = outcomes.get(l.outcome, 0) + 1
+        for ls in self._lessons:
+            outcomes[ls.outcome] = outcomes.get(ls.outcome, 0) + 1
         for outcome, count in sorted(outcomes.items()):
             icon = {"success": "✅", "failure": "❌", "poor_quality": "⚠️",
                     "timeout": "⏱️", "partial": "◑"}.get(outcome, "?")
             print(f"    {icon} {outcome:<15} {count}")
 
         if self._lessons:
-            recent = sorted(self._lessons, key=lambda l: -l.learned_at)[:3]
-            print(f"\n  Most Recent Lessons:")
-            for l in recent:
-                print(f"    • [{l.outcome}] {l.task_sample[:50]}")
-                print(f"      → {l.adjustment[:70]}")
+            recent = sorted(self._lessons, key=lambda ls: -ls.learned_at)[:3]
+            print("\n  Most Recent Lessons:")
+            for ls in recent:
+                print(f"    • [{ls.outcome}] {ls.task_sample[:50]}")
+                print(f"      → {ls.adjustment[:70]}")
 
         print(f"\n  Routing Weights: {len(self._routing_weights)} agent-category pairs tracked")
         if self._routing_weights:
             best = sorted(self._routing_weights.values(), key=lambda w: -w.empirical_score)
-            print(f"  Top performers:")
+            print("  Top performers:")
             for w in best[:3]:
                 if w.is_reliable:
                     print(f"    • {w.agent_id:<20} on {w.task_category:<15} "
@@ -656,7 +654,7 @@ class SelfImprovementEngine:
         return {
             "lessons_total":      len(self._lessons),
             "lessons_by_outcome": {
-                k: sum(1 for l in self._lessons if l.outcome == k)
+                k: sum(1 for ls in self._lessons if ls.outcome == k)
                 for k in ["success", "failure", "poor_quality", "timeout", "partial"]
             },
             "open_gaps":          len(self.get_open_gaps()),
@@ -783,7 +781,7 @@ class SelfImprovementEngine:
         )
         self._gaps[gap_key] = gap
 
-        print(f"\n[Learning] 🔴 New capability gap identified!")
+        print("\n[Learning] 🔴 New capability gap identified!")
         print(f"  Task type:   {task_category}")
         print(f"  Root cause:  {root_cause}")
         print(f"  Suggested:   {proposed_cap} — {proposed_desc}")
@@ -853,17 +851,17 @@ class SelfImprovementEngine:
             data = {
                 "lessons": [
                     {
-                        "lesson_id":  l.lesson_id,
-                        "task_sample": l.task_sample,
-                        "outcome":    l.outcome,
-                        "root_cause": l.root_cause,
-                        "agents_used": l.agents_used,
-                        "quality_score": l.quality_score,
-                        "adjustment": l.adjustment,
-                        "learned_at": l.learned_at,
-                        "tags":       l.tags,
+                        "lesson_id":  ls.lesson_id,
+                        "task_sample": ls.task_sample,
+                        "outcome":    ls.outcome,
+                        "root_cause": ls.root_cause,
+                        "agents_used": ls.agents_used,
+                        "quality_score": ls.quality_score,
+                        "adjustment": ls.adjustment,
+                        "learned_at": ls.learned_at,
+                        "tags":       ls.tags,
                     }
-                    for l in self._lessons[-1000:]  # Keep last 1000 lessons
+                    for ls in self._lessons[-1000:]  # Keep last 1000 lessons
                 ],
                 "routing_weights": {
                     k: {
@@ -895,8 +893,8 @@ class SelfImprovementEngine:
     def _load(self):
         try:
             data = json.loads(self._persist_path.read_text())
-            for l in data.get("lessons", []):
-                lesson = Lesson(**{k: v for k, v in l.items() if k in Lesson.__dataclass_fields__})
+            for entry in data.get("lessons", []):
+                lesson = Lesson(**{k: v for k, v in entry.items() if k in Lesson.__dataclass_fields__})
                 self._lessons.append(lesson)
             for k, w in data.get("routing_weights", {}).items():
                 self._routing_weights[k] = RoutingWeight(**w)

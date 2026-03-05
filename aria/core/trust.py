@@ -24,13 +24,11 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
-from dataclasses import dataclass, asdict
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
 from .models import TrustRecord
 from .registry import tokenize
-
 
 # ─── Category Detection ───────────────────────────────────────────────────────
 
@@ -75,15 +73,15 @@ def detect_category(task_description: str) -> str:
 class TrustLedger:
     """
     Maintains the trust history for all agents across all task categories.
-    
+
     The ledger is the long-term memory of ARIA's routing intelligence.
     Every completed task leaves a record here, and future routing decisions
     use these records to weight agent selection.
-    
+
     Persistence: optionally writes to a JSON file on disk so trust history
     survives across ARIA restarts. Without persistence, every restart resets
     trust to the prior (0.6 for all agents).
-    
+
     Usage:
         ledger = TrustLedger(persist_path="./aria_trust.json")
         ledger.record_success("agent_web", "research the latest AI news", quality=0.9, seconds=12.0)
@@ -146,7 +144,7 @@ class TrustLedger:
     def get_trust_score(self, agent_id: str, task_description: str) -> float:
         """
         Get the trust score for an agent on a given task type.
-        
+
         If the agent has no history for this specific category, falls back
         to its overall score, then to the prior (0.6).
         """

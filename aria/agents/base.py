@@ -6,13 +6,13 @@ The building blocks for all agents in an ARIA system.
 Two ways to create an ARIA agent:
 
 1. Subclass BaseAgent and implement the execute() method:
-   
+
        class MyAgent(BaseAgent):
            async def execute(self, node, context, memory):
                return await my_tool(node.description)
 
 2. Use the @aria_agent decorator to wrap any Python function:
-   
+
        @aria_agent(
            capabilities=["search the web", "find information"],
            domains=["research"],
@@ -20,9 +20,9 @@ Two ways to create an ARIA agent:
        )
        async def web_search_agent(node, context, memory):
            return await tavily.search(node.description)
-   
+
 3. Use LLMAgent with a list of callable tools:
-   
+
        agent = LLMAgent(
            agent_id="researcher",
            capabilities=["research", "summarize articles"],
@@ -37,25 +37,25 @@ with full trust ledger integration, contract enforcement, and memory access.
 
 from __future__ import annotations
 
-import time
 import asyncio
 import functools
 import inspect
-from typing import Optional, Any, Callable, Awaitable
 from abc import ABC, abstractmethod
+from typing import Any, Callable, Optional
 
 from ..core.models import (
-    TaskNode, TaskStatus, CapabilityFingerprint,
-    ExecutionContract, AgentMessage, MessageType, MemoryRing
+    AgentMessage,
+    CapabilityFingerprint,
+    MessageType,
+    TaskNode,
 )
-
 
 # ─── Base Agent ───────────────────────────────────────────────────────────────
 
 class BaseAgent(ABC):
     """
     Abstract base class for all ARIA agents.
-    
+
     Every agent must implement execute(). Everything else — contract enforcement,
     trust ledger updates, memory integration, coalition messaging — is handled
     by the framework. Your agent just focuses on doing its job.
@@ -97,15 +97,15 @@ class BaseAgent(ABC):
     ) -> Any:
         """
         Execute the task described in the node.
-        
+
         Args:
             node:    The TaskNode to execute (contains description, contract, etc.)
             context: Accumulated results from dependency nodes
             memory:  ARIA's memory system for reading past context
-        
+
         Returns:
             Any value — string, dict, list, etc. ARIA will serialize it.
-        
+
         Raise an exception to mark the node as FAILED.
         """
         pass
@@ -152,14 +152,14 @@ class BaseAgent(ABC):
 class LLMAgent(BaseAgent):
     """
     An agent that uses an LLM with a set of tools to complete tasks.
-    
+
     This is the most common agent type. It runs a ReAct-style loop:
     1. Show the LLM the task + available tools + context
     2. LLM decides which tool to call (or produces a final answer)
     3. Execute the tool call
     4. Feed the result back to the LLM
     5. Repeat until the LLM produces a final answer or the contract expires
-    
+
     The LLM is called through the plugin system — you swap the LLM by
     changing the plugin, not by changing this class.
     """
@@ -372,11 +372,16 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                 ptype = "string"
                 if param.annotation != inspect.Parameter.empty:
                     ann = str(param.annotation)
-                    if "int" in ann:    ptype = "integer"
-                    elif "float" in ann: ptype = "number"
-                    elif "bool" in ann:  ptype = "boolean"
-                    elif "list" in ann:  ptype = "array"
-                    elif "dict" in ann:  ptype = "object"
+                    if "int" in ann:
+                        ptype = "integer"
+                    elif "float" in ann:
+                        ptype = "number"
+                    elif "bool" in ann:
+                        ptype = "boolean"
+                    elif "list" in ann:
+                        ptype = "array"
+                    elif "dict" in ann:
+                        ptype = "object"
                 params[pname] = {"type": ptype}
                 if param.default == inspect.Parameter.empty:
                     required.append(pname)
@@ -405,12 +410,12 @@ def aria_agent(
 ):
     """
     The Universal Adapter decorator — wrap any async function as an ARIA agent.
-    
+
     This is the simplest way to create an ARIA agent. The function receives
     the same arguments as BaseAgent.execute() and should return the result.
-    
+
     Example:
-    
+
         @aria_agent(
             capabilities=["search the web for information", "find current news"],
             domains=["research", "web_browsing"],
@@ -420,7 +425,7 @@ def aria_agent(
             query = node.description
             results = await tavily_search(query)
             return summarize(results)
-        
+
         # Register with ARIA
         orchestrator.register_agent(web_researcher)
     """

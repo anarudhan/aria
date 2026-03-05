@@ -25,9 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio
-          # Install optional deps for fuller test coverage
-          pip install anthropic openai || true
+          pip install -e ".[dev,all]" || pip install -e ".[dev]"
 
       - name: Run tests
         env:
@@ -50,7 +48,7 @@ jobs:
         run: pip install ruff
 
       - name: Lint with ruff
-        run: ruff check aria/ --ignore E501
+        run: ruff check aria/
 
   demo:
     name: Demo smoke test

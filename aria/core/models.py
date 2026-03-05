@@ -9,13 +9,11 @@ enough metadata to make autonomous decisions without human intervention.
 
 from __future__ import annotations
 
-import uuid
 import time
-from enum import Enum
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional, Callable, Awaitable
-from datetime import datetime
-
+from enum import Enum
+from typing import Any, Optional
 
 # ─── Enumerations ─────────────────────────────────────────────────────────────
 
@@ -66,11 +64,11 @@ class MessageType(Enum):
 class ExecutionContract:
     """
     Hard limits attached to every task node in the genome.
-    
+
     This is one of ARIA's key differentiators — unlike other frameworks,
     every task carries enforceable resource constraints. The executor
     kills tasks that violate their contracts and updates the trust ledger.
-    
+
     Contracts are hierarchical — a child task inherits its parent's
     remaining budget, not the full budget. This prevents subtask
     explosion from consuming the entire resource envelope.
@@ -139,12 +137,12 @@ class ExecutionContract:
 class CapabilityFingerprint:
     """
     How an agent describes itself to the registry.
-    
+
     ARIA's semantic routing uses these fingerprints — not role names or
     fixed routing tables. The fingerprint is matched against task requirements
     using TF-IDF style cosine similarity, meaning you never need to call
     an embedding API just to route a task.
-    
+
     This is inspired by content-based filtering in recommendation systems,
     applied to agent selection for the first time.
     """
@@ -169,11 +167,11 @@ class CapabilityFingerprint:
 class TaskNode:
     """
     One node in the TaskGenome DAG.
-    
+
     The TaskGenome is ARIA's most distinctive feature. Instead of asking the user
     to define a workflow graph, ARIA's decomposer LLM creates this structure
     automatically from a plain natural language task description.
-    
+
     Nodes form a directed acyclic graph where edges represent dependencies.
     The executor reads the DAG and runs nodes in topological order,
     parallelizing independent nodes automatically.
@@ -211,11 +209,11 @@ class TaskNode:
 class TaskGenome:
     """
     The full decomposition of a task into a DAG of subtasks.
-    
+
     The genome metaphor is intentional — the structure evolves. The decomposer
     creates an initial genome, and the retrospective engine can improve it
     for similar future tasks by storing routing hints.
-    
+
     Every ARIA execution starts with genome creation and ends with
     genome retrospection — the framework gets smarter over time.
     """
@@ -258,12 +256,12 @@ class TaskGenome:
 class AgentMessage:
     """
     Used by the Coalition Protocol for peer-to-peer agent communication.
-    
+
     Unlike AutoGen's conversation model where agents chat in turns, ARIA agents
     can send targeted messages to specific agents or broadcast to the coalition.
     Messages can carry partial results, requests for clarification, or
     sub-task delegation — all without routing through the central orchestrator.
-    
+
     This is the decentralized part of ARIA — the orchestrator sets up the coalition
     and then steps back, letting agents coordinate among themselves.
     """
@@ -285,7 +283,7 @@ class AgentMessage:
 class TaskResult:
     """
     The final output of an ARIA execution.
-    
+
     Results carry not just the answer but a full audit trail — which agents ran,
     how long they took, what it cost, and the ARIA self-assessment of result quality.
     This makes it possible to improve future executions.
@@ -325,7 +323,7 @@ class TaskResult:
 class MemoryEntry:
     """
     A single record in ARIA's Temporal Memory Ring system.
-    
+
     Memory entries age through four rings: FLASH → HOT → WARM → COLD.
     Each ring is searched with different priority and cost. The ring migration
     happens automatically based on access patterns — frequently accessed
@@ -359,12 +357,12 @@ class MemoryEntry:
 class TrustRecord:
     """
     Tracks an agent's performance on a specific task category.
-    
+
     ARIA uses Bayesian trust scoring — agents start with a prior and
     update based on outcomes. This means a new agent with no history
     gets a moderate score (not zero, not perfect), and scores converge
     toward reality as evidence accumulates.
-    
+
     Task categories are auto-detected from task descriptions using
     the same TF-IDF fingerprinting used for capability matching.
     """

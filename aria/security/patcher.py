@@ -36,18 +36,16 @@ What ARIA CANNOT touch without human review (patch_safe=False):
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shutil
 import time
 import uuid
-import json
-import hashlib
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
-from .scanner import Vulnerability, ScanReport
-
+from .scanner import ScanReport, Vulnerability
 
 # ─── Patch Record ─────────────────────────────────────────────────────────────
 
@@ -265,30 +263,30 @@ class SelfPatcher:
 
             patched_line = strategy(original_line)
             if patched_line is None:
-                raise ValueError(f"Patch strategy returned None — patch not applicable")
+                raise ValueError("Patch strategy returned None — patch not applicable")
 
             record.patched_line = patched_line.strip()
             lines[line_idx] = patched_line if patched_line.endswith('\n') else patched_line + '\n'
 
             # Step 3: Write patched file
             file_path.write_text("".join(lines), encoding="utf-8")
-            print(f"[Patcher]    ✅ Patch written")
+            print("[Patcher]    ✅ Patch written")
 
             # Step 4: Syntax verification
             try:
                 ast.parse(file_path.read_text(encoding="utf-8"))
-                print(f"[Patcher]    ✅ Syntax check passed")
+                print("[Patcher]    ✅ Syntax check passed")
             except SyntaxError as e:
                 print(f"[Patcher]    ❌ Syntax error after patch: {e}")
                 self._rollback(file_path, backup_path, record)
                 raise RuntimeError(f"Patch introduced a syntax error and was rolled back: {e}")
 
             record.success = True
-            print(f"[Patcher]    ✅ Patch applied successfully")
+            print("[Patcher]    ✅ Patch applied successfully")
             print(f"[Patcher]    Before: {original_line.strip()}")
             print(f"[Patcher]    After:  {patched_line.strip()}")
 
-        except Exception as e:
+        except Exception:
             if not record.rollback_done:
                 self._rollback(file_path, backup_path, record)
             raise

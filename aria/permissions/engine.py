@@ -40,15 +40,14 @@ Capability categories:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
-import hashlib
+from dataclasses import dataclass, field
 from enum import Enum
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Any
-
+from typing import Optional
 
 # ─── Capability Definitions ───────────────────────────────────────────────────
 
