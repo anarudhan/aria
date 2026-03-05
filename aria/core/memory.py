@@ -34,7 +34,6 @@ from typing import Any, Optional
 from .models import MemoryEntry, MemoryRing
 from .registry import build_term_frequency, cosine_similarity
 
-
 # ─── Ring Configuration ───────────────────────────────────────────────────────
 
 RING_MAX_AGE_HOURS = {
@@ -256,9 +255,12 @@ class TemporalMemory:
 
         for ring in search_rings:
             for entry in self._rings[ring].values():
-                if user_id   and entry.user_id   and entry.user_id   != user_id:   continue
-                if agent_id  and entry.agent_id  and entry.agent_id  != agent_id:  continue
-                if genome_id and entry.genome_id and entry.genome_id != genome_id: continue
+                if user_id and entry.user_id and entry.user_id != user_id:
+                    continue
+                if agent_id and entry.agent_id and entry.agent_id != agent_id:
+                    continue
+                if genome_id and entry.genome_id and entry.genome_id != genome_id:
+                    continue
                 sim = cosine_similarity(query_vec, entry.term_vector)
                 if sim >= min_similarity:
                     scored.append((sim, entry))

@@ -369,6 +369,8 @@ class ARIAOrchestrator:
 
         print(f"\n  Memory Rings:")
         for ring, stats in s['memory'].items():
+            if not isinstance(stats, dict):
+                continue
             bar_len = int(stats['count'] / max(stats['max'], 1) * 20)
             bar = "█" * bar_len + "░" * (20 - bar_len)
             print(f"    {ring:<8} [{bar}] {stats['count']:>5}/{stats['max']}")
