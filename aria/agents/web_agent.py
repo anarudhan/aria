@@ -77,9 +77,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .base import BaseAgent
 from ..core.models import MemoryRing, TaskNode
-
+from .base import BaseAgent
 
 # ─── Content Helpers ──────────────────────────────────────────────────────────
 
@@ -241,8 +240,8 @@ async def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict]:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return [{"url": "", "title": "Search failed", "content": str(e), "score": 0.0}]
+    except Exception:
+        return [{"url": "", "title": "Search failed", "content": "Search request failed", "score": 0.0}]
 
     results = []
     links   = re.findall(r'<a[^>]+href="(https?://[^"]+)"[^>]*>([^<]+)</a>', html)
@@ -398,11 +397,11 @@ class WebAgent(BaseAgent):
             self._domain_trust.record(url, success=True, content_length=len(content))
             self._store_browse_result(url, content, fp, user_id, node)
             return self._format_browse_result(url, content, fp, from_cache=False, elapsed=elapsed, method=method)
-        except Exception as e:
+        except Exception as ex:
             self._domain_trust.record(url, success=False)
             return (
                 f"[ARIA Web Agent] Could not browse {url}\n"
-                f"Error: {e}\n"
+                f"Error: {ex}\n"
                 f"Domain trust: {self._domain_trust.score(url):.2f}"
             )
 
@@ -456,7 +455,7 @@ class WebAgent(BaseAgent):
                     f"{answer}"
                 )
                 if url_lines:
-                    formatted += f"\n\nSources cited:\n" + "\n".join(url_lines)
+                    formatted += "\n\nSources cited:\n" + "\n".join(url_lines)
 
                 # Store in HOT memory for fast recall
                 self._memory.store(
@@ -473,7 +472,7 @@ class WebAgent(BaseAgent):
                 )
                 return formatted
 
-            except Exception as e:
+            except Exception:
                 # Fall through to DuckDuckGo if Claude search fails
                 pass
 
@@ -482,12 +481,12 @@ class WebAgent(BaseAgent):
             results = await _search_duckduckgo(query)
             elapsed = time.monotonic() - start
             engine  = "DuckDuckGo"
-        except Exception as e:
-            return f"[ARIA Web Agent] All search engines failed: {e}"
+        except Exception as ex:
+            return f"[ARIA Web Agent] All search engines failed: {ex}"
 
         lines = [
             f"[ARIA Web Agent — {engine} fallback, {elapsed:.1f}s]",
-            f"Note: Set ANTHROPIC_API_KEY for Claude-native search (better quality)",
+            "Note: Set ANTHROPIC_API_KEY for Claude-native search (better quality)",
             f"Query: {query}\n",
         ]
         for i, r in enumerate(results, 1):
@@ -554,8 +553,10 @@ class WebAgent(BaseAgent):
 
     def _age_str(self, created_at: float) -> str:
         age = time.time() - created_at
-        if age < 60:    return f"{age:.0f} seconds"
-        if age < 3600:  return f"{age/60:.0f} minutes"
+        if age < 60:
+            return f"{age:.0f} seconds"
+        if age < 3600:
+            return f"{age/60:.0f} minutes"
         return f"{age/3600:.1f} hours"
 
     def _format_browse_result(
