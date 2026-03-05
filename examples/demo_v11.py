@@ -16,8 +16,8 @@ Shows everything:
 No API key needed — MockLLMPlugin handles all LLM calls.
 """
 
-import sys
 import asyncio
+import sys
 import time
 from pathlib import Path
 
@@ -26,12 +26,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # ─── Import ARIA ──────────────────────────────────────────────────────────────
 from aria import (
-    ARIAOrchestrator, ARIAConfig, ExecutionContract,
-    TaskResult, TaskStatus, MemoryRing,
-    aria_agent, Capability,
+    ARIAConfig,
+    ARIAOrchestrator,
+    Capability,
+    ExecutionContract,
+    TaskResult,
+    TaskStatus,
+    aria_agent,
 )
 from aria.core.improvement import SelfImprovementEngine
-
 
 # ─── Mock LLM Plugin (no API key needed) ─────────────────────────────────────
 
@@ -82,7 +85,7 @@ async def data_analyst_agent(node, context, memory):
         if any(w in prompt_lower for w in ["write", "draft", "summarize", "format"]):
             return "Document prepared with executive overview, detailed findings, and actionable recommendations."
 
-        return f"Task processed successfully."
+        return "Task processed successfully."
 
     async def chat(self, messages: list, max_tokens: int = 500) -> str:
         if messages:
@@ -224,7 +227,7 @@ async def main():
 
     print("ARIA scanning its own source code for vulnerabilities...\n")
     report = await aria.security_scan("sathis")
-    print(f"\nScan summary:")
+    print("\nScan summary:")
     print(f"  Critical: {report['summary']['critical']}")
     print(f"  High:     {report['summary']['high']}")
     print(f"  Medium:   {report['summary']['medium']}")
@@ -277,9 +280,9 @@ async def main():
         llm_plugin = llm,
     )
     print(f"\nLessons recorded: {len(lessons)}")
-    for l in lessons:
-        print(f"  • Outcome: {l.outcome} | Root: {l.root_cause}")
-        print(f"    Adjustment: {l.adjustment}")
+    for lesson in lessons:
+        print(f"  • Outcome: {lesson.outcome} | Root: {lesson.root_cause}")
+        print(f"    Adjustment: {lesson.adjustment}")
 
 
     # ═══════════════════════════════════════════════════════════════════

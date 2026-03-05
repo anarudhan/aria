@@ -1,9 +1,11 @@
 """
 Tests for ARIA Zero-Trust Permission Engine
 """
-import pytest
 import time
-from aria.permissions.engine import PermissionEngine, Capability, PermissionDeniedError
+
+import pytest
+
+from aria.permissions.engine import Capability, PermissionDeniedError, PermissionEngine
 
 
 @pytest.fixture
