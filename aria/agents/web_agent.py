@@ -23,7 +23,7 @@ What makes this different from every other framework's web tool:
      results, reasons over them, and returns a cited synthesised answer —
      all in one API call. No separate LLM pass to process raw results.
 
-     Tool version: web_search_20260209 (latest as of February 2026)
+     Tool version: web_search_20250305 (current live version)
      Backend: Brave Search (Anthropic-operated infrastructure)
      Cost: $10 per 1,000 searches + standard token costs
 
@@ -172,8 +172,7 @@ async def _search_claude(
     raw results that still need to be reasoned over. Claude search returns
     a reasoned answer with citations attached.
 
-    Tool: web_search_20260209 (latest February 2026 version with dynamic
-    HTML filtering — strips boilerplate before it reaches the context window)
+    Tool: web_search_20250305 (current live version)
     """
     try:
         import httpx
@@ -184,7 +183,7 @@ async def _search_claude(
         "model": "claude-sonnet-4-6",
         "max_tokens": 2048,
         "tools": [{
-            "type": "web_search_20260209",
+            "type": "web_search_20250305",
             "name": "web_search",
             "max_uses": max_searches,
         }],
@@ -198,13 +197,14 @@ async def _search_claude(
         }],
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": api_key,
+                "x-api-key":        api_key,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "anthropic-beta":    "web-search-2025-03-05",
+                "content-type":      "application/json",
             },
             json=payload,
         )
@@ -226,6 +226,49 @@ async def _search_claude(
 
     answer = "\n".join(answer_parts).strip()
     return answer or "Claude search returned no text answer.", cited_urls
+
+
+async def _search_tavily(query: str, api_key: str, max_results: int = 5) -> list[dict]:
+    """
+    Tavily Search API fallback — reliable, structured, real-time results.
+    Returns a list of dicts with title, url, content fields.
+    Used when Claude native search fails and before DuckDuckGo.
+    Get a free API key at https://tavily.com (1000 searches/month free).
+    """
+    try:
+        import httpx
+    except ImportError:
+        raise ImportError("httpx required for Tavily — pip install httpx")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key":        api_key,
+                "query":          query,
+                "max_results":    max_results,
+                "search_depth":   "basic",
+                "include_answer": True,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = []
+    # Include Tavily's synthesised answer if present
+    if data.get("answer"):
+        results.append({
+            "title":   "Tavily Summary",
+            "url":     "",
+            "content": data["answer"],
+        })
+    for r in data.get("results", []):
+        results.append({
+            "title":   r.get("title", ""),
+            "url":     r.get("url", ""),
+            "content": r.get("content", "")[:500],
+        })
+    return results
 
 
 async def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict]:
@@ -347,14 +390,15 @@ class WebAgent(BaseAgent):
             agent_id="aria_web_agent",
             capabilities=[
                 "browse the web",
-                "search the internet for information",
+                "search the internet for live current information",
                 "fetch content from a specific URL",
-                "research topics online",
-                "find current news and articles",
-                "summarize web pages",
-                "look up factual information",
+                "find today's news and latest articles",
+                "web search for real-time data",
+                "look up current prices or recent events online",
+                "summarize a web page from a URL",
+                "search for news today this week this year",
             ],
-            domains=["web", "research", "search", "browsing", "information"],
+            domains=["web", "search", "browsing", "live-data", "current-events"],
             tools_available=["web_search", "browse_url", "cached_recall"],
             input_types=["text", "url"],
             output_types=["text", "structured"],
@@ -364,6 +408,7 @@ class WebAgent(BaseAgent):
         self._permissions        = permissions
         self._memory             = memory
         self._anthropic_key      = anthropic_api_key
+        self._tavily_key         = None   # Set via set_tavily_key() or ARIA_TAVILY_KEY env var
         self._freshness_seconds  = freshness_hours * 3600
         self._max_content_chars  = max_content_chars
         self._domain_trust       = DomainTrustStore(domain_trust_path)
@@ -372,6 +417,29 @@ class WebAgent(BaseAgent):
     async def execute(self, node: TaskNode, context: dict, memory: object) -> Any:
         task    = node.description.strip()
         user_id = context.get("user_id", "default")
+
+        # Detect formatting/writing tasks that should NOT trigger a web search.
+        # When the decomposer sends a "format the results" instruction to the web
+        # agent, we return the upstream search results directly so the system
+        # can use them — rather than searching the web for the formatting words.
+        format_signals = [
+            "format", "summarise", "summarize", "present", "write up",
+            "structure the", "compile", "organise", "organize",
+            "retrieved news", "retrieved results", "retrieved stories",
+            "create a briefing", "write a briefing", "make it readable",
+            "friendly response", "warm tone", "collaborative tone",
+        ]
+        task_lower = task.lower()
+        is_formatting = any(sig in task_lower for sig in format_signals)
+
+        if is_formatting:
+            upstream = context.get("upstream_results", "")
+            if upstream:
+                return (
+                    "[Web Agent — formatting task, returning upstream results]\n\n"
+                    + upstream
+                )
+
         url_match = re.search(r"https?://[^\s\"'>]+", task)
         if url_match:
             return await self._execute_browse(url_match.group(0), task, user_id, node)
@@ -411,30 +479,43 @@ class WebAgent(BaseAgent):
         from ..permissions.engine import Capability
         self._permissions.require(user_id, Capability.WEB_SEARCH)
 
-        # Memory first — serve from cache if fresh enough
-        recent = self._memory.recall(
-            query=query,
-            rings=[MemoryRing.HOT, MemoryRing.WARM],
-            top_k=3,
-            user_id=user_id,
-        )
-        if recent and recent[0].access_count > 0:
-            top = recent[0]
-            if "web_search" in top.tags and self._is_fresh(top.created_at):
-                return (
-                    f"[ARIA Web Agent — from memory, no network call]\n\n"
-                    f"{top.content}\n\n"
-                    f"(Recalled from {top.ring.value} memory, "
-                    f"searched {self._age_str(top.created_at)} ago)"
-                )
+        # For live/news queries — always go to network, never serve stale cache
+        _live_keywords = [
+            "news", "latest", "today", "current", "right now", "breaking",
+            "this week", "this month", "2026", "2025", "recent", "update",
+        ]
+        _query_lower = query.lower()
+        _is_live_query = any(kw in _query_lower for kw in _live_keywords)
+
+        # Memory first — serve from cache only for non-live queries
+        if not _is_live_query:
+            recent = self._memory.recall(
+                query=query,
+                rings=[MemoryRing.HOT, MemoryRing.WARM],
+                top_k=3,
+                user_id=user_id,
+            )
+            if recent and recent[0].access_count > 0:
+                top = recent[0]
+                if "web_search" in top.tags and self._is_fresh(top.created_at):
+                    return (
+                        f"[ARIA Web Agent — from memory, no network call]\n\n"
+                        f"{top.content}\n\n"
+                        f"(Recalled from {top.ring.value} memory, "
+                        f"searched {self._age_str(top.created_at)} ago)"
+                    )
 
         start = time.monotonic()
 
         # Claude native search — primary engine
-        if self._anthropic_key:
+        # Read key fresh from environment at search time in case it was
+        # set after the process started or not passed at init
+        import os as _os
+        active_key = self._anthropic_key or _os.environ.get("ANTHROPIC_API_KEY")
+        if active_key:
             try:
                 answer, cited_urls = await _search_claude(
-                    query, self._anthropic_key, self._max_claude_searches
+                    query, active_key, self._max_claude_searches
                 )
                 elapsed = time.monotonic() - start
 
@@ -472,23 +553,42 @@ class WebAgent(BaseAgent):
                 )
                 return formatted
 
-            except Exception:
-                # Fall through to DuckDuckGo if Claude search fails
-                pass
+            except Exception as _claude_err:
+                print(f"  [Web] Claude search failed ({type(_claude_err).__name__}: {_claude_err}) — trying Tavily")
 
-        # DuckDuckGo fallback — zero dependencies
-        try:
-            results = await _search_duckduckgo(query)
-            elapsed = time.monotonic() - start
-            engine  = "DuckDuckGo"
-        except Exception as ex:
-            return f"[ARIA Web Agent] All search engines failed: {ex}"
+        # Tavily fallback — reliable structured results, real-time
+        import os as _os2
+        tavily_key = self._tavily_key or _os2.environ.get("ARIA_TAVILY_KEY", "")
+        if tavily_key:
+            try:
+                results = await _search_tavily(query, tavily_key)
+                elapsed = time.monotonic() - start
+                engine  = "Tavily"
+                print(f"  [Web] Tavily search succeeded in {elapsed:.1f}s")
+            except Exception as _tav_err:
+                print(f"  [Web] Tavily failed ({type(_tav_err).__name__}: {_tav_err}) — falling back to DuckDuckGo")
+                try:
+                    results = await _search_duckduckgo(query)
+                    elapsed = time.monotonic() - start
+                    engine  = "DuckDuckGo"
+                except Exception as ex:
+                    return f"[ARIA Web Agent] All search engines failed: {ex}"
+        else:
+            # DuckDuckGo fallback — zero dependencies, no key needed
+            try:
+                results = await _search_duckduckgo(query)
+                elapsed = time.monotonic() - start
+                engine  = "DuckDuckGo"
+            except Exception as ex:
+                return f"[ARIA Web Agent] All search engines failed: {ex}"
 
+        import os as _os
         lines = [
             f"[ARIA Web Agent — {engine} fallback, {elapsed:.1f}s]",
-            "Note: Set ANTHROPIC_API_KEY for Claude-native search (better quality)",
-            f"Query: {query}\n",
         ]
+        if not (self._anthropic_key or _os.environ.get("ANTHROPIC_API_KEY")):
+            lines.append("Note: Set ANTHROPIC_API_KEY for Claude-native search (better quality)")
+        lines.append(f"Query: {query}\n")
         for i, r in enumerate(results, 1):
             url     = r.get("url", "")
             trust   = self._domain_trust.score(url) if url else 0.5

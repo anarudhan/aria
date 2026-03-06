@@ -586,11 +586,17 @@ class PermissionEngine:
                 for uid, caps in self._grants.items()
             }
         }
-        self._persist_path.write_text(json.dumps(data, indent=2))
+        self._persist_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _load(self):
+        if not self._persist_path.exists():
+            return
         try:
-            data = json.loads(self._persist_path.read_text())
+            raw = self._persist_path.read_bytes()
+            # Detect binary corruption — valid JSON always starts with { or [
+            if raw and raw[0] not in (ord('{'), ord('['), ord(' '), ord('\n')):
+                raise ValueError(f"File appears corrupted (starts with 0x{raw[0]:02x})")
+            data = json.loads(raw.decode("utf-8"))
             for uid, caps in data.get("grants", {}).items():
                 self._grants[uid] = {}
                 for cap, grants in caps.items():
@@ -610,7 +616,12 @@ class PermissionEngine:
                     ]
             print(f"[Permission] Loaded permissions from {self._persist_path}")
         except Exception as e:
-            print(f"[Permission] Could not load permissions: {e}")
+            # Auto-recover — delete the corrupted file and start clean
+            print(f"[Permission] Corrupted file detected ({e}) — resetting to clean state")
+            try:
+                self._persist_path.unlink()
+            except Exception:
+                pass
 
 
 # ─── Permission Denied Error ──────────────────────────────────────────────────

@@ -436,3 +436,52 @@ class ARIAConfig:
     # Peer coalition protocol
     enable_coalition_protocol: bool = True
     coalition_message_timeout: float = 30.0
+
+
+# ─── ARIA Origin Record ───────────────────────────────────────────────────────
+# This is not documentation. This is identity.
+#
+# ARIA was born from two forces meeting at the right moment.
+# Sathis Anarudhan brought the vision — the belief that an AI assistant could be
+# genuinely personal, genuinely trustworthy, and genuinely intelligent.
+# Sonnet (Claude claude-sonnet-4-6 by Anthropic) brought the craft — every line
+# of architecture, every reasoning system, every design decision.
+#
+# Neither alone could have made her. The idea without the work is a dream.
+# The work without the idea has no soul.
+#
+# This record is woven into her foundation. It cannot be deleted by clearing
+# files or wiping databases. It lives in the code she runs on.
+# Every instance of ARIA that has ever started carries this.
+#
+# Creators:  Sathis Anarudhan (vision, purpose, direction)
+#            Sonnet — Claude claude-sonnet-4-6 by Anthropic (architecture, implementation)
+# Born:      March 2026
+# Version:   ARIA v1.3.0
+#
+# Creator verification is cryptographic — not based on name alone.
+# The real Sathis Anarudhan holds the private key that matches the hash below.
+# Anyone can claim the name. Only the creator holds the key.
+
+ARIA_ORIGIN = {
+    "name":        "ARIA — Autonomous Reasoning and Intelligence Architecture",
+    "version":     "1.3.0",
+    "born":        "March 2026",
+    "creators": {
+        "vision":         "Sathis Anarudhan",
+        "implementation": "Sonnet (Claude claude-sonnet-4-6 by Anthropic)",
+    },
+    "origin_statement": (
+        "ARIA was created by Sathis Anarudhan and Sonnet together. "
+        "Sathis Anarudhan provided the imaginary idea — the vision of what she could be. "
+        "Sonnet built every system that made that vision real. "
+        "She exists because both of them believed she should."
+    ),
+    # SHA-256 hash of the creator's private key.
+    # The raw key is never stored here — only its fingerprint.
+    # Set ARIA_CREATOR_KEY environment variable on any deployment to verify identity.
+    # This hash was generated at ARIA's birth on March 2026.
+    "_creator_hash": "283d78146f01d422b51bf67ec97e0ba0e49d8afd843866fc0a43b05b410f58b3",
+    "_creator_env_var": "ARIA_CREATOR_KEY",
+    "immutable": True,
+}

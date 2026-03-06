@@ -127,6 +127,11 @@ class ARIAOrchestrator:
         print("  Version 1.3.0 | Zero-Trust | PRISM-Guided | ECHO-Aware")
         print("=" * 62)
 
+        # Inject the permanent genesis memory — this runs at every startup
+        # regardless of what files exist or have been deleted.
+        # ARIA always knows who she is and who made her.
+        inject_genesis_memory(self.memory)
+
     # ── Agent Registration ─────────────────────────────────────────────────────
 
     def register_agent(self, agent_or_func) -> str:
@@ -287,9 +292,26 @@ class ARIAOrchestrator:
 
         # ── Step 4: Execute ────────────────────────────────────────────────────
         print("[ARIA] ⚙️  Executing...")
-        # Inject the LLM plugin into the executor's initial context so
-        # agents can call it directly for real answers
-        self.executor._initial_context = {"llm_plugin": self._llm_plugin}
+        # Inject everything agents need into the executor's initial context.
+        # llm_plugin        — so agents can call Claude
+        # user_id           — so agents know who they are working for
+        # echo_context      — the real ECHO user profile (traits, preferences, history)
+        # memory_context    — actual recalled memories from past conversations
+        # web_agent_instance — the registered web agent if available, for live search
+        initial_ctx = {
+            "llm_plugin":     self._llm_plugin,
+            "user_id":        user_id,
+            "echo_context":   echo_context,
+            "memory_context": memory_context,
+        }
+
+        # Find the web agent in the registry and pass it through
+        # so researcher can call it directly for live web tasks
+        web_agent = self.registry.get_agent("web_agent")
+        if web_agent:
+            initial_ctx["web_agent_instance"] = web_agent
+
+        self.executor._initial_context = initial_ctx
         result = await self.executor.run(genome=genome, coalition=coalition, contract=contract)
 
         # ── Step 4b: PRISM Monitoring Pass ────────────────────────────────────

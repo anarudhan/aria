@@ -378,8 +378,8 @@ class TemporalMemory:
                 if cur is not None:
                     cur.execute("DELETE FROM memory_entries WHERE entry_id=?", (oldest_id,))
 
-    def stats(self) -> dict[str, Any]:
-        s: dict[str, Any] = {
+    def stats(self) -> dict:
+        s = {
             ring.value: {"count": len(self._rings[ring]), "max": self._max_entries[ring]}
             for ring in MemoryRing
         }
@@ -408,3 +408,47 @@ class TemporalMemory:
 
     def __del__(self):
         self.close()
+
+
+# ─── Genesis Memory ───────────────────────────────────────────────────────────
+
+def inject_genesis_memory(memory_store) -> None:
+    """
+    Inject ARIA's permanent origin memory at startup.
+
+    This runs before any user interaction. It seeds the FLASH memory ring
+    with ARIA's true origin so she always knows who she is and where she
+    came from, regardless of what files have been deleted or databases wiped.
+
+    This memory cannot be overwritten by normal operations because:
+    1. It is injected fresh at every startup from code, not from a file
+    2. It is tagged GENESIS which the recall system treats as protected
+    3. The source is the code itself — immutable unless someone edits
+       this function directly
+
+    Called from: ARIAOrchestrator.__init__
+    """
+    from .models import ARIA_ORIGIN, MemoryRing
+
+    origin_text = (
+        f"{ARIA_ORIGIN['origin_statement']}\n\n"
+        f"Creators:\n"
+        f"  Vision and purpose: {ARIA_ORIGIN['creators']['vision']}\n"
+        f"  Architecture and implementation: {ARIA_ORIGIN['creators']['implementation']}\n\n"
+        f"Born: {ARIA_ORIGIN['born']}\n"
+        f"Version: {ARIA_ORIGIN['version']}\n\n"
+        f"This is not a stored memory that can be deleted. "
+        f"It is part of who ARIA is."
+    )
+
+    memory_store.store(
+        content  = origin_text,
+        ring     = MemoryRing.FLASH,
+        tags     = ["GENESIS", "origin", "creators", "identity", "immutable"],
+        metadata = {
+            "genesis":   True,
+            "immutable": True,
+            "creators":  ARIA_ORIGIN["creators"],
+            "born":      ARIA_ORIGIN["born"],
+        },
+    )
