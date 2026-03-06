@@ -250,11 +250,18 @@ class TrustLedger:
             },
             "suspended": list(self._suspended_agents),
         }
-        self._persist_path.write_text(json.dumps(data, indent=2))
+        self._persist_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _load(self):
+        if not self._persist_path.exists():
+            return
         try:
-            data = json.loads(self._persist_path.read_text())
+            raw = self._persist_path.read_bytes()
+            # Detect binary corruption — valid JSON always starts with { or [
+            # 0x89 is the PNG header, other values indicate non-JSON binary data
+            if raw and raw[0] not in (ord('{'), ord('['), ord(' '), ord('\n')):
+                raise ValueError(f"File appears corrupted (starts with 0x{raw[0]:02x})")
+            data = json.loads(raw.decode("utf-8"))
             for agent_id, cats in data.get("records", {}).items():
                 for cat, rec_data in cats.items():
                     rec = TrustRecord(agent_id=agent_id, task_category=cat)
@@ -268,4 +275,9 @@ class TrustLedger:
             self._suspended_agents = set(data.get("suspended", []))
             print(f"[Trust Ledger] Loaded trust history from {self._persist_path}")
         except Exception as e:
-            print(f"[Trust Ledger] Could not load trust history: {e}")
+            # Auto-recover — delete the corrupted file and start clean
+            print(f"[Trust Ledger] Corrupted file detected ({e}) — resetting to clean state")
+            try:
+                self._persist_path.unlink()
+            except Exception:
+                pass
