@@ -125,9 +125,11 @@ class ExecutionEngine:
             self._message_bus[agent_id] = asyncio.Queue()
 
         # Context accumulates results from completed nodes
-        # so downstream nodes can access upstream outputs
+        # so downstream nodes can access upstream outputs.
+        # Also picks up any initial context injected by the orchestrator
+        # (e.g. llm_plugin so agents can make real LLM calls).
         completed_ids: set[str] = set()
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = dict(getattr(self, "_initial_context", {}))
 
         try:
             # Execute layers in order
@@ -201,9 +203,15 @@ class ExecutionEngine:
         else:
             result.status = TaskStatus.COMPLETED
 
-        # Synthesize final answer from last layer's output
+        # Synthesize final answer from last layer output.
+        # If the last layer failed or timed out, fall back to any completed
+        # node result we have — never throw away good work from earlier layers.
         last_layer = genome.execution_order[-1] if genome.execution_order else []
         last_results = [str(context[nid]) for nid in last_layer if nid in context]
+        if not last_results:
+            skip = {"llm_plugin"}
+            all_results = [str(v) for k, v in context.items() if k not in skip and v]
+            last_results = all_results
         result.final_answer = "\n\n".join(last_results) if last_results else "No results produced"
 
         # Store result in memory
@@ -302,6 +310,23 @@ class ExecutionEngine:
         agent = self._registry.get_agent(agent_id)
         if not agent:
             raise RuntimeError(f"Agent '{agent_id}' not found in registry")
+
+        # Build a clean summary of upstream results so the agent can see
+        # what previous layers actually produced. This is what allows Layer 3
+        # to synthesise Layer 1+2, and Layer 4 to write from Layer 3's output.
+        skip_keys = {"llm_plugin"}
+        upstream = {
+            k: v for k, v in context.items()
+            if k not in skip_keys and isinstance(k, str) and k.startswith("t")
+        }
+        if upstream:
+            parts = [
+                f"[Result from subtask {k}]:\n{str(v)[:2000]}"
+                for k, v in sorted(upstream.items())
+            ]
+            upstream_text = "\n\n".join(parts)
+            context = dict(context)
+            context["upstream_results"] = upstream_text
 
         self._registry.mark_busy(agent_id)
         timeout = node.contract.remaining_seconds

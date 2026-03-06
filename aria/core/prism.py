@@ -487,6 +487,7 @@ class PRISMEngine:
 
             if relevant:
                 successes = sum(1 for lsn in relevant if getattr(lsn, 'outcome', '') == "success")
+                sum(1 for lsn in relevant if getattr(lsn, 'outcome', '') == "failure")
                 total     = len(relevant)
 
                 if total > 0:
@@ -495,9 +496,11 @@ class PRISMEngine:
                     score_sum += lesson_accuracy * weight
                     total_weight += weight
 
+
         # Pull from trust summaries if available
+        # trust_summaries is a list[dict] from get_all_summaries() — not a dict
         if trust_summaries:
-            for agent_id, summary in trust_summaries.items():
+            for summary in (trust_summaries if isinstance(trust_summaries, list) else trust_summaries.values()):
                 if not isinstance(summary, dict):
                     continue
                 agent_trust = summary.get('overall_trust', 0.6)
