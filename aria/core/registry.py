@@ -337,8 +337,13 @@ class CapabilityRegistry:
             if trust_ledger:
                 trust_weight = trust_ledger.get_trust_score(agent_id, task_description)
 
-            # Load penalty: reduce score by 15% per already-assigned task
-            load_penalty = 0.85 ** agent_load.get(agent_id, 0)
+            # Load penalty: reduce score by 25% per already-assigned task.
+            # This is intentionally aggressive — once an agent has 2+ tasks,
+            # a different agent with even slightly lower raw similarity should win.
+            # This prevents researcher from monopolising all nodes in a genome
+            # that clearly needs both research AND writing agents.
+            current_load = agent_load.get(agent_id, 0)
+            load_penalty = 0.75 ** current_load
 
             score = similarity * trust_weight * load_penalty
 

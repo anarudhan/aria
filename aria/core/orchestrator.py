@@ -287,6 +287,9 @@ class ARIAOrchestrator:
 
         # ── Step 4: Execute ────────────────────────────────────────────────────
         print("[ARIA] ⚙️  Executing...")
+        # Inject the LLM plugin into the executor's initial context so
+        # agents can call it directly for real answers
+        self.executor._initial_context = {"llm_plugin": self._llm_plugin}
         result = await self.executor.run(genome=genome, coalition=coalition, contract=contract)
 
         # ── Step 4b: PRISM Monitoring Pass ────────────────────────────────────
