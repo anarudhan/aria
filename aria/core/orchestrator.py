@@ -44,7 +44,7 @@ from ..permissions.engine import Capability, PermissionDeniedError, PermissionEn
 from .decomposer import TaskDecomposer
 from .echo import ECHOEngine
 from .executor import ExecutionEngine
-from .memory import TemporalMemory
+from .memory import TemporalMemory, inject_genesis_memory
 from .models import ARIAConfig, ExecutionContract, MemoryRing, TaskResult, TaskStatus
 from .prism import PRISMEngine
 from .registry import CapabilityRegistry
