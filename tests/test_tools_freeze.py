@@ -770,9 +770,136 @@ class TestCanonical:
     def test_tuple_and_list_are_the_same(self):
         assert freeze_args({"a": (1, 2)}).sha256() == freeze_args({"a": [1, 2]}).sha256()
 
-    def test_lone_surrogate_is_escaped_not_crashing(self):
-        f = freeze_args({"a": "\ud800"})
-        assert f.canonical_json() == '{"a":"\\ud800"}'
+    def test_emoji_accepted_and_escaped_as_a_pair(self):
+        f = freeze_args({"a": "\U0001f600"})
+        assert f.canonical_json() == '{"a":"\\ud83d\\ude00"}'
+        assert f["a"] == "\U0001f600"
+
+    @pytest.mark.parametrize("lone", ["\ud800", "\udc00", "\udfff", "\ud83d", "\ude00", "ab\ud800cd"])
+    def test_lone_surrogate_rejected_as_value(self, lone):
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args({"a": lone})
+
+    @pytest.mark.parametrize("lone", ["\ud800", "\ude00", "k\ud83dk"])
+    def test_lone_surrogate_rejected_as_key(self, lone):
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args({lone: 1})
+
+    def test_lone_surrogate_rejected_nested(self):
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args({"a": [1, {"b": ["ok", "\ud800"]}]})
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args({"a": {"\ud800": 1}})
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args({"a": ("x", ("\udc00",))})
+
+    def test_a_surrogate_pair_written_as_two_lone_surrogates_is_not_the_emoji(self):
+        emoji = freeze_args({"a": "\U0001f600"})
+        # chr(0xd83d) + chr(0xde00) are two unpaired surrogates in a Python str. They
+        # used to get the same canonical JSON and digest as the emoji.
+        with pytest.raises(FreezeError):
+            freeze_args({"a": chr(0xD83D) + chr(0xDE00)})
+        assert emoji.sha256() == hashlib.sha256(b'{"a":"\\ud83d\\ude00"}').hexdigest()
+
+    def test_surrogate_pair_keys_cannot_collide_with_the_emoji_key(self):
+        data = {"\U0001f600": 1, chr(0xD83D) + chr(0xDE00): 2}
+        with pytest.raises(FreezeError, match="unpaired surrogate"):
+            freeze_args(data)
+
+    def test_surrogate_error_message_has_no_value(self):
+        with pytest.raises(FreezeError) as info:
+            freeze_args({"k": "pw-sekrit-\ud800"})
+        assert "sekrit" not in str(info.value)
+
+    def test_distinct_strings_never_share_a_digest(self):
+        values = ["\U0001f600", "é", "é", "\u0000", "\\ud83d\\ude00", "\U0001f601"]
+        digests = {freeze_args({"a": v}).sha256() for v in values}
+        assert len(digests) == len(values)
+
+    def test_surrogate_check_applies_to_long_strings(self):
+        with pytest.raises(FreezeError):
+            freeze_args({"a": "x" * 100_000 + "\ud800"})
+
+    # ─── equality agrees with the digest ────────────────────────────────────
+
+    def test_int_and_float_are_not_equal_when_the_digest_differs(self):
+        a, b = freeze_args({"a": 1}), freeze_args({"a": 1.0})
+        assert a.sha256() != b.sha256()
+        assert a != b and b != a
+        assert a != {"a": 1.0} and b != {"a": 1}
+        assert a == {"a": 1} and b == {"a": 1.0}
+
+    def test_negative_zero_is_not_zero(self):
+        a, b = freeze_args({"a": 0.0}), freeze_args({"a": -0.0})
+        assert a.sha256() != b.sha256()
+        assert a != b
+        assert a != {"a": -0.0} and b != {"a": 0.0}
+        assert a == {"a": 0.0} and b == {"a": -0.0}
+        assert freeze_args({"a": [0.0]}) != {"a": [-0.0]}
+
+    def test_equal_implies_same_digest_over_scalars(self):
+        scalars = [0, 1, -1, 0.0, -0.0, 1.0, True, False, None, "", "0", "1", 2**70, 1.5]
+        for x in scalars:
+            for y in scalars:
+                fx, fy = freeze_args({"v": [x]}), freeze_args({"v": [y]})
+                if fx == fy:
+                    assert fx.sha256() == fy.sha256(), (x, y)
+                if fx.sha256() == fy.sha256():
+                    assert fx == fy, (x, y)
+
+    def test_equality_does_not_run_foreign_scalar_eq(self):
+        class Evil:
+            def __eq__(self, other):
+                raise RuntimeError("eq ran")
+
+        assert (freeze_args({"a": 1}) == {"a": Evil()}) is False
+
+    # ─── size pre-checks ────────────────────────────────────────────────────
+
+    def test_huge_list_is_refused(self):
+        big = [0] * 200_000
+        with pytest.raises(FreezeError, match="values"):
+            freeze_args({"v": big})
+
+    def test_huge_dict_is_refused(self):
+        big = {str(i): 0 for i in range(20_000)}
+        with pytest.raises(FreezeError, match="values"):
+            freeze_args(big)
+
+    def test_precheck_matches_the_exact_budget(self):
+        # root dict + list = 2 nodes, so 9_998 items fit and 9_999 do not.
+        freeze_args({"v": [0] * 9_998})
+        with pytest.raises(FreezeError):
+            freeze_args({"v": [0] * 9_999})
+        freeze_args({str(i): 0 for i in range(9_999)})  # 1 root + 9_999 values
+        with pytest.raises(FreezeError):
+            freeze_args({str(i): 0 for i in range(10_000)})
+
+    # ─── lookup with foreign keys ───────────────────────────────────────────
+
+    @pytest.mark.parametrize("key", [[1], {"a": 1}, {1, 2}, (1, [2]), bytearray(b"a"), None, 5, b"a"])
+    def test_get_with_unhashable_or_foreign_key_returns_default(self, key):
+        f = freeze_args({"a": 1, "n": {"b": 2}})
+        assert f.get(key) is None
+        assert f.get(key, "dflt") == "dflt"
+        assert f["n"].get(key, "dflt") == "dflt"
+        assert key not in f
+        with pytest.raises(KeyError):
+            f[key]
+
+    def test_lookup_never_hashes_a_hostile_key(self):
+        class H:
+            def __hash__(self):
+                raise RuntimeError("hash ran")
+
+            def __eq__(self, other):
+                raise RuntimeError("eq ran")
+
+        f = freeze_args({"a": 1})
+        assert f.get(H()) is None
+        assert H() not in f
+        with pytest.raises(KeyError):
+            f[H()]
 
 
 # ─── randomized round trip ───────────────────────────────────────────────────

@@ -13,14 +13,21 @@ override methods and run code while we read it):
   dict with str keys, list, tuple (treated as a list), str, int (at most 100
   digits), float (finite only), bool, None.
 
+Strings (values and keys) must be valid Unicode text: an unpaired surrogate is
+rejected. Otherwise two different strings could get the same ASCII escape in the
+canonical JSON, and so the same digest.
+
 Everything else is rejected with ``FreezeError``: bytes, sets, any other
 object, non-str keys, NaN and infinity, cycles, data that is too deep or too
 big. The checks never call ``repr``, ``str``, ``==`` or ``hash`` on a rejected
 object, and error messages show only its type name and a path such as
 ``$.items[2].url``. Argument VALUES never appear in an error message.
 
-Limits are checked before anything is copied, so hostile input cannot make
-this function use much memory or time.
+The size limits are checked while reading, and a container whose length alone
+would exceed the node budget is refused before its items are snapshotted. This
+bounds the work and the copy to roughly the limits. It is not a guarantee against
+every resource problem: the caller's own data is already in memory, and a string
+is checked after it exists.
 """
 
 from __future__ import annotations
@@ -88,6 +95,8 @@ class FrozenMap(Mapping[str, Any]):
         raise AttributeError("FrozenMap is read-only")
 
     def __getitem__(self, key: str) -> Any:
+        if type(key) is not str:  # never hash a foreign object; makes get(unhashable) safe
+            raise KeyError("key must be a str")
         return self._d[key]
 
     def __iter__(self) -> Iterator[str]:
@@ -128,9 +137,15 @@ class FrozenMap(Mapping[str, Any]):
 
 
 def _scalar_equal(a: Any, b: Any) -> bool:
-    # True == 1 in Python; treat a bool as different from a number.
-    if (type(a) is bool) != (type(b) is bool):
+    # Python says True == 1 == 1.0 and 0.0 == -0.0, but their canonical JSON and
+    # digest differ. Equality must agree with the digest, so the exact types must
+    # match (this also keeps a foreign object's __eq__ from ever being called) and
+    # a negative zero is not a zero.
+    ta = type(a)
+    if ta is not type(b):
         return False
+    if ta is float:
+        return bool(a == b and math.copysign(1.0, a) == math.copysign(1.0, b))
     return bool(a == b)
 
 
@@ -195,7 +210,7 @@ class FrozenArgs(Mapping[str, Any]):
         raise AttributeError("FrozenArgs is read-only")
 
     def __getitem__(self, key: str) -> Any:
-        return self._root[key]
+        return self._root[key]  # FrozenMap refuses non-str keys with KeyError
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._root)
@@ -263,6 +278,14 @@ class _Walker:
         n = len(text)
         if n > self.max_string_chars:
             self.fail(f"{what} is longer than {self.max_string_chars} characters")
+        if not text.isascii():
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                # An unpaired surrogate would be written as the same \uXXXX escape as
+                # a real character (U+1F600 and the pair of surrogates that encode it),
+                # so two different values would get the same canonical JSON and digest.
+                self.fail(f"{what} contains an unpaired surrogate")
         self.chars += n
         if self.chars > self.max_total_chars:
             self.fail(f"total text is longer than {self.max_total_chars} characters")
@@ -306,6 +329,8 @@ class _Walker:
         self.fail(f"unsupported type {_safe_type_name(value)}")
 
     def walk_dict(self, value: dict[Any, Any], depth: int) -> FrozenMap:
+        if len(value) > self.max_nodes - self.nodes:
+            self.fail(f"more than {self.max_nodes} values")
         items = list(value.items())  # one snapshot; str keys hash without user code
         out: dict[str, Any] = {}
         for key, item in items:
@@ -320,6 +345,8 @@ class _Walker:
         return FrozenMap(_TOKEN, out)
 
     def walk_seq(self, value: Any, depth: int) -> tuple[Any, ...]:
+        if len(value) > self.max_nodes - self.nodes:
+            self.fail(f"more than {self.max_nodes} values")
         items = tuple(value)  # snapshot of an exact list or tuple
         out = []
         for index, item in enumerate(items):
