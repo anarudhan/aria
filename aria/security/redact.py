@@ -260,13 +260,17 @@ def _key_text(key: Any, limit: int, budget: _Budget) -> tuple[str, bool]:
     return _clean_str(text, limit, budget), _is_secret_key(text)
 
 
-def _unique(name: str, taken: dict[str, Any]) -> str:
+def _unique(name: str, taken: dict[str, Any], counts: dict[str, int]) -> str:
+    """``name``, or ``name#2``, ``name#3`` ... when two keys give the same text."""
     if name not in taken:
         return name
-    n = 2
-    while f"{name}#{n}" in taken:
+    n = counts.get(name, 1)
+    while True:
         n += 1
-    return f"{name}#{n}"
+        candidate = f"{name}#{n}"
+        if candidate not in taken:
+            counts[name] = n
+            return candidate
 
 
 def _redact(
@@ -303,16 +307,17 @@ def _redact(
         if is_dict:
             total = dict.__len__(value)
             result: dict[str, Any] = {}
+            counts: dict[str, int] = {}
             for key, item in islice(dict.items(value), max_items):
                 name, secret = _key_text(key, max_string, budget)
-                name = _unique(name, result)
+                name = _unique(name, result, counts)
                 if secret:
                     result[name] = REDACTED         # the value is never looked at
                 else:
                     result[name] = _redact(item, depth + 1, max_depth, max_items,
                                            max_string, path, budget)
             if total > max_items:
-                result[_unique("<omitted>", result)] = f"<{total - max_items} more items omitted>"
+                result[_unique("<omitted>", result, counts)] = f"<{total - max_items} more items omitted>"
             return result
 
         if issubclass(kind, list):
@@ -438,24 +443,25 @@ def _check_json_keys(obj: Any) -> None:
     stack = [obj]
     while stack:
         item = stack.pop()
-        if isinstance(item, dict):
+        kind = type(item)
+        if issubclass(kind, dict):
             if id(item) in seen:
                 continue
             seen.add(id(item))
-            for key, child in item.items():
-                if not isinstance(key, str):
+            for key, child in dict.items(item):
+                if not issubclass(type(key), str):
                     raise TypeError(f"dict key of type {_type_label(key)} is not a string")
                 stack.append(child)
-        elif isinstance(item, (list, tuple)):
+        elif issubclass(kind, (list, tuple)):
             if id(item) in seen:
                 continue
             seen.add(id(item))
-            stack.extend(item)
+            stack.extend(list.__iter__(item) if issubclass(kind, list) else tuple.__iter__(item))
 
 
 def _canonical_json(obj: Any) -> str:
-    _check_json_keys(obj)
     try:
+        _check_json_keys(obj)
         return json.dumps(
             obj,
             sort_keys=True,
@@ -468,6 +474,9 @@ def _canonical_json(obj: Any) -> str:
     except (ValueError, RecursionError, OverflowError) as exc:
         # circular reference, nan/inf, too deep, int too large to print
         raise TypeError(f"arguments cannot be serialised to canonical JSON: {exc}") from None
+    except Exception:
+        # an object whose own methods raise (the message could hold anything, so drop it)
+        raise TypeError("arguments cannot be serialised to canonical JSON") from None
 
 
 _default_digester: Optional[ArgsDigester] = None

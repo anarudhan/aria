@@ -89,6 +89,8 @@ The list keeps the last 200 records so it cannot grow without limit. The counter
 
 Stored in the records, the counters' `last_error`, `cause_text` and the `LLMError` message: the error type name and the error text, with common secrets hidden and cut to 500 characters. When cut, an ellipsis is added with the length of the text as it was before any redaction or cutting.
 
+The redaction code (`sanitize_error_text`) lives in `aria/security/redact.py` and is re-exported from `aria/plugins/retry.py`, so both import paths work. What it covers, what it does not, and the matching tool for tool arguments are described in [redaction.md](redaction.md).
+
 **Redaction is best effort. It is a list of known shapes, not a guarantee.** Anything not on the list below goes through unchanged, and error text written by a provider can quote part of your request. Treat the records as possibly sensitive and look before you publish them.
 
 The text is first normalised with NFKC (so full-width look-alike letters become normal ones), then these shapes are replaced with `[REDACTED]`:
