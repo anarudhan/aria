@@ -243,7 +243,10 @@ as the undo. `fn` may return:
   or a function that returns a task).
 - A list or tuple of callables: all of them are run, last one first.
 - An awaitable that resolves to one of the above. It is started as a task, so
-  this needs a running event loop.
+  this needs a running event loop. The scope owns that task: `dispose()` and
+  removers cancel it if it has not finished, even if someone else also awaits it.
+  If the awaitable is shared, pass `asyncio.shield(shared)` so only your wait is
+  cancelled.
 
 `effect` returns a **remover**. Calling it takes the effect out of the scope and
 starts its undo now. A remover only ever touches the effect it was made for, so
@@ -304,13 +307,22 @@ effects. A `once` listener that has fired no longer takes up space in the scope.
    same time and whose undos wait for each other (A waits for B while B waits for
    A, or a longer ring): the call that would close the ring returns without
    waiting. Waiting for a scope that is not part of such a ring works as usual.
-   Only an undo that awaits `other.dispose()` itself counts as a wait: a
-   background task that an undo starts is not part of the unwinding, so it does
-   not create a ring. Wrapping the call in a helper task (for example
-   `asyncio.gather(other.dispose())`) hides the wait from the ring check, so a
-   ring built that way is not detected. The "returns at once" shortcut for your
-   own scope only applies while that scope is really unwinding: a task left over
-   from an earlier unwind that calls `dispose()` later is a normal request.
+   It does not matter how the undo waits: `await other.dispose()`,
+   `asyncio.gather(...)`, `asyncio.create_task(...)`, `asyncio.shield(...)` and
+   `asyncio.wait_for(...)` all work, also with `asyncio.eager_task_factory`.
+   **Why this can return early.** Every task that an undo starts (helper tasks
+   and also fire-and-forget background tasks) inherits the marker "inside this
+   unwind" for as long as that unwind is live. A `dispose()` call made by such a
+   task counts as a wait of the undo, even if the undo itself does not wait for
+   that task. If waiting would close a ring, the call returns without waiting.
+   So a background task started by an undo of A that calls `B.dispose()` can make
+   B's own wait for `A.dispose()` return early while A is still unwinding. This
+   is the price for never hanging because of the scope bookkeeping: nothing
+   deadlocks, every undo still runs exactly once, and the early return happens
+   only when waiting would have been circular. The marker stops counting as soon
+   as that unwind is over. A task left over from an earlier unwind that calls
+   `dispose()` later makes a normal request, and so does a new scope that happens
+   to reuse a dead scope's `id()`.
    An undo that tries to register a new effect gets `ScopeDisposedError`, which
    is recorded. No lock is held while your code runs.
 7. **Nothing leaks while something is still pending.** If you dispose a scope
@@ -407,6 +419,9 @@ look at when a scope seems stuck.
   safe.
 - The sync part of a remover and of `effect` needs no loop, but an async effect,
   `start`, `restart` and `dispose` do.
+- Every unwind starts by asking the effects that are still resolving to stop
+  (rule 7). That includes `restart()` of an `ACTIVE` scope: async effects that
+  were registered after `start` and have not finished are cancelled too.
 - Cancelling the unwinding task cancels the undo that is running at that moment
   (the remaining undos still run, see rule 8), so an undo that was in flight can
   be left half done. Write undos so that a cancel at any `await` is safe.
