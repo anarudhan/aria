@@ -49,6 +49,7 @@ from ..core.models import (
     MessageType,
     TaskNode,
 )
+from ..core.spill import READ_TOOL_NAME, SpillError, SpillStore, get_default_store
 
 if TYPE_CHECKING:
     from ..core.memory import TemporalMemory
@@ -193,6 +194,13 @@ Think step by step. Use tools when needed. Be concise and focused.
 When you have enough information, give a direct final answer.
 Prefix your final answer with FINAL_ANSWER: on its own line."""
 
+    # Text longer than these is never cut silently. It is saved to the spill
+    # store and the model gets a head and tail preview that says how many
+    # characters were left out and how to read them (see aria/core/spill.py).
+    # Text that fits is passed through unchanged.
+    DEPENDENCY_PREVIEW_CHARS = 1000
+    TOOL_RESULT_PREVIEW_CHARS = 1000
+
     def __init__(
         self,
         agent_id: str,
@@ -206,6 +214,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         max_concurrent_tasks: int = 3,
         preferred_task_size: str = "medium",
         max_react_iterations: int = 6,
+        spill_store: Optional[SpillStore] = None,
     ):
         tool_names = tools_available or [getattr(t, '__name__', str(t)) for t in (tools or [])]
 
@@ -227,6 +236,42 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
 
         self._llm = llm
         self._max_react_iterations = max_react_iterations
+        self._spill_store = spill_store   # None: use the shared default on first need
+
+    @property
+    def spill_store(self) -> SpillStore:
+        """Where oversized output is saved (created on first use if not given)."""
+        if self._spill_store is None:
+            self._spill_store = get_default_store()
+        return self._spill_store
+
+    def read_spilled(self, locator: str, offset: int = 0, length: int = 2000) -> str:
+        """Read more of an output that was shortened. Pass the spill id from the omission note; offset and length count characters."""
+        try:
+            page = self.spill_store.read_page(locator, offset, length)
+        except SpillError as exc:
+            return f"Error: {exc}"
+        note = f"[characters {page.offset} to {page.end} of {page.total_chars}"
+        if page.has_more:
+            note += f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", offset={page.end})"
+        else:
+            note += "; end of text"
+        return f"{page.text}\n{note}]"
+
+    def _show(self, text: str, max_chars: int) -> str:
+        """Return text as-is if it fits, else an honest preview (never a silent cut).
+
+        The first time something is spilled the ``read_spilled`` tool is made
+        available to the model. It is not added to the advertised fingerprint,
+        and agents that never meet large output are unchanged.
+        """
+        result = self.spill_store.preview_or_spill(text, max_chars)
+        if result.spilled and READ_TOOL_NAME not in self._tools:
+            self._tools[READ_TOOL_NAME] = self.read_spilled
+        return result.text
+
+    def _tool_text(self, result: Any) -> str:
+        return self._show(str(result), self.TOOL_RESULT_PREVIEW_CHARS)
 
     def set_llm(self, llm: Any):
         """Attach an LLM plugin after construction (common pattern)."""
@@ -258,7 +303,8 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
 
         # Format dependency results
         dep_text = "None" if not context else "\n".join(
-            f"[{nid}]: {str(result)[:300]}" for nid, result in context.items()
+            f"[{nid}]: {self._show(str(result), self.DEPENDENCY_PREVIEW_CHARS)}"
+            for nid, result in context.items()
         )
 
         # Build tool descriptions
@@ -335,7 +381,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                 else:
                     try:
                         result = tool_fn(**tool_args)
-                        results.append({"tool": tool_name, "result": str(result)[:1000]})
+                        results.append({"tool": tool_name, "result": self._tool_text(result)})
                     except Exception as e:
                         results.append({"tool": tool_name, "error": str(e)})
             else:
@@ -345,7 +391,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         for tool_name, task in tasks:
             try:
                 result = await task
-                results.append({"tool": tool_name, "result": str(result)[:1000]})
+                results.append({"tool": tool_name, "result": self._tool_text(result)})
             except Exception as e:
                 results.append({"tool": tool_name, "error": str(e)})
 
