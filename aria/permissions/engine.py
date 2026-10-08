@@ -245,24 +245,34 @@ class AuditEntry:
     def compute_hash(self) -> str:
         """
         Full SHA256 hex digest (64 characters) of every field except
-        entry_hash. The fields come from dataclasses.fields(), so a field
-        added later is covered automatically. The encoding is canonical JSON
-        of a dict of all fields (sorted keys, ASCII only, no whitespace). It
-        is unambiguous: one field's text cannot run into the next one's.
+        entry_hash. The fields come from dataclasses.fields() of the CLASS
+        (an instance cannot hide a field by shadowing __dataclass_fields__),
+        so a field added later is covered automatically. The encoding is
+        canonical JSON of a dict of all fields (sorted keys, no whitespace,
+        non-ASCII written as is), turned into bytes with UTF-8 and
+        "surrogatepass". It is unambiguous: one field's text cannot run into
+        the next one's, and two different strings never give the same bytes.
+        That includes a lone surrogate pair versus the one character it would
+        spell if joined (U+D83D U+DE00 versus U+1F600). Escaping everything
+        to ASCII would not have kept those apart.
+
+        The hash of an entry that holds non-ASCII text is different from the
+        one an earlier version computed. Nothing is saved to disk, so that
+        only matters inside one process.
 
         Raises TypeError or ValueError if a field holds something JSON cannot
         encode (verify_chain() reports that as a bad entry).
         """
         data = {
             f.name: getattr(self, f.name)
-            for f in fields(self)
+            for f in fields(type(self))
             if f.name != "entry_hash"
         }
         text = json.dumps(
-            data, sort_keys=True, ensure_ascii=True,
+            data, sort_keys=True, ensure_ascii=False,
             separators=(",", ":"), allow_nan=False,
         )
-        return hashlib.sha256(text.encode("ascii")).hexdigest()
+        return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 @dataclass(frozen=True)

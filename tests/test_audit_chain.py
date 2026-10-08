@@ -93,8 +93,9 @@ def test_hash_matches_documented_encoding():
     """Independent re-computation: canonical JSON of all fields but entry_hash."""
     entry = _full_entry()
     data = {n: getattr(entry, n) for n in HASHED_FIELDS}
-    text = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    assert entry.compute_hash() == hashlib.sha256(text.encode("ascii")).hexdigest()
+    text = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+    assert entry.compute_hash() == digest
 
 
 @pytest.mark.parametrize("name", HASHED_FIELDS)
@@ -672,6 +673,63 @@ def test_record_audit_does_not_redact():
     entry = e.record_audit("u", "c", "s", "a", reason="token=sk-secret", detail={"k": "sk-secret"})
     assert "sk-secret" in entry.reason
     assert "sk-secret" in entry.detail
+
+
+# ─── The hash encoding keeps different strings apart ─────────────────────────
+
+SMILEY = "\U0001F600"
+SMILEY_AS_SURROGATES = "\ud83d\ude00"    # two lone surrogates, not one character
+
+
+def test_surrogate_pair_and_joined_character_are_different_strings():
+    assert SMILEY != SMILEY_AS_SURROGATES and len(SMILEY_AS_SURROGATES) == 2
+
+
+def test_editing_between_a_character_and_its_surrogates_is_detected():
+    e = PermissionEngine()
+    e.record_audit("u", "c", SMILEY, "a")
+    e.record_audit("u", "c", "/after", "a")
+    assert e.verify_chain().ok
+    e._audit[0].scope = SMILEY_AS_SURROGATES   # no recompute
+    report = e.verify_chain()
+    assert not report.ok and report.first_bad_index == 0
+
+
+def test_editing_the_other_way_is_detected_too():
+    e = PermissionEngine()
+    e.record_audit("u", "c", SMILEY_AS_SURROGATES, "a")
+    e._audit[0].scope = SMILEY
+    assert not e.verify_chain().ok
+
+
+@pytest.mark.parametrize("text", [
+    "\ud800", "\udc00", "\udbff\udfff", SMILEY_AS_SURROGATES, SMILEY, "caf\u00e9",
+    "\u00e9", "e\u0301", "\u2028", "\x00",
+])
+def test_hash_differs_for_every_distinct_text(text):
+    seen = {}
+    for other in ["\ud800", "\udc00", "\udbff\udfff", SMILEY_AS_SURROGATES, SMILEY,
+                  "caf\u00e9", "\u00e9", "e\u0301", "\u2028", "\x00"]:
+        a, b = _full_entry(), _full_entry()
+        a.scope, b.scope = text, other
+        seen[other] = a.compute_hash() == b.compute_hash()
+    assert [k for k, same in seen.items() if same] == [text]
+
+
+@pytest.mark.parametrize("text", ["\ud800", "\udc00", SMILEY_AS_SURROGATES, SMILEY, "caf\u00e9"])
+def test_entries_with_odd_text_verify_and_the_trail_stays_json_safe(text):
+    e = PermissionEngine()
+    e.record_audit(text, text, text, text, reason=text, agent_id=text,
+                   task_id=text, call_id=text, stage=text, detail=text,
+                   args_digest=text)
+    e.record_audit(text, "c", "s", "a", detail={"k": text})
+    assert e.verify_chain().ok
+    trail = e.get_audit_trail(text)
+    out = json.dumps(trail)          # default json.dumps must keep working
+    back = json.loads(out)
+    assert len(back) == len(trail) == 2
+    if text != SMILEY_AS_SURROGATES:  # JSON itself joins an escaped surrogate pair
+        assert back == trail
 
 
 # ─── Control characters and JSON-safe output ─────────────────────────────────
