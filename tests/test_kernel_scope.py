@@ -10,6 +10,7 @@ import asyncio
 import gc
 import json
 import random
+import sys
 import warnings
 import weakref
 from typing import Any, Callable, List, Optional
@@ -25,6 +26,7 @@ from aria.kernel import (
     ScopeError,
     ScopeState,
 )
+from aria.kernel import scope as scope_module
 
 
 def rec(log: List[Any], name: Any) -> Callable[[], Callable[[], None]]:
@@ -623,8 +625,9 @@ async def test_child_errors_stay_visible_on_the_parent() -> None:
     (err,) = root.errors
     assert isinstance(err.exception, ChildScopeErrors)
     assert err.exception.scope == "kid"
-    assert len(err.exception.errors) == 1
-    assert "kid failed" in str(err.exception.errors[0])
+    assert err.exception.count == 1
+    assert len(err.exception.recent) == 1
+    assert "kid failed" in err.exception.recent[0]
 
 
 async def test_deeply_nested_scopes_dispose_without_recursion_trouble() -> None:
@@ -1122,7 +1125,8 @@ async def test_setup_raising_cancelled_error_is_not_swallowed() -> None:
     assert log == ["a"] and s.errors == [] and s.state is ScopeState.PENDING
 
 
-async def test_cancelled_error_in_a_disposer_is_not_recorded() -> None:
+async def test_cancelled_error_raised_by_a_sync_disposer_is_dropped() -> None:
+    # A disposer's own CancelledError is not a real cancellation of the unwinding.
     log: List[str] = []
     s = Scope(name="s")
     s.effect(rec(log, "a"))
@@ -1134,10 +1138,8 @@ async def test_cancelled_error_in_a_disposer_is_not_recorded() -> None:
         return undo
 
     s.effect(effect)
-    with pytest.raises(asyncio.CancelledError):
-        await s.dispose()
-    # sync disposer raised a BaseException: it is propagated, not recorded
-    assert s.errors == []
+    await s.dispose()
+    assert log == ["a"] and s.errors == [] and s.disposed
 
 
 # ----------------------------------------------------------------------
@@ -1511,3 +1513,759 @@ async def test_randomized_state_before_final_dispose_matches_model() -> None:
             assert s.effect_count == counts[id(s)]
         await root.dispose()
         assert all(s.disposed for s in live)
+
+
+# ----------------------------------------------------------------------
+# Review round: cancellation inside disposers
+# ----------------------------------------------------------------------
+
+
+async def test_task_stop_disposer_does_not_raise_cancelled_error_at_the_caller() -> None:
+    async def work() -> None:
+        await asyncio.Event().wait()
+
+    t = asyncio.ensure_future(work())
+    await turns()
+
+    def effect() -> Callable[[], Any]:
+        async def stop() -> None:
+            t.cancel()
+            await t  # raises CancelledError inside the disposer
+
+        return stop
+
+    s = Scope(name="s")
+    s.effect(effect)
+    await s.dispose()  # must not raise: the caller was not cancelled
+    assert s.disposed and s.errors == [] and t.cancelled()
+
+
+async def test_disposer_cancelling_its_own_task_is_dropped_not_recorded() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    s.effect(rec(log, "a"))
+
+    def effect() -> Callable[[], Any]:
+        async def stop() -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            await asyncio.sleep(0)
+            log.append("not reached")
+
+        return stop
+
+    s.effect(effect)
+    s.effect(rec(log, "c"))
+    await s.dispose()
+    assert log == ["c", "a"] and s.errors == [] and s.disposed
+
+
+async def test_task_stop_disposer_through_start_restart_and_async_with() -> None:
+    tasks: List["asyncio.Future[None]"] = []
+
+    def stopper(sc: Scope) -> None:
+        async def work() -> None:
+            await asyncio.Event().wait()
+
+        t = asyncio.ensure_future(work())
+        tasks.append(t)
+
+        def effect() -> Callable[[], Any]:
+            async def stop() -> None:
+                t.cancel()
+                await t
+
+            return stop
+
+        sc.effect(effect)
+
+    s = Scope(name="s")
+    await s.start(stopper)
+    await s.restart(stopper)  # undoes the first one
+    assert tasks[0].cancelled() and s.state is ScopeState.ACTIVE
+    await s.dispose()
+    assert tasks[1].cancelled() and s.errors == []
+
+    async with Scope(name="w") as w:
+        stopper(w)
+    assert tasks[2].cancelled() and w.errors == []
+
+    r = Scope(name="r")
+    stopper(r)
+    await r.dispose()
+    assert tasks[3].cancelled() and r.errors == []
+
+
+async def test_scoped_usage_in_sibling_tasks_sees_no_spurious_cancellation() -> None:
+    async def part(name: str) -> str:
+        async def work() -> None:
+            await asyncio.Event().wait()
+
+        t = asyncio.ensure_future(work())
+        async with Scope(name=name) as sc:
+
+            def effect() -> Callable[[], Any]:
+                async def stop() -> None:
+                    t.cancel()
+                    await t
+
+                return stop
+
+            sc.effect(effect)
+            await turns()
+        return name
+
+    assert await asyncio.gather(part("a"), part("b"), part("c")) == ["a", "b", "c"]
+
+
+async def test_genuine_cancellation_still_propagates_runs_the_rest_and_leaks_nothing() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    s.effect(rec(log, "a"))
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                log.append("b-cancelled")
+
+        return undo
+
+    s.effect(effect)
+    s.effect(rec(log, "c"))
+    before = asyncio.all_tasks()
+    d = asyncio.ensure_future(s.dispose())
+    await turns()
+    assert s._task is not None
+    s._task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await d
+    assert log == ["c", "b-cancelled", "a"]
+    assert s.disposed and s.errors == []
+    await turns()
+    assert asyncio.all_tasks() <= before | {d}  # the disposer's task is gone
+
+
+# ----------------------------------------------------------------------
+# Review round: start() and timeouts
+# ----------------------------------------------------------------------
+
+
+async def test_wait_for_start_times_out_when_an_async_effect_never_resolves() -> None:
+    s = Scope(name="s")
+    log: List[str] = []
+
+    def setup(sc: Scope) -> None:
+        sc.effect(rec(log, "first"))
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        sc.effect(hang, label="hang")
+
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.start(setup), 0.2)
+    assert loop.time() - began < 1.5
+    assert log == ["first"] and s.state is ScopeState.PENDING and s.errors == []
+    assert s.effect_count == 0 and not s._live_pending()
+
+
+async def test_slow_undo_after_a_start_timeout_is_waited_for_only_as_long_as_itself() -> None:
+    s = Scope(name="s")
+    log: List[str] = []
+
+    def setup(sc: Scope) -> None:
+        def effect() -> Callable[[], Any]:
+            async def undo() -> None:
+                await turns(30)
+                log.append("slow undo done")
+
+            return undo
+
+        sc.effect(effect)
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        sc.effect(hang)
+
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.start(setup), 0.2)
+    assert loop.time() - began < 1.5
+    assert log == ["slow undo done"]
+
+
+async def test_effect_resolving_late_after_cancellation_is_undone_exactly_once() -> None:
+    s = Scope(name="s")
+    log: List[str] = []
+
+    def setup(sc: Scope) -> None:
+        async def stubborn() -> Callable[[], None]:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass  # swallows the cancellation and still produces something
+            await asyncio.sleep(0)
+            return lambda: log.append("undo")
+
+        sc.effect(stubborn)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.start(setup), 0.2)
+    assert log == ["undo"]
+    await s.dispose()
+    assert log == ["undo"]  # not run a second time
+
+
+async def test_failed_setup_with_a_hanging_effect_does_not_hang() -> None:
+    s = Scope(name="s")
+
+    async def setup(sc: Scope) -> None:
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        sc.effect(hang)
+        raise RuntimeError("setup failed")
+
+    await asyncio.wait_for(s.start(setup), 5)  # 5 s is only a hang guard
+    assert s.state is ScopeState.FAILED and len(s.errors) == 1
+
+
+# ----------------------------------------------------------------------
+# Review round: removers whose result is not awaited
+# ----------------------------------------------------------------------
+
+
+async def test_unawaited_remover_still_runs_async_and_sync_disposers() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def effect() -> Any:
+        async def async_a() -> None:
+            await asyncio.sleep(0)
+            log.append("async_a")
+
+        return [async_a, lambda: log.append("sync_b")]
+
+    r = s.effect(effect)
+    r()  # NOT awaited
+    assert log == ["sync_b"]  # the list runs newest first: sync_b, then async_a
+    await s.dispose()  # waits for the scheduled work
+    assert log == ["sync_b", "async_a"]
+
+
+async def test_unawaited_remover_of_a_resolving_effect_does_not_leak() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+
+    async def slow() -> Callable[[], None]:
+        await gate.wait()
+        return lambda: log.append("undone")
+
+    remove = s.effect(slow)
+    remove()  # not awaited, effect still resolving
+    assert s.effect_count == 0
+    d = asyncio.ensure_future(s.dispose())
+    await turns()
+    assert not d.done()  # dispose waits for the remover's work
+    gate.set()
+    await d
+    assert log == ["undone"]
+
+
+async def test_unawaited_remover_work_is_done_after_the_loop_runs() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await asyncio.sleep(0)
+            log.append("done")
+
+        return undo
+
+    s.effect(effect)()
+    await turns()
+    assert log == ["done"] and s.errors == []
+
+
+async def test_remover_errors_are_recorded_even_when_not_awaited() -> None:
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            raise ValueError("bad undo")
+
+        return undo
+
+    s.effect(effect, label="bad")()
+    await turns()
+    assert [e.label for e in s.errors] == ["bad"]
+
+
+async def test_cancelling_the_waiter_of_a_remover_does_not_stop_the_undo() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            log.append("done")
+
+        return undo
+
+    remove = s.effect(effect)
+    waiter = asyncio.ensure_future(_run(remove()))
+    await turns()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    gate.set()
+    await s.dispose()
+    assert log == ["done"]
+
+
+async def _run(aw: Any) -> None:
+    await aw
+
+
+def test_remover_without_a_running_loop_returns_work_to_run_by_hand() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            log.append("async")
+
+        return undo
+
+    remove = s.effect(effect)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        aw = remove()
+        assert log == []
+        asyncio.run(_run(aw))
+        gc.collect()
+    assert log == ["async"]
+
+
+async def test_disposer_run_by_a_remover_may_call_dispose_without_deadlock() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await s.dispose()  # returns at once, like during a disposal
+            log.append("undo")
+
+        return undo
+
+    s.effect(effect)()
+    await asyncio.wait_for(s.dispose(), 5)
+    assert log == ["undo"] and s.disposed
+
+
+# ----------------------------------------------------------------------
+# Review round: disposals that wait for each other
+# ----------------------------------------------------------------------
+
+
+def _dispose_other(log: List[str], name: str, other: Scope) -> Callable[[], Callable[[], Any]]:
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await other.dispose()
+            log.append(name)
+
+        return undo
+
+    return effect
+
+
+async def test_two_scopes_disposing_each_other_do_not_deadlock() -> None:
+    log: List[str] = []
+    a = Scope(name="a")
+    b = Scope(name="b")
+    a.effect(_dispose_other(log, "a", b))
+    b.effect(_dispose_other(log, "b", a))
+    await asyncio.wait_for(asyncio.gather(a.dispose(), b.dispose()), 5)
+    assert a.disposed and b.disposed and sorted(log) == ["a", "b"]
+    assert scope_module._WAITS == {}  # the bookkeeping is cleaned up
+
+
+async def test_three_scopes_in_a_dispose_cycle_do_not_deadlock() -> None:
+    log: List[str] = []
+    a, b, c = Scope(name="a"), Scope(name="b"), Scope(name="c")
+    a.effect(_dispose_other(log, "a", b))
+    b.effect(_dispose_other(log, "b", c))
+    c.effect(_dispose_other(log, "c", a))
+    await asyncio.wait_for(asyncio.gather(a.dispose(), b.dispose(), c.dispose()), 5)
+    assert all(s.disposed for s in (a, b, c)) and sorted(log) == ["a", "b", "c"]
+    assert scope_module._WAITS == {}
+
+
+async def test_a_disposer_still_waits_for_another_scope_that_is_not_in_a_cycle() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    other = Scope(name="other")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            log.append("other-undone")
+
+        return undo
+
+    other.effect(effect)
+    a = Scope(name="a")
+    a.effect(_dispose_other(log, "a", other))
+    d = asyncio.ensure_future(a.dispose())
+    await turns()
+    assert not d.done()
+    gate.set()
+    await d
+    assert log == ["other-undone", "a"]
+
+
+# ----------------------------------------------------------------------
+# Review round: health report, memory, odd exceptions
+# ----------------------------------------------------------------------
+
+
+async def test_describe_shows_when_a_disposal_is_in_progress() -> None:
+    s = Scope(name="s")
+    seen: List[Any] = []
+    before = s.describe()
+    assert before["closing"] is False and before["unwinding"] is False
+
+    def effect() -> Callable[[], None]:
+        return lambda: seen.append(s.describe())
+
+    s.effect(effect)
+    await s.dispose()
+    (during,) = seen
+    assert during["closing"] is True and during["unwinding"] is True
+    assert during["state"] == "pending"  # not DISPOSED until it is finished
+    after = s.describe()
+    assert after["state"] == "disposed" and after["unwinding"] is False
+    json.dumps(after)
+
+
+async def test_describe_survives_an_exception_whose_str_raises() -> None:
+    class Nasty(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no str for you")
+
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], None]:
+        def undo() -> None:
+            raise Nasty()
+
+        return undo
+
+    s.effect(effect, label="nasty")
+    await s.dispose()
+    report = s.describe()
+    assert report["error_count"] == 1
+    assert "Nasty" in report["recent_errors"][0] and "nasty" in report["recent_errors"][0]
+    parent = Scope(name="p")
+    kid = parent.child("k")
+    kid.effect(effect, label="nasty")
+    await parent.dispose()  # summarising the child's errors must not raise either
+    assert "child scope" in parent.describe()["recent_errors"][0]
+
+
+async def test_parent_keeps_only_a_bounded_summary_of_a_childs_errors() -> None:
+    root = Scope(name="root")
+    kid = root.child("kid")
+
+    def bad() -> Callable[[], None]:
+        def undo() -> None:
+            raise RuntimeError("x" * 50)
+
+        return undo
+
+    for _ in range(200):
+        kid.effect(bad)
+    await root.dispose()
+    (err,) = root.errors
+    summary = err.exception
+    assert isinstance(summary, ChildScopeErrors)
+    assert summary.count == 200
+    assert len(summary.recent) == 3 and all(isinstance(t, str) for t in summary.recent)
+    for value in vars(summary).values():
+        assert not (isinstance(value, (list, tuple)) and value and isinstance(value[0], ScopeError))
+
+
+def test_pending_unwind_task_collected_with_its_loop_does_not_blow_up() -> None:
+    # Closing a loop that still has an unwind task in flight finalizes its
+    # coroutine in another context; resetting the context variable must not raise.
+    caught: List[Any] = []
+    old_hook = sys.unraisablehook
+    sys.unraisablehook = caught.append
+    try:
+        loop = asyncio.new_event_loop()
+        keep: List[Any] = [Scope(name="s")]
+
+        async def go() -> None:
+            def effect() -> Callable[[], Any]:
+                async def undo() -> None:
+                    await asyncio.Event().wait()
+
+                return undo
+
+            keep[0].effect(effect)
+            keep.append(asyncio.ensure_future(keep[0].dispose()))
+            await turns()
+
+        loop.run_until_complete(go())
+        loop.close()
+        del loop
+        keep[0]._task = None
+        keep.clear()
+        gc.collect()
+    finally:
+        sys.unraisablehook = old_hook
+    assert caught == []
+
+
+class _Fatal(BaseException):
+    """Stands in for SystemExit/KeyboardInterrupt without stopping the test run."""
+
+
+async def test_base_exception_from_a_disposer_finishes_the_rest_then_reraises() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    s.effect(rec(log, "a"))
+
+    def effect() -> Callable[[], None]:
+        def undo() -> None:
+            raise _Fatal("stop")
+
+        return undo
+
+    s.effect(effect)
+    s.effect(rec(log, "c"))
+    with pytest.raises(_Fatal):
+        await s.dispose()
+    assert log == ["c", "a"]
+    assert s.state is ScopeState.DISPOSED and s.errors == []
+    await s.dispose()  # already finished, quiet
+
+
+async def test_base_exception_from_an_async_disposer_finishes_the_rest_then_reraises() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    s.effect(rec(log, "a"))
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await asyncio.sleep(0)
+            raise _Fatal("stop")
+
+        return undo
+
+    s.effect(effect)
+    s.effect(rec(log, "c"))
+    with pytest.raises(_Fatal):
+        await s.dispose()
+    assert log == ["c", "a"] and s.disposed
+
+
+async def test_base_exception_from_a_remover_is_raised_after_the_other_disposers() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def effect() -> Any:
+        def boom() -> None:
+            raise _Fatal("x")
+
+        return [lambda: log.append("first"), boom, lambda: log.append("last")]
+
+    remove = s.effect(effect)
+    with pytest.raises(_Fatal):
+        remove()
+    assert log == ["last", "first"]
+
+
+# ----------------------------------------------------------------------
+# Review round: tests aimed at mutants that used to survive
+# ----------------------------------------------------------------------
+
+
+async def test_failing_async_disposer_in_a_list_does_not_stop_the_others() -> None:
+    log: List[str] = []
+
+    async def ok_one() -> None:
+        await asyncio.sleep(0)
+        log.append("ok1")
+
+    async def ok_two() -> None:
+        await asyncio.sleep(0)
+        log.append("ok2")
+
+    async def bad() -> None:
+        await asyncio.sleep(0)
+        raise ValueError("bad async")
+
+    s = Scope(name="s")
+    s.effect(lambda: [ok_one, ok_two, bad], label="list")  # runs bad, ok_two, ok_one
+    await s.dispose()
+    assert log == ["ok2", "ok1"]
+    assert [e.label for e in s.errors] == ["list"]
+    # and through a remover
+    s2 = Scope(name="s2")
+    remove = s2.effect(lambda: [ok_one, bad, ok_two])
+    log.clear()
+    await remove()
+    assert log == ["ok2", "ok1"] and len(s2.errors) == 1
+
+
+async def test_restart_unwind_refuses_new_registrations() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+
+    def setup(sc: Scope) -> None:
+        def effect() -> Callable[[], None]:
+            def undo() -> None:
+                sc.effect(rec(log, "sneaky"))  # must be refused during the unwind
+
+            return undo
+
+        sc.effect(effect, label="registers-during-unwind")
+
+    await s.start(setup)
+    await s.restart(None)
+    assert s.state is ScopeState.ACTIVE
+    (err,) = s.errors
+    assert err.label == "registers-during-unwind"
+    assert isinstance(err.exception, ScopeDisposedError)
+    assert "unwound" in str(err.exception)
+    assert s.effect_count == 0
+    await s.dispose()
+    assert log == []
+
+
+async def test_failed_setup_unwind_refuses_new_registrations() -> None:
+    s = Scope(name="s")
+
+    def setup(sc: Scope) -> None:
+        def effect() -> Callable[[], None]:
+            return lambda: sc.effect(lambda: None)
+
+        sc.effect(effect, label="late")
+        raise RuntimeError("fail")
+
+    await s.start(setup)
+    assert s.state is ScopeState.FAILED and s.effect_count == 0
+    assert any(isinstance(e.exception, ScopeDisposedError) for e in s.errors)
+
+
+async def test_dispose_requested_during_restart_wins() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+
+    def first(sc: Scope) -> None:
+        def effect() -> Callable[[], Any]:
+            async def undo() -> None:
+                await gate.wait()
+                log.append("undo")
+
+            return undo
+
+        sc.effect(effect)
+
+    await s.start(first)
+    ran: List[str] = []
+    r = asyncio.ensure_future(s.restart(lambda sc: ran.append("setup")))
+    await turns()
+    d = asyncio.ensure_future(s.dispose())
+    await turns()
+    gate.set()
+    await asyncio.gather(r, d)
+    assert s.state is ScopeState.DISPOSED
+    assert ran == [] and log == ["undo"]
+
+
+async def test_join_waits_for_a_second_unwind_pass() -> None:
+    # A registration that sneaks in right after the first unwind pass ends (a
+    # call_soon callback queued by the last disposer) must also be undone before
+    # restart() runs the new setup.
+    log: List[str] = []
+    s = Scope(name="s")
+    loop = asyncio.get_running_loop()
+
+    def first(sc: Scope) -> None:
+        def effect() -> Callable[[], None]:
+            def undo() -> None:
+                loop.call_soon(lambda: sc.effect(rec(log, "sneaked")))
+
+            return undo
+
+        sc.effect(effect)
+
+    await s.start(first)
+    await s.restart(lambda sc: log.append(f"setup-after-{log}"))
+    assert log == ["sneaked", "setup-after-['sneaked']"]
+    assert s.effect_count == 0
+
+
+# ----------------------------------------------------------------------
+# Review round: no loop errors and no warnings in the main scenarios
+# ----------------------------------------------------------------------
+
+
+async def test_main_scenarios_leave_no_loop_errors_unraisables_or_warnings() -> None:
+    loop = asyncio.get_running_loop()
+    loop_errors: List[Any] = []
+    unraisable: List[Any] = []
+    old_handler = loop.get_exception_handler()
+    old_hook = sys.unraisablehook
+    loop.set_exception_handler(lambda lp, ctx: loop_errors.append(ctx))
+    sys.unraisablehook = unraisable.append
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for scenario in (
+                test_effect_runs_immediately_and_disposer_runs_on_dispose,
+                test_disposal_is_strictly_sequential_and_reverse,
+                test_children_are_disposed_before_own_effects_newest_first,
+                test_errors_do_not_stop_other_disposers,
+                test_concurrent_dispose_calls_wait_for_the_first,
+                test_failing_async_setup_with_children_unwinds_them_too,
+                test_restart_can_fail_again_and_restart_from_active_undoes_first,
+                test_cancelled_setup_unwinds_and_propagates,
+                test_cancelled_dispose_waiter_does_not_stop_the_unwinding,
+                test_cancelling_the_unwinding_task_still_runs_remaining_disposers,
+                test_task_stop_disposer_does_not_raise_cancelled_error_at_the_caller,
+                test_disposer_cancelling_its_own_task_is_dropped_not_recorded,
+                test_genuine_cancellation_still_propagates_runs_the_rest_and_leaks_nothing,
+                test_wait_for_start_times_out_when_an_async_effect_never_resolves,
+                test_effect_resolving_late_after_cancellation_is_undone_exactly_once,
+                test_unawaited_remover_still_runs_async_and_sync_disposers,
+                test_unawaited_remover_of_a_resolving_effect_does_not_leak,
+                test_two_scopes_disposing_each_other_do_not_deadlock,
+                test_base_exception_from_an_async_disposer_finishes_the_rest_then_reraises,
+                test_disposer_calling_dispose_again_does_not_deadlock,
+                test_task_started_by_a_disposer_may_call_dispose_too,
+                test_async_with_starts_and_disposes,
+                test_no_coroutine_is_left_unawaited,
+            ):
+                await scenario()
+            await turns()
+            gc.collect()
+            await turns()
+    finally:
+        loop.set_exception_handler(old_handler)
+        sys.unraisablehook = old_hook
+    assert loop_errors == []
+    assert unraisable == []

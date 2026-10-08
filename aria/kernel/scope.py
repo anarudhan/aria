@@ -36,6 +36,7 @@ A scope is meant to be used from the event loop thread. It is not thread safe.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import itertools
 import time
@@ -92,28 +93,77 @@ class ScopeError:
     when: float
 
     def __str__(self) -> str:
-        return f"{self.label}: {type(self.exception).__name__}: {self.exception}"
+        try:
+            detail = str(self.exception)
+        except Exception:  # a broken __str__ must not break error reporting
+            detail = "<unprintable>"
+        return f"{self.label}: {type(self.exception).__name__}: {detail}"
+
+
+# How many error texts a parent keeps from a finished child.
+_CHILD_ERROR_TEXTS = 3
 
 
 class ChildScopeErrors(Exception):
     """Recorded on a parent when a child scope finished with recorded errors.
 
-    The child is gone after disposal, so this keeps its errors visible: they
-    are in ``errors``.
+    The child is gone after disposal, so this keeps a summary: ``count`` is how
+    many errors the child had recorded or dropped, and ``recent`` holds the text
+    of the last few. It deliberately does not keep the child's error objects
+    (and their tracebacks), so a parent's memory stays bounded.
     """
 
-    def __init__(self, scope: str, errors: List[ScopeError], dropped: int = 0) -> None:
+    def __init__(self, scope: str, count: int, recent: Tuple[str, ...] = ()) -> None:
         self.scope = scope
-        self.errors: Tuple[ScopeError, ...] = tuple(errors)
-        self.dropped = dropped
-        total = len(self.errors) + dropped
-        super().__init__(f"child scope {scope!r} finished with {total} recorded error(s)")
+        self.count = count
+        self.recent = tuple(recent)
+        super().__init__(f"child scope {scope!r} finished with {count} recorded error(s)")
 
 
 # Scopes whose disposal is running in the current context. A disposer that
 # calls dispose() on its own scope would wait for itself; this lets it return
 # instead. Tasks started inside a disposer inherit the marker.
 _DISPOSING: ContextVar[FrozenSet[int]] = ContextVar("aria_scope_disposing", default=frozenset())
+
+# Who is waiting for whose disposal: waiter id -> {target id: how many waits}.
+# Only disposals that wait inside another disposal appear here. It lets two
+# scopes that dispose each other at the same time notice the cycle and return
+# instead of waiting for each other forever.
+_WAITS: Dict[int, Dict[int, int]] = {}
+
+
+def _waits_reach(start: int, goal: FrozenSet[int]) -> bool:
+    seen: Set[int] = set()
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        if node in goal:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(_WAITS.get(node, ()))
+    return False
+
+
+def _add_waits(waiters: FrozenSet[int], target: int) -> None:
+    for w in waiters:
+        edges = _WAITS.setdefault(w, {})
+        edges[target] = edges.get(target, 0) + 1
+
+
+def _drop_waits(waiters: FrozenSet[int], target: int) -> None:
+    for w in waiters:
+        edges = _WAITS.get(w)
+        if edges is None:
+            continue
+        left = edges.get(target, 0) - 1
+        if left > 0:
+            edges[target] = left
+        else:
+            edges.pop(target, None)
+            if not edges:
+                del _WAITS[w]
 
 
 class _Done:
@@ -144,14 +194,24 @@ class _Effect:
 class Remover:
     """Undoes one effect early. Returned by ``effect`` and ``on``.
 
-    Calling it removes the effect from the scope and runs its undo now. The
-    return value is awaitable. If the undo was sync (listeners always are), it
-    has already finished and awaiting is optional. If the undo is async, or
-    the effect was still resolving, you must ``await`` the result to wait for
-    it; otherwise Python warns that a coroutine was never awaited.
+    Calling it removes the effect from the scope and starts its undo now. The
+    return value is awaitable.
+
+    * Sync undos (listeners always are) have already finished when the call
+      returns; awaiting the result is optional.
+    * If an undo is async, or the effect is still resolving, then with a running
+      event loop the rest of the work is scheduled as a task. It happens even if
+      you never await the result, and ``dispose()`` waits for it. Await the
+      result to wait for it yourself, and to see a failure of the undo
+      (failures are recorded in ``scope.errors`` either way). Awaiting is safe
+      to cancel: the undo carries on.
+    * With NO running loop, the rest of the work is returned as an awaitable that
+      you must run yourself (for example with ``asyncio.run``).
 
     Calling it again does nothing and returns an already finished awaitable.
-    It only ever touches the effect it was created for.
+    It only ever touches the effect it was created for. If an undo run this way
+    calls ``dispose()`` on its own scope, that call returns at once (the same
+    no-deadlock rule as during disposal).
     """
 
     __slots__ = ("_scope", "_effect")
@@ -169,7 +229,7 @@ class Remover:
         scope = self._scope
         if scope._effects.pop(self._effect.id, None) is None:
             return _DONE
-        return scope._undo(self._effect)
+        return scope._undo_detached(self._effect)
 
 
 async def _exhaust_asyncgen(agen: Any) -> None:
@@ -184,6 +244,11 @@ def _discard_awaitable(obj: Any) -> None:
             close()
         except Exception:  # pragma: no cover - best effort only
             pass
+
+
+def _discard_cancelled(task: "asyncio.Future[Any]", *, aw: Any) -> None:
+    if task.cancelled():
+        _discard_awaitable(aw)
 
 
 class Scope:
@@ -382,6 +447,9 @@ class Scope:
             eff.task = task
             self._pending.add(task)
             task.add_done_callback(self._pending.discard)
+            # A task cancelled before its first step never starts the awaitable;
+            # close it so Python does not warn that it was never awaited.
+            task.add_done_callback(functools.partial(_discard_cancelled, aw=result))
         else:
             eff = self._add(self._normalize(result), label)
         return Remover(self, eff)
@@ -444,13 +512,18 @@ class Scope:
     # Undoing one effect
     # ------------------------------------------------------------------
 
-    def _advance(self, label: str, rest: List[Callable[[], Any]]) -> Optional[Awaitable[Any]]:
+    def _advance(
+        self, label: str, rest: List[Callable[[], Any]], bag: List[BaseException]
+    ) -> Optional[Awaitable[Any]]:
         """Run disposers from ``rest`` (newest last) until one returns something to await.
 
         Returns that awaitable, or None when ``rest`` is used up. Errors are
-        recorded. Anything that is not awaitable is ignored, except that sync
-        and async generators are run to the end: calling a generator function
-        does nothing by itself, and silently skipping it would hide the bug.
+        recorded. A ``CancelledError`` raised by a disposer is that disposer's
+        own and is dropped. Any other ``BaseException`` (``SystemExit`` and the
+        like) goes into ``bag`` and is raised once everything has run. Anything
+        that is not awaitable is ignored, except that sync and async generators
+        are run to the end: calling a generator function does nothing by
+        itself, and silently skipping it would hide the bug.
         """
         while rest:
             disposer = rest.pop()
@@ -465,80 +538,183 @@ class Scope:
                         pass
             except Exception as exc:
                 self._record(label, exc)
+            except asyncio.CancelledError:
+                pass
+            except BaseException as exc:
+                bag.append(exc)
         return None
 
-    def _undo(self, eff: _Effect) -> Awaitable[None]:
-        """Undo a claimed effect (already out of ``_effects``). Sync part runs now."""
+    def _undo(self, eff: _Effect, bag: Optional[List[BaseException]] = None) -> Awaitable[None]:
+        """Undo a claimed effect (already out of its dict). The sync part runs now.
+
+        With ``bag=None`` the caller wants the result raised: a ``BaseException``
+        that a disposer raised, or a genuine cancellation of the awaiting task,
+        is raised after all disposers have run. With a shared ``bag`` (the
+        unwinding loop) they are collected there instead.
+        """
+        own = bag is None
+        if bag is None:
+            bag = []
         task = eff.task
         if task is not None and not task.done():
-            return self._undo_after_resolve(eff)
+            return self._undo_late(eff, bag, own)
         rest = list(eff.disposers)
         eff.disposers = []
-        pending = self._advance(eff.label, rest)
+        pending = self._advance(eff.label, rest, bag)
         if pending is None:
+            if own and bag:
+                raise bag[0]
             return _DONE
-        return self._drain(eff.label, pending, rest)
+        return self._undo_async(eff, pending, rest, bag, own)
 
-    async def _drain(
-        self, label: str, pending: Optional[Awaitable[Any]], rest: List[Callable[[], Any]]
+    async def _undo_async(
+        self,
+        eff: _Effect,
+        pending: Awaitable[Any],
+        rest: List[Callable[[], Any]],
+        bag: List[BaseException],
+        own: bool,
     ) -> None:
-        cancelled: Optional[BaseException] = None
-        while pending is not None:
-            try:
-                await pending
-            except asyncio.CancelledError as exc:
-                # Cleanup must finish. Remember the cancellation, raise it last.
-                cancelled = cancelled or exc
-            except Exception as exc:
-                self._record(label, exc)
-            pending = self._advance(label, rest)
-        if cancelled is not None:
-            raise cancelled
+        await self._drain(eff.label, pending, rest, bag, keep=eff.child is not None)
+        if own and bag:
+            raise bag[0]
 
-    async def _undo_after_resolve(self, eff: _Effect) -> None:
+    async def _undo_late(self, eff: _Effect, bag: List[BaseException], own: bool) -> None:
+        """Wait for an async effect to resolve, then undo it. Never skips the undo."""
         task = eff.task
         assert task is not None
-        cancelled: Optional[BaseException] = None
         while not task.done():
             try:
                 await asyncio.wait({task})
             except asyncio.CancelledError as exc:
-                cancelled = cancelled or exc
+                bag.append(exc)
         rest = list(eff.disposers)
         eff.disposers = []
-        pending = self._advance(eff.label, rest)
+        pending = self._advance(eff.label, rest, bag)
         if pending is not None:
+            await self._drain(eff.label, pending, rest, bag, keep=False)
+        if own and bag:
+            raise bag[0]
+
+    async def _drain(
+        self,
+        label: str,
+        pending: Optional[Awaitable[Any]],
+        rest: List[Callable[[], Any]],
+        bag: List[BaseException],
+        keep: bool,
+    ) -> None:
+        while pending is not None:
+            await self._await_one(label, pending, bag, keep)
+            pending = self._advance(label, rest, bag)
+
+    async def _await_one(
+        self, label: str, aw: Awaitable[Any], bag: List[BaseException], keep: bool
+    ) -> None:
+        """Run one async disposer as its own task and wait for it.
+
+        Being a task of its own, the disposer's cancellation (for example it
+        stops another task and awaits it, or cancels itself) is not confused
+        with a cancellation of the task that is unwinding. Only a real
+        cancellation of the waiter is remembered in ``bag``. Then the disposer's
+        task is cancelled and awaited (unless ``keep``, used for child scopes
+        whose own unwinding must finish), so nothing outlives the call.
+        """
+        try:
+            task = asyncio.ensure_future(aw)
+        except Exception as exc:
+            _discard_awaitable(aw)
+            self._record(label, exc)
+            return
+        while not task.done():
             try:
-                await self._drain(eff.label, pending, rest)
+                await asyncio.wait({task})
             except asyncio.CancelledError as exc:
-                cancelled = cancelled or exc
-        if cancelled is not None:
-            raise cancelled
+                bag.append(exc)
+                if not keep:
+                    task.cancel()
+        if task.cancelled():
+            return  # the disposer's own cancellation, or ours after a real one
+        exc2 = task.exception()
+        if exc2 is None:
+            return
+        if isinstance(exc2, Exception):
+            self._record(label, exc2)
+        else:
+            bag.append(exc2)
+
+    def _undo_detached(self, eff: _Effect) -> Awaitable[None]:
+        """Undo for a remover: the work is scheduled so it happens even if not awaited."""
+        aw = self._undo(eff)
+        if aw is _DONE:
+            return _DONE
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return aw  # no loop: the caller has to run it
+        task = loop.create_task(self._marked(aw))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        return asyncio.shield(task)
+
+    async def _marked(self, aw: Awaitable[Any]) -> None:
+        token = _DISPOSING.set(_DISPOSING.get() | {id(self)})
+        try:
+            await aw
+        finally:
+            try:
+                _DISPOSING.reset(token)
+            except ValueError:  # pragma: no cover - context changed under us
+                pass
+
+    def _live_pending(self) -> List["asyncio.Future[None]"]:
+        return [t for t in self._pending if not t.done()]
+
+    def _cancel_unresolved(self) -> None:
+        """Cancel async effects that have not resolved (used when setup is abandoned)."""
+        for eff in list(self._effects.values()):
+            task = eff.task
+            if task is not None and not task.done():
+                task.cancel()
 
     # ------------------------------------------------------------------
     # Unwinding and disposal
     # ------------------------------------------------------------------
 
     async def _unwind_loop(self) -> None:
-        cancelled: Optional[BaseException] = None
-        while self._effects or self._children:
-            # Children first, then own effects, each newest first.
-            _, eff = (self._children if self._children else self._effects).popitem()
+        bag: List[BaseException] = []
+        while True:
+            if self._effects or self._children:
+                # Children first, then own effects, each newest first.
+                _, eff = (self._children if self._children else self._effects).popitem()
+                try:
+                    aw = self._undo(eff, bag)
+                    if aw is not _DONE:
+                        await aw
+                except asyncio.CancelledError as exc:
+                    bag.append(exc)
+                continue
+            live = self._live_pending()
+            if not live:
+                break
             try:
-                aw = self._undo(eff)
-                if aw is not _DONE:
-                    await aw
+                await asyncio.wait(live)
             except asyncio.CancelledError as exc:
-                cancelled = cancelled or exc
-        if cancelled is not None:
-            raise cancelled
+                bag.append(exc)
+        if bag:
+            raise bag[0]
 
     async def _run(self) -> None:
         token = _DISPOSING.set(_DISPOSING.get() | {id(self)})
         try:
             await self._unwind_loop()
         finally:
-            _DISPOSING.reset(token)
+            try:
+                _DISPOSING.reset(token)
+            except ValueError:
+                # "Token was created in a different Context": can happen when an
+                # unwind task that never finished is collected. Nothing to undo.
+                pass
             self._unwinding = False
             if self._closing and not self._has_work():
                 self._finish_dispose()
@@ -564,7 +740,7 @@ class Scope:
                 return
 
     def _has_work(self) -> bool:
-        return bool(self._effects or self._children)
+        return bool(self._effects or self._children or self._live_pending())
 
     def _finish_dispose(self) -> None:
         link, self._link = self._link, None
@@ -572,9 +748,10 @@ class Scope:
             parent, ident = link
             parent._children.pop(ident, None)
             if self._errors or self._dropped_errors:
+                recent = tuple(str(e) for e in list(self._errors)[-_CHILD_ERROR_TEXTS:])
                 parent._record(
                     f"scope {self.name}",
-                    ChildScopeErrors(self.name, list(self._errors), self._dropped_errors),
+                    ChildScopeErrors(self.name, len(self._errors) + self._dropped_errors, recent),
                 )
         self._set_state(ScopeState.DISPOSED)
 
@@ -584,21 +761,36 @@ class Scope:
         Idempotent: later calls return at once if it is finished, and wait for
         it if it is still running. Errors from undos do not raise; they are in
         ``errors``. A disposer that calls ``dispose()`` on its own scope gets an
-        immediate return instead of a deadlock.
+        immediate return instead of a deadlock. So does a disposer that waits for
+        another scope whose disposal is (directly or through others) waiting for
+        this one: the call that would close the cycle returns without waiting.
+
+        If a disposer raised a ``BaseException`` that is not ``CancelledError``
+        (``SystemExit``, ``KeyboardInterrupt``), the remaining disposers still
+        run, the scope ends DISPOSED, and then that exception is raised here.
 
         The unwinding runs as its own task. If the caller is cancelled (for
         example by ``asyncio.wait_for``), it stops waiting, but the unwinding
         carries on until it is done, so nothing is left behind.
         """
-        if self._state is ScopeState.DISPOSED or id(self) in _DISPOSING.get():
+        marks = _DISPOSING.get()
+        if self._state is ScopeState.DISPOSED or id(self) in marks:
             return
+        if marks and _waits_reach(id(self), marks):
+            return  # waiting would close a cycle: two disposals waiting for each other
         self._closing = True
         task = self._task
         if (task is None or task.done()) and not self._has_work():
             self._finish_dispose()
             return
-        while self._state is not ScopeState.DISPOSED:
-            await asyncio.shield(self._ensure_task())
+        if marks:
+            _add_waits(marks, id(self))
+        try:
+            while self._state is not ScopeState.DISPOSED:
+                await asyncio.shield(self._ensure_task())
+        finally:
+            if marks:
+                _drop_waits(marks, id(self))
 
     # ------------------------------------------------------------------
     # Start, restart
@@ -651,8 +843,11 @@ class Scope:
         return await self._run_setup(setup)
 
     async def _settle(self) -> None:
-        while self._pending:
-            await asyncio.wait(list(self._pending))
+        while True:
+            live = self._live_pending()
+            if not live:
+                return
+            await asyncio.wait(live)
 
     async def _run_setup(self, setup: Optional[Setup]) -> "Scope":
         self._async_failure = None
@@ -671,7 +866,10 @@ class Scope:
             except GeneratorExit:
                 raise
             except BaseException:
-                # Cancellation (or Ctrl-C): not a failure, but do not leak.
+                # Cancellation (or Ctrl-C): not a failure, but do not leak. Async
+                # effects that have not resolved are cancelled first, otherwise a
+                # hanging one would keep the unwinding (and a timeout) waiting.
+                self._cancel_unresolved()
                 await self._join_unwind()
                 raise
             if self._closing:
@@ -679,6 +877,7 @@ class Scope:
                 await self.dispose()
                 return self
             if failed:
+                self._cancel_unresolved()
                 await self._join_unwind()
                 if self._closing:
                     self._starting = False
@@ -715,6 +914,8 @@ class Scope:
         report: Dict[str, Any] = {
             "name": self.name,
             "state": self._state.value,
+            "closing": self._closing,  # dispose() was requested
+            "unwinding": self._unwinding,  # undos are running right now
             "effects": self.effect_count,
             "error_count": len(self._errors),
             "dropped_errors": self._dropped_errors,
