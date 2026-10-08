@@ -483,3 +483,35 @@ class TestNoSilentTruncation:
         agent._store_browse_result(url, content, _fingerprint(content), "user1", make_node())
         warm = mem.recall(url, rings=[MemoryRing.WARM])
         assert warm[0].content == content
+
+    def test_tavily_direct_answer_is_not_cut(self, tmp_path, monkeypatch):
+        import aria.agents.web_agent as wa
+        agent, _ = self._make_agent(tmp_path)
+        answer = "a" * 1500
+
+        async def fake_tavily(query, key, max_results=5):
+            return [{"title": "Tavily Summary", "url": "", "content": answer, "keep_full": True}]
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ARIA_TAVILY_KEY", "k")
+        monkeypatch.setattr(wa, "_search_tavily", fake_tavily)
+        out = asyncio.run(agent._execute_search("q", "user1", make_node()))
+        assert answer in out
+        assert agent.spill_store.spills_total == 0
+
+    def test_clean_text_without_cap_keeps_everything(self):
+        text = "word " * 5000
+        assert len(_clean_text(text)) == len(text.strip())
+
+    def test_fresh_browse_over_cap_reports_omitted_count(self, tmp_path, monkeypatch):
+        import aria.agents.web_agent as wa
+        agent, _ = self._make_agent(tmp_path)
+        agent._max_content_chars = 1000
+        page = "p" * 4000
+
+        async def fake_fetch(url):
+            return page, "fake"
+
+        monkeypatch.setattr(wa, "_fetch_page", fake_fetch)
+        out = asyncio.run(agent._execute_browse("https://example.com/big", "t", "user1", make_node()))
+        assert "3000" in out

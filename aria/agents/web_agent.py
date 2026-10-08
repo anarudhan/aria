@@ -87,15 +87,15 @@ def _fingerprint(content: str) -> str:
     return hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _clean_text(raw: str, max_chars: int = 12000) -> str:
+def _clean_text(raw: str, max_chars: Optional[int] = None) -> str:
     raw = re.sub(r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<style[^>]*>.*?</style>",  " ", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<[^>]+>", " ", raw)
     raw = raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     raw = raw.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
     raw = re.sub(r"\s+", " ", raw).strip()
-    if len(raw) <= max_chars:
-        return raw
+    if max_chars is None or len(raw) <= max_chars:
+        return raw   # no cap: callers shorten with an honest preview (issue #48)
     truncated = raw[:max_chars]
     last_period = truncated.rfind(". ")
     if last_period > max_chars * 0.8:
@@ -262,6 +262,7 @@ async def _search_tavily(query: str, api_key: str, max_results: int = 5) -> list
             "title":   "Tavily Summary",
             "url":     "",
             "content": data["answer"],
+            "keep_full": True,   # the direct answer was never cut; keep it that way
         })
     for r in data.get("results", []):
         results.append({
@@ -482,7 +483,8 @@ class WebAgent(BaseAgent):
             fp = _fingerprint(content)
             self._domain_trust.record(url, success=True, content_length=len(content))
             self._store_browse_result(url, content, fp, user_id, node)
-            return self._format_browse_result(url, content, fp, from_cache=False, elapsed=elapsed, method=method)
+            shown = self._show(content, self._max_content_chars)
+            return self._format_browse_result(url, shown, fp, from_cache=False, elapsed=elapsed, method=method)
         except Exception as ex:
             self._domain_trust.record(url, success=False)
             return (
@@ -611,7 +613,7 @@ class WebAgent(BaseAgent):
             url     = r.get("url", "")
             trust   = self._domain_trust.score(url) if url else 0.5
             content = r.get("content", "")
-            snippet = self._show(content, self.SNIPPET_PREVIEW_CHARS)
+            snippet = content if r.get("keep_full") else self._show(content, self.SNIPPET_PREVIEW_CHARS)
             lines.append(f"{i}. {r.get('title', 'No title')}")
             if url:
                 lines.append(f"   {url}  [trust: {trust:.2f}]")
