@@ -8,6 +8,7 @@ home folder. Offsets and lengths are CHARACTERS throughout.
 import errno
 import os
 import re
+import tempfile
 import time
 
 import pytest
@@ -17,9 +18,11 @@ from aria.core import spill as spill_module
 from aria.core.models import TaskNode
 from aria.core.spill import (
     READ_TOOL_NAME,
+    UNTRUSTED_NOTICE,
     SpillError,
     SpillNotFound,
     SpillStore,
+    SpillTooLarge,
     get_default_store,
     reset_default_store,
 )
@@ -57,8 +60,21 @@ class TestPreview:
 
     def test_exact_fit_unchanged_and_one_over_spills(self, store):
         assert store.preview_or_spill("x" * 50, 50).spilled is False
-        r = store.preview_or_spill("x" * 51, 50)
-        assert r.spilled and r.omitted_chars == 1
+        r = store.preview_or_spill("x" * 2000, 1999)
+        assert r.spilled is False and r.omitted_chars == 0 and r.text == "x" * 2000
+
+    def test_almost_nothing_omitted_stays_inline(self, store):
+        """1001 chars at max 1000: the note would be longer than what it hides."""
+        text = "q" * 1001
+        r = store.preview_or_spill(text, 1000)
+        assert r.text == text and r.omitted_chars == 0 and not r.spilled
+        assert r.locator is None and r.warning is None
+        assert spill_files(store) == []
+        assert store.describe()["spills_this_session"] == 0
+
+    def test_spills_once_preview_is_shorter_than_text(self, store):
+        r = store.preview_or_spill("q" * 2000, 1000)
+        assert r.spilled and len(r.text) < 2000
 
     def test_empty_text(self, store):
         assert store.preview_or_spill("", 0).text == ""
@@ -92,18 +108,18 @@ class TestPreview:
         assert text[:60] + middle + text[-30:] == text
 
     def test_zero_max_chars_omits_everything_but_saves_it(self, store):
-        r = store.preview_or_spill("secret text", 0)
-        assert r.omitted_chars == 11
-        assert store.read(r.locator, 0, 100) == "secret text"
+        r = store.preview_or_spill("secret text " * 100, 0)
+        assert r.omitted_chars == 1200
+        assert store.read(r.locator, 0, 2000) == "secret text " * 100
 
     def test_each_spill_gets_its_own_locator_and_file(self, store):
-        a = store.preview_or_spill("a" * 100, 10)
-        b = store.preview_or_spill("a" * 100, 10)
+        a = store.preview_or_spill("a" * 1000, 10)
+        b = store.preview_or_spill("a" * 1000, 10)
         assert a.locator != b.locator
         assert len(spill_files(store)) == 2
 
     def test_locator_is_opaque_hex_not_a_path(self, store):
-        r = store.preview_or_spill("z" * 100, 10)
+        r = store.preview_or_spill("z" * 1000, 10)
         assert re.fullmatch(r"[0-9a-f]{32}", r.locator)
         assert str(store.base_dir) not in r.text
 
@@ -140,7 +156,7 @@ class TestRead:
 
     @pytest.mark.parametrize("offset,length", [(-1, 10), (0, 0), (0, -5), ("1", 5), (0, 2.5), (True, 5)])
     def test_bad_numbers_rejected(self, store, offset, length):
-        loc = store.preview_or_spill("x" * 100, 10).locator
+        loc = store.preview_or_spill("x" * 1000, 10).locator
         with pytest.raises(SpillError):
             store.read(loc, offset, length)
 
@@ -156,15 +172,15 @@ class TestRead:
         assert store.read(r.locator, 0, 10_000) == text
 
     def test_lone_surrogate_and_crlf_survive(self, store):
-        text = "a\r\nb\ud800c\r\n" * 20
+        text = "a\r\nb\ud800c\r\n" * 200
         loc = store.preview_or_spill(text, 10).locator
         assert store.read(loc, 0, 10_000) == text
 
     def test_describe_bytes_are_utf8_bytes(self, store):
-        text = "日" * 100
+        text = "日" * 1000
         store.preview_or_spill(text, 10)
         d = store.describe()
-        assert d["files"] == 1 and d["bytes"] == 300
+        assert d["item_count"] == 1 and d["total_bytes"] == 3000
 
 
 # ─── Locator safety ──────────────────────────────────────────────────────────
@@ -191,7 +207,7 @@ class TestLocatorSafety:
         b"0" * 32,
     ])
     def test_invalid_ids_rejected(self, store, bad):
-        store.preview_or_spill("x" * 100, 10)
+        store.preview_or_spill("x" * 1000, 10)
         with pytest.raises(SpillError):
             store.read(bad)
 
@@ -202,7 +218,7 @@ class TestLocatorSafety:
     def test_foreign_locator_rejected(self, tmp_path):
         a = SpillStore(tmp_path / "a")
         b = SpillStore(tmp_path / "b")
-        loc = a.preview_or_spill("x" * 100, 10).locator
+        loc = a.preview_or_spill("x" * 1000, 10).locator
         with pytest.raises(SpillNotFound):
             b.read(loc)
 
@@ -216,13 +232,13 @@ class TestLocatorSafety:
     def test_second_store_on_same_folder_cannot_read_first_stores_ids(self, tmp_path):
         a = SpillStore(tmp_path / "s")
         b = SpillStore(tmp_path / "s")
-        loc = a.preview_or_spill("x" * 100, 10).locator
+        loc = a.preview_or_spill("x" * 1000, 10).locator
         with pytest.raises(SpillNotFound):
             b.read(loc)
 
     @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
     def test_symlink_swapped_in_is_refused(self, store, tmp_path):
-        loc = store.preview_or_spill("x" * 100, 10).locator
+        loc = store.preview_or_spill("x" * 1000, 10).locator
         outside = tmp_path / "outside.txt"
         outside.write_text("do not read me")
         path = store.base_dir / (loc + ".spill")
@@ -230,16 +246,6 @@ class TestLocatorSafety:
         path.symlink_to(outside)
         with pytest.raises(SpillError):
             store.read(loc)
-
-    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
-    def test_symlinked_base_dir_is_not_used(self, tmp_path):
-        real = tmp_path / "real"
-        real.mkdir()
-        link = tmp_path / "link"
-        link.symlink_to(real)
-        s = SpillStore(link)
-        assert not s.usable
-        assert os.listdir(real) == []
 
 
 # ─── Permissions and exclusive creation ──────────────────────────────────────
@@ -250,19 +256,11 @@ class TestFilesystem:
         old = os.umask(0)           # a permissive umask must not weaken the modes
         try:
             s = SpillStore(tmp_path / "private")
-            loc = s.preview_or_spill("x" * 100, 10).locator
+            loc = s.preview_or_spill("x" * 1000, 10).locator
         finally:
             os.umask(old)
         assert (os.stat(s.base_dir).st_mode & 0o777) == 0o700
         assert (os.stat(s.base_dir / (loc + ".spill")).st_mode & 0o777) == 0o600
-
-    @posix_only
-    def test_existing_loose_folder_is_tightened(self, tmp_path):
-        d = tmp_path / "loose"
-        d.mkdir(mode=0o755)
-        os.chmod(d, 0o755)
-        SpillStore(d)
-        assert (os.stat(d).st_mode & 0o777) == 0o700
 
     def test_exclusive_creation_never_overwrites(self, store, monkeypatch):
         victim = "7" * 32
@@ -270,17 +268,17 @@ class TestFilesystem:
         path.write_text("precious")
         ids = iter([victim, victim, "8" * 32])
         monkeypatch.setattr(spill_module.secrets, "token_hex", lambda n: next(ids))
-        r = store.preview_or_spill("n" * 100, 10)
+        r = store.preview_or_spill("n" * 1000, 10)
         assert path.read_text() == "precious"       # untouched
         assert r.locator == "8" * 32                # retried with a fresh id
-        assert store.read(r.locator, 0, 200) == "n" * 100
+        assert store.read(r.locator, 0, 2000) == "n" * 1000
 
     def test_all_ids_colliding_keeps_text_inline(self, store, monkeypatch):
         victim = "7" * 32
         path = store.base_dir / (victim + ".spill")
         path.write_text("precious")
         monkeypatch.setattr(spill_module.secrets, "token_hex", lambda n: victim)
-        text = "n" * 100
+        text = "n" * 1000
         r = store.preview_or_spill(text, 10)
         assert path.read_text() == "precious"
         assert r.text == text and not r.spilled and r.omitted_chars == 0
@@ -324,13 +322,13 @@ class TestSaveFailure:
         blocker.write_text("x")
         s = SpillStore(blocker)
         assert not s.usable and s.warnings
-        text = "w" * 300
+        text = "w" * 1000
         r = s.preview_or_spill(text, 10)
         assert r.text == text and r.omitted_chars == 0
 
     def test_failure_does_not_count_as_spill(self, store, monkeypatch):
         monkeypatch.setattr(spill_module.os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
-        store.preview_or_spill("a" * 100, 10)
+        store.preview_or_spill("a" * 1000, 10)
         monkeypatch.undo()
         assert store.describe()["spills_this_session"] == 0
 
@@ -352,8 +350,8 @@ class TestRetention:
 
     def test_cleanup_removes_only_old_files(self, tmp_path):
         s = SpillStore(tmp_path / "s", retention_seconds=3600)
-        old = s.preview_or_spill("o" * 100, 10).locator
-        new = s.preview_or_spill("n" * 100, 10).locator
+        old = s.preview_or_spill("o" * 1000, 10).locator
+        new = s.preview_or_spill("n" * 1000, 10).locator
         self._age(s, old, 7200)
         assert s.cleanup() == 1
         assert spill_files(s) == [new + ".spill"]
@@ -362,7 +360,7 @@ class TestRetention:
         assert s.read(new, 0, 5) == "nnnnn"
 
     def test_cleanup_with_explicit_age(self, store):
-        a = store.preview_or_spill("a" * 100, 10).locator
+        a = store.preview_or_spill("a" * 1000, 10).locator
         self._age(store, a, 120)
         assert store.cleanup(max_age_seconds=3600) == 0
         assert store.cleanup(max_age_seconds=60) == 1
@@ -380,12 +378,12 @@ class TestRetention:
 
     def test_clear_all(self, store):
         for _ in range(3):
-            store.preview_or_spill("x" * 100, 10)
+            store.preview_or_spill("x" * 1000, 10)
         (store.base_dir / "keep.txt").write_text("k")
         assert store.clear_all() == 3
         assert spill_files(store) == []
         assert (store.base_dir / "keep.txt").exists()
-        assert store.describe()["files"] == 0
+        assert store.describe()["item_count"] == 0
 
     def test_negative_arguments_rejected(self, store, tmp_path):
         with pytest.raises(ValueError):
@@ -394,13 +392,273 @@ class TestRetention:
             SpillStore(tmp_path / "x", retention_seconds=-1)
 
     def test_describe(self, store):
-        store.preview_or_spill("a" * 100, 10)
-        store.preview_or_spill("b" * 200, 10)
+        store.preview_or_spill("a" * 1000, 10)
+        store.preview_or_spill("b" * 2000, 10)
         d = store.describe()
-        assert d["files"] == 2 and d["bytes"] == 300
+        assert d["item_count"] == 2 and d["total_bytes"] == 3000
         assert d["spills_this_session"] == 2
-        assert d["characters_omitted_from_previews"] == 90 + 190
+        assert d["characters_omitted_from_previews"] == 990 + 1990
+        assert d["max_item_bytes"] == spill_module.DEFAULT_MAX_ITEM_BYTES
+        assert d["max_total_bytes"] == spill_module.DEFAULT_MAX_TOTAL_BYTES
         assert d["usable"] is True and d["warnings"] == 0
+
+
+# ─── Folder ownership: only our own subfolder is ever touched ────────────────
+
+def mode_of(path):
+    return os.stat(path).st_mode & 0o7777
+
+
+class TestOwnFolderOnly:
+    def test_store_works_in_a_subfolder_of_the_base(self, tmp_path):
+        s = SpillStore(tmp_path / "base")
+        assert s.base_dir == tmp_path / "base" / f"aria-spill-{spill_module._uid_suffix()}"
+        assert s.base_dir.is_dir() and s.usable
+
+    @posix_only
+    def test_subfolder_is_created_0700_even_with_open_umask(self, tmp_path):
+        old = os.umask(0)
+        try:
+            s = SpillStore(tmp_path / "base")
+        finally:
+            os.umask(old)
+        assert mode_of(s.base_dir) == 0o700
+
+    @posix_only
+    def test_loose_base_dir_and_foreign_files_are_left_alone(self, tmp_path):
+        base = tmp_path / "shared"
+        base.mkdir()
+        os.chmod(base, 0o755)
+        foreign = base / "someone_elses.txt"
+        foreign.write_text("mine")
+        os.chmod(foreign, 0o644)
+        s = SpillStore(base)
+        s.preview_or_spill("x" * 1000, 10)
+        s.cleanup(0)
+        s.clear_all()
+        assert mode_of(base) == 0o755
+        assert foreign.read_text() == "mine" and mode_of(foreign) == 0o644
+        assert mode_of(s.base_dir) == 0o700
+
+    @posix_only
+    def test_sticky_world_writable_base_keeps_its_mode(self, tmp_path):
+        base = tmp_path / "sticky"
+        base.mkdir()
+        os.chmod(base, 0o1777)
+        s = SpillStore(base)
+        assert s.usable
+        assert mode_of(base) == 0o1777
+        assert mode_of(s.base_dir) == 0o700
+
+    @posix_only
+    def test_existing_own_subfolder_is_tightened(self, tmp_path):
+        base = tmp_path / "b"
+        base.mkdir()
+        sub = base / f"aria-spill-{spill_module._uid_suffix()}"
+        sub.mkdir()
+        os.chmod(sub, 0o755)
+        s = SpillStore(base)
+        assert s.usable and mode_of(sub) == 0o700
+
+    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs symlinks")
+    def test_symlink_at_subfolder_path_is_refused(self, tmp_path):
+        base = tmp_path / "b"
+        base.mkdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        (base / f"aria-spill-{spill_module._uid_suffix()}").symlink_to(target)
+        s = SpillStore(base)
+        assert not s.usable and s.warnings
+        text = "p" * 1000
+        assert s.preview_or_spill(text, 10).text == text
+        assert os.listdir(target) == []
+        if os.name == "posix":
+            assert mode_of(target) == 0o755
+
+    @posix_only
+    def test_foreign_owned_subfolder_is_refused_and_not_chmoded(self, tmp_path, monkeypatch):
+        base = tmp_path / "b"
+        base.mkdir()
+        suffix = spill_module._uid_suffix()
+        sub = base / f"aria-spill-{suffix}"
+        sub.mkdir()
+        os.chmod(sub, 0o755)
+        owner_uid = os.stat(sub).st_uid
+        # Pretend we are a different user (tests may run as root).
+        monkeypatch.setattr(spill_module, "_uid_suffix", lambda: suffix)
+        monkeypatch.setattr(spill_module.os, "geteuid", lambda: owner_uid + 1)
+        s = SpillStore(base)
+        assert not s.usable
+        assert any("owned by another user" in w for w in s.warnings)
+        assert mode_of(sub) == 0o755
+        text = "p" * 1000
+        assert s.preview_or_spill(text, 10).text == text
+
+    def test_cleanup_only_deletes_spill_files_inside_the_subfolder(self, tmp_path):
+        base = tmp_path / "b"
+        s = SpillStore(base)
+        look_alike = base / ("a" * 32 + ".spill")      # right name, wrong folder
+        look_alike.write_text("keep")
+        inside_other = s.base_dir / "readme.txt"
+        inside_other.write_text("keep")
+        old = time.time() - 10**6
+        os.utime(look_alike, (old, old))
+        os.utime(inside_other, (old, old))
+        s.preview_or_spill("x" * 1000, 10)
+        assert s.cleanup(0) == 1
+        assert s.clear_all() == 0
+        assert look_alike.exists() and inside_other.exists()
+
+    def test_relative_base_dir_is_made_absolute(self, tmp_path, monkeypatch):
+        (tmp_path / "work").mkdir()
+        (tmp_path / "elsewhere").mkdir()
+        monkeypatch.chdir(tmp_path / "work")
+        s = SpillStore("rel_spill")
+        assert s.parent_dir.is_absolute() and s.base_dir.is_absolute()
+        loc = s.preview_or_spill("r" * 1000, 10).locator
+        monkeypatch.chdir(tmp_path / "elsewhere")
+        assert s.read(loc, 0, 5) == "rrrrr"
+        assert not (tmp_path / "elsewhere" / "rel_spill").exists()
+
+
+# ─── Argument validation, notices ────────────────────────────────────────────
+
+class TestValidationAndNotice:
+    @pytest.mark.parametrize("bad", [True, False, 1.5, 10.0, "10", None])
+    def test_max_chars_wrong_type(self, store, bad):
+        with pytest.raises(TypeError):
+            store.preview_or_spill("x" * 5000, bad)
+        assert spill_files(store) == []
+
+    def test_bad_arguments_leave_no_orphan_file(self, store):
+        for args in [("x" * 5000, -5), (b"x" * 5000, 10), ("x" * 5000, 10, 7)]:
+            with pytest.raises((TypeError, ValueError)):
+                store.preview_or_spill(*args)
+        assert spill_files(store) == []
+        assert store.describe()["item_count"] == 0
+
+    def test_preview_marker_carries_untrusted_notice(self, store):
+        r = store.preview_or_spill("n" * 3000, 100)
+        assert f"[{UNTRUSTED_NOTICE} ..." in r.text
+
+    def test_small_text_gets_no_notice(self, store):
+        assert UNTRUSTED_NOTICE not in store.preview_or_spill("hello", 100).text
+
+
+# ─── Owner binding ───────────────────────────────────────────────────────────
+
+class TestOwner:
+    def test_other_owner_cannot_read_even_with_the_real_locator(self, store):
+        loc = store.preview_or_spill("s" * 1000, 10, owner="A").locator
+        assert store.read(loc, 0, 5, owner="A") == "sssss"
+        with pytest.raises(SpillNotFound) as other:
+            store.read(loc, 0, 5, owner="B")
+        with pytest.raises(SpillNotFound) as default:
+            store.read(loc, 0, 5)
+        with pytest.raises(SpillNotFound) as unknown:
+            store.read("0" * 32, 0, 5, owner="B")
+        # Exactly the same message as an id that never existed: no hint it exists.
+        assert str(other.value) == str(unknown.value) == str(default.value)
+
+    def test_owner_must_be_a_string(self, store):
+        with pytest.raises(TypeError):
+            store.preview_or_spill("s" * 1000, 10, owner=5)
+        loc = store.preview_or_spill("s" * 1000, 10, owner="A").locator
+        with pytest.raises(SpillError):
+            store.read(loc, 0, 5, owner=None)
+
+    def test_expired_message_only_for_the_owner(self, store):
+        loc = store.preview_or_spill("s" * 1000, 10, owner="A").locator
+        store.cleanup(0)
+        with pytest.raises(SpillNotFound, match="expired"):
+            store.read(loc, owner="A")
+        with pytest.raises(SpillNotFound) as other:
+            store.read(loc, owner="B")
+        assert "expired" not in str(other.value)
+
+
+# ─── Size bounds, eviction, sweeping ─────────────────────────────────────────
+
+class TestBounds:
+    def _spill_aged(self, s, ch, size, age):
+        loc = s.preview_or_spill(ch * size, 10).locator
+        t = time.time() - age
+        os.utime(s.base_dir / (loc + ".spill"), (t, t))
+        return loc
+
+    def test_item_over_max_item_bytes_stays_inline_with_warning(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_item_bytes=500)
+        text = "m" * 1000
+        r = s.preview_or_spill(text, 10)
+        assert r.text == text and not r.spilled and r.omitted_chars == 0
+        assert r.warning and "max_item_bytes" in r.warning
+        assert s.warnings and "max_item_bytes" in s.warnings[-1]
+        assert spill_files(s) == []
+
+    def test_item_bytes_are_measured_in_utf8_not_characters(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_item_bytes=2000)
+        assert s.preview_or_spill("日" * 1000, 10).spilled is False   # 3000 bytes
+        assert s.preview_or_spill("a" * 1000, 10).spilled is True     # 1000 bytes
+
+    def test_item_over_max_total_bytes_stays_inline(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_total_bytes=800)
+        r = s.preview_or_spill("m" * 1000, 10)
+        assert not r.spilled and r.text == "m" * 1000 and s.warnings
+
+    def test_oldest_evicted_first_with_warning(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_total_bytes=2500)
+        first = self._spill_aged(s, "1", 1000, 300)
+        second = self._spill_aged(s, "2", 1000, 200)
+        r = s.preview_or_spill("3" * 1000, 10)           # 3000 > 2500: evict one
+        assert r.spilled
+        assert s.describe()["item_count"] == 2 and s.describe()["total_bytes"] == 2000
+        with pytest.raises(SpillNotFound, match="expired"):
+            s.read(first)
+        assert s.read(second, 0, 3) == "222"
+        assert s.read(r.locator, 0, 3) == "333"
+        assert any("removed 1 older" in w for w in s.warnings)
+
+    def test_eviction_removes_several_oldest_in_age_order(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_total_bytes=3500)
+        a = self._spill_aged(s, "a", 1000, 400)
+        b = self._spill_aged(s, "b", 1000, 300)
+        c = self._spill_aged(s, "c", 1000, 100)
+        r = s.preview_or_spill("d" * 2000, 10)           # needs 1500 freed: a then b
+        assert r.spilled
+        for gone in (a, b):
+            with pytest.raises(SpillNotFound, match="expired"):
+                s.read(gone)
+        assert s.read(c, 0, 1) == "c" and s.read(r.locator, 0, 1) == "d"
+        assert any("removed 2 older" in w for w in s.warnings)
+
+    def test_total_never_exceeds_bound(self, tmp_path):
+        s = SpillStore(tmp_path / "s", max_total_bytes=5000)
+        for i in range(30):
+            s.preview_or_spill(chr(97 + i % 26) * 1000, 10)
+            assert s.describe()["total_bytes"] <= 5000
+
+    def test_bounds_must_be_positive(self, tmp_path):
+        with pytest.raises(ValueError):
+            SpillStore(tmp_path / "x", max_item_bytes=0)
+        with pytest.raises(ValueError):
+            SpillStore(tmp_path / "x", max_total_bytes=0)
+
+    def test_too_large_error_type(self):
+        assert issubclass(SpillTooLarge, SpillError)
+
+    def test_periodic_sweep_removes_expired_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(spill_module, "_SWEEP_EVERY", 3)
+        s = SpillStore(tmp_path / "s", retention_seconds=3600)
+        old = self._spill_aged(s, "o", 1000, 7200)         # 1st spill
+        s.preview_or_spill("a" * 1000, 10)                  # 2nd: no sweep yet
+        assert (s.base_dir / (old + ".spill")).exists()
+        s.preview_or_spill("b" * 1000, 10)                  # 3rd: sweep first
+        assert not (s.base_dir / (old + ".spill")).exists()
+        assert s.describe()["item_count"] == 2
+
+    def test_default_sweep_interval_is_50(self):
+        assert spill_module._SWEEP_EVERY == 50
 
 
 # ─── Default store ───────────────────────────────────────────────────────────
@@ -408,14 +666,77 @@ class TestRetention:
 class TestDefaultStore:
     def test_default_store_uses_env_folder_and_is_shared(self, tmp_path):
         s = get_default_store()
-        assert s.base_dir == tmp_path / "default-spill"
+        assert s.parent_dir == tmp_path / "default-spill"
+        assert s.base_dir == tmp_path / "default-spill" / f"aria-spill-{spill_module._uid_suffix()}"
         assert get_default_store() is s
 
     def test_default_folder_is_outside_the_repo(self, monkeypatch):
         monkeypatch.delenv("ARIA_SPILL_DIR")
-        d = spill_module._default_dir()
+        d = spill_module._default_parent()
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         assert not str(d).startswith(repo + os.sep)
+
+    def test_primary_unsafe_falls_back_to_private_temp_folder(self, tmp_path, monkeypatch):
+        parent = tmp_path / "default-spill"
+        parent.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (parent / f"aria-spill-{spill_module._uid_suffix()}").symlink_to(elsewhere)
+        tmp_area = tmp_path / "tmp-area"
+        tmp_area.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_area))
+        s = get_default_store()
+        assert s.usable and s.enabled
+        assert tmp_area in s.base_dir.parents
+        assert any("unusable" in w for w in s.warnings)
+        assert s.preview_or_spill("f" * 1000, 10).spilled is True
+        assert os.listdir(elsewhere) == []
+
+    async def test_everything_fails_gives_inline_only_store_and_agent_still_works(
+        self, tmp_path, monkeypatch
+    ):
+        parent = tmp_path / "default-spill"
+        parent.mkdir()
+        (parent / f"aria-spill-{spill_module._uid_suffix()}").symlink_to(tmp_path)
+
+        def no_temp(*a, **k):
+            raise OSError(errno.ENOSPC, "no space")
+
+        monkeypatch.setattr(spill_module.tempfile, "mkdtemp", no_temp)
+        s = get_default_store()                      # must not raise
+        assert not s.usable and not s.enabled
+        assert s.warnings and any("unavailable" in w for w in s.warnings)
+
+        big = "Z" * 5000
+        r = s.preview_or_spill(big, 100)
+        assert r.text == big and r.omitted_chars == 0 and r.warning
+
+        llm = ScriptedLLM([{"content": "FINAL_ANSWER: ok"}])
+        agent = LLMAgent(agent_id="a", capabilities=["x"], domains=["d"], llm=llm)
+        assert await agent.execute(TaskNode(description="t"), {"n1": big}, None) == "ok"
+        assert big in llm.calls[0]["messages"][0]["content"]      # whole text, nothing dropped
+        assert READ_TOOL_NAME not in agent._tools
+        assert os.listdir(tmp_path) == ["default-spill"]
+
+    def test_failure_building_primary_store_still_does_not_raise(self, tmp_path, monkeypatch):
+        def boom():
+            raise RuntimeError("bad environment")
+
+        tmp_area = tmp_path / "tmp-area"
+        tmp_area.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_area))
+        monkeypatch.setattr(spill_module, "_default_parent", boom)
+        s = get_default_store()
+        assert s.usable and any("bad environment" in w for w in s.warnings)
+
+    def test_sweeps_old_files_once_when_created(self):
+        first = get_default_store()
+        loc = first.preview_or_spill("o" * 1000, 10).locator
+        t = time.time() - 10 * 24 * 3600
+        os.utime(first.base_dir / (loc + ".spill"), (t, t))
+        reset_default_store()
+        second = get_default_store()
+        assert second.describe()["item_count"] == 0
 
 
 # ─── Wiring into LLMAgent ────────────────────────────────────────────────────
@@ -503,17 +824,17 @@ class TestAgentWiring:
 
     async def test_read_spilled_pages_on(self, store):
         agent = make_agent(store, ScriptedLLM([]))
-        loc = store.preview_or_spill("0123456789" * 10, 10).locator
+        loc = store.preview_or_spill("0123456789" * 100, 10, owner="spiller").locator
         res = agent.read_spilled(loc, 10, 20)
-        assert res.startswith("0123456789" * 2)
-        assert "characters 10 to 30 of 100" in res
+        assert res.startswith(f"[{UNTRUSTED_NOTICE}]\n" + "0123456789" * 2)
+        assert "characters 10 to 30 of 1000" in res
         assert f'{READ_TOOL_NAME}(locator="{loc}", offset=30)' in res
 
     async def test_read_spilled_reaches_end_and_reports_it(self, store):
         agent = make_agent(store, ScriptedLLM([]))
-        loc = store.preview_or_spill("abcdefghij", 3).locator
-        res = agent.read_spilled(loc, 5, 100)
-        assert res.startswith("fghij") and "end of text" in res
+        loc = store.preview_or_spill("abcdefghij" * 100, 3, owner="spiller").locator
+        res = agent.read_spilled(loc, 995, 100)
+        assert res == f"[{UNTRUSTED_NOTICE}]\nfghij\n[characters 995 to 1000 of 1000; end of text]"
 
     async def test_read_spilled_returns_error_text_for_bad_locator(self, store):
         agent = make_agent(store, ScriptedLLM([]))
@@ -570,7 +891,45 @@ class TestAgentWiring:
     async def test_agent_without_store_uses_default_in_configured_folder(self, tmp_path):
         agent = LLMAgent(agent_id="a", capabilities=["x"], domains=["d"], llm=ScriptedLLM([]))
         assert agent.spill_store is get_default_store()
-        assert agent.spill_store.base_dir == tmp_path / "default-spill"
+        assert agent.spill_store.parent_dir == tmp_path / "default-spill"
+
+
+    async def test_agent_b_cannot_read_agent_a_spill_even_with_real_locator(self, store):
+        def big():
+            return "P" * 4000
+
+        a = LLMAgent(agent_id="agent_a", capabilities=["x"], domains=["d"],
+                     tools=[big], llm=ScriptedLLM([]), spill_store=store)
+        b = LLMAgent(agent_id="agent_b", capabilities=["x"], domains=["d"],
+                     llm=ScriptedLLM([]), spill_store=store)      # same shared store
+        assert a.spill_store is b.spill_store
+        out = await a._execute_tools([{"name": "big", "arguments": {}}])
+        loc = re.search(r"spill id ([0-9a-f]{32})", out[0]["result"]).group(1)
+
+        mine = a.read_spilled(loc, 0, 4)
+        assert not mine.startswith("Error") and "PPPP" in mine
+        theirs = b.read_spilled(loc, 0, 4)
+        unknown = b.read_spilled("0" * 32, 0, 4)
+        assert theirs == unknown == "Error: unknown spill locator"
+
+    async def test_read_spilled_output_starts_with_untrusted_notice(self, store):
+        def big():
+            return "N" * 4000
+
+        agent = make_agent(store, ScriptedLLM([]), tools=[big])
+        out = await agent._execute_tools([{"name": "big", "arguments": {}}])
+        assert UNTRUSTED_NOTICE in out[0]["result"]
+        loc = re.search(r"spill id ([0-9a-f]{32})", out[0]["result"]).group(1)
+        assert agent.read_spilled(loc, 0, 10).startswith(f"[{UNTRUSTED_NOTICE}]\n")
+
+    async def test_dependency_barely_over_limit_is_not_spilled(self, store):
+        text = "d" * 1001
+        llm = ScriptedLLM([{"content": "FINAL_ANSWER: ok"}])
+        agent = make_agent(store, llm)
+        await agent.execute(TaskNode(description="t"), {"n1": text}, None)
+        assert f"[n1]: {text}" in llm.calls[0]["messages"][0]["content"]
+        assert spill_files(store) == []
+        assert READ_TOOL_NAME not in agent._tools
 
 
 def test_cut_marks_truncation_with_count():

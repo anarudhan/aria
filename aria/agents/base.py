@@ -49,7 +49,13 @@ from ..core.models import (
     MessageType,
     TaskNode,
 )
-from ..core.spill import READ_TOOL_NAME, SpillError, SpillStore, get_default_store
+from ..core.spill import (
+    READ_TOOL_NAME,
+    UNTRUSTED_NOTICE,
+    SpillError,
+    SpillStore,
+    get_default_store,
+)
 
 if TYPE_CHECKING:
     from ..core.memory import TemporalMemory
@@ -255,7 +261,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
     def read_spilled(self, locator: str, offset: int = 0, length: int = 2000) -> str:
         """Read more of an output that was shortened. Pass the spill id from the omission note; offset and length count characters."""
         try:
-            page = self.spill_store.read_page(locator, offset, length)
+            page = self.spill_store.read_page(locator, offset, length, owner=self.agent_id)
         except SpillError as exc:
             return f"Error: {exc}"
         note = f"[characters {page.offset} to {page.end} of {page.total_chars}"
@@ -263,7 +269,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
             note += f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", offset={page.end})"
         else:
             note += "; end of text"
-        return f"{page.text}\n{note}]"
+        return f"[{UNTRUSTED_NOTICE}]\n{page.text}\n{note}]"
 
     def _show(self, text: str, max_chars: int) -> str:
         """Return text as-is if it fits, else an honest preview (never a silent cut).
@@ -272,7 +278,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         available to the model. It is not added to the advertised fingerprint,
         and agents that never meet large output are unchanged.
         """
-        result = self.spill_store.preview_or_spill(text, max_chars)
+        result = self.spill_store.preview_or_spill(text, max_chars, owner=self.agent_id)
         if result.spilled and READ_TOOL_NAME not in self._tools:
             self._tools[READ_TOOL_NAME] = self.read_spilled
         return result.text
