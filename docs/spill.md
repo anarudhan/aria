@@ -83,6 +83,16 @@ a subfolder it creates itself, `<base>/aria-spill-<user id>`:
 * Each item is its own file with a random name and mode `0600`, created
   exclusively, so an existing file is never overwritten and a planted link is
   never followed.
+* Before every write the store checks again (with `lstat`, never following a
+  link) that the folder is still the very directory it validated: same device,
+  inode and owner, and a real directory. If it was deleted, replaced by a
+  symlink, another directory or a file, setup is re-run once from scratch; if
+  that fails the text stays inline with a warning, and nothing is written
+  outside the folder. After the write the store checks once more that the file
+  landed inside the folder, and removes it and keeps the text inline if not.
+  A very fast swap in the tiny gap between the check and the write is not
+  excluded; the folder is private to your user, so this only matters if
+  something else is already running as you.
 * Cleanup deletes only files named `<32 hex characters>.spill` inside that
   subfolder, never anything else.
 * On Windows the mode bits do not apply the same way; the folder is a normal
@@ -135,11 +145,16 @@ to give the model orders. Two things reduce the risk of confusion:
   omission note repeats it. Everything `read_spilled` returns also starts with
   the notice. So the content cannot place its own text ahead of the label.
 * A line of the shown content that starts with `[Untrusted data`,
-  `[characters ` or `[... ` (after optional spaces) gets a visible `> ` prefix,
-  so a forged "end of text" or a fake omission note cannot be mistaken for
-  ARIA's. The prefix is display only: counts and offsets always refer to the
-  original text, and the stored file is unchanged. Text that fits the limit is
-  passed through as before and is not touched.
+  `[characters ` or `[... ` gets a visible `> ` prefix, so a forged "end of
+  text" or a fake omission note cannot be mistaken for ARIA's. The test ignores
+  letter case, invisible format characters (zero-width space, BOM and the like),
+  any unicode spacing (non-breaking space, ideographic space) and extra spaces
+  after the `[`; the original line is kept and only gets the prefix. The prefix
+  is display only: counts and offsets always refer to the original text, and the
+  stored file is unchanged. Whenever a prefix was added, the omission note (or
+  the `read_spilled` footer) says that lines beginning with `> ` may have been
+  added by ARIA. Text that fits the limit is passed through as before and is not
+  touched.
 
 These measures reduce confusion; they cannot make a model immune to prompt
 injection. Content can still say anything in other words. The guarded pipeline
@@ -156,6 +171,8 @@ Spill files are temporary.
   many older items were removed. Their locators then answer "expired".
 * `max_items` (default 10,000): the same oldest-first eviction applies to the
   number of files.
+* A sweep lists the folder once (one `os.scandir` pass) and reuses that listing
+  to rebuild the accounting; locators whose file is gone are forgotten.
 * The store keeps a running total of items and bytes, so a spill does not list
   the folder. The accounting is rebuilt from the folder at startup, on every 50th
   spill (together with the retention sweep) and whenever it is found to disagree

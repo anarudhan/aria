@@ -51,6 +51,7 @@ from ..core.models import (
     TaskNode,
 )
 from ..core.spill import (
+    ESCAPE_SENTENCE,
     READ_TOOL_NAME,
     UNTRUSTED_NOTICE,
     SpillError,
@@ -278,11 +279,19 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         else:
             note += "; end of text"
         # Lines of the content that imitate our own notes get a "> " prefix.
-        return f"[{UNTRUSTED_NOTICE}]\n{neutralize_markers(page.text)}\n{note}]"
+        shown = neutralize_markers(page.text)
+        if shown != page.text:
+            note += f"; {ESCAPE_SENTENCE}"
+        return f"[{UNTRUSTED_NOTICE}]\n{shown}\n{note}]"
 
     def _owns_read_tool(self) -> bool:
         """True when the registered ``read_spilled`` is this agent's own method."""
-        return self._tools.get(READ_TOOL_NAME) == self.read_spilled
+        tool = self._tools.get(READ_TOOL_NAME)
+        # Identity, never ``==``: a user object could define __eq__ to say yes.
+        return (
+            getattr(tool, "__self__", None) is self
+            and getattr(tool, "__func__", None) is type(self).read_spilled
+        )
 
     def _show(self, text: str, max_chars: int) -> str:
         """Return text as-is if it fits, else an honest preview (never a silent cut).
