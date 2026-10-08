@@ -32,7 +32,8 @@ import re
 import secrets
 import threading
 import unicodedata
-from itertools import islice
+from array import array
+from itertools import compress, islice, repeat
 from typing import Any, Optional
 
 __all__ = [
@@ -159,38 +160,172 @@ def _normalise_bounded(text: str, cap: int) -> Optional[str]:
     return "".join(parts)
 
 
-_ASCII_DROP = dict.fromkeys(
-    [c for c in range(32) if chr(c) not in "\t\n\r\x0b\x0c"] + [127])   # control characters
-_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+# ─── The shadow: how split and look-alike labels are read ────────────────────
+#
+# The secret patterns only know plain spellings. To also read ``pa<zero width space>ssword=x``
+# or ``p<Cyrillic a>ssword=x`` the patterns are run on a "shadow" of the text: invisible,
+# control and combining characters removed, Cyrillic and Greek look-alike letters folded to
+# Latin, look-alikes of ":" and "=" folded to those. Every shadow character remembers where it
+# came from, so what the patterns find is hidden in the ORIGINAL text, and only there: the
+# rest of the text is returned exactly as it was.
+
+_EXTRA_INVISIBLE = frozenset(map(chr, (
+    0x115F, 0x1160, 0x3164, 0xFFA0,   # Hangul fillers
+    0x2800,                           # Braille blank
+    0x0640,                           # Arabic tatweel
+    0x02BC,                           # modifier letter apostrophe
+)))
+# marks, format, private use, unassigned and surrogate characters
+_INVISIBLE_CATEGORIES = frozenset({"Cf", "Mn", "Mc", "Me", "Co", "Cn", "Cs"})
+_KEPT_CONTROLS = frozenset("\t\n\x0b\x0c\r\x85")      # control characters that are white space
+_SEPARATOR_LOOKALIKES = {
+    chr(0x2236): ":", chr(0xA789): ":",              # ratio, modifier letter colon
+    chr(0x2254): "=", chr(0x2255): "=", chr(0xA78A): "=",   # colon equals, equals colon, modifier equals
+}
+_MAX_FOLD_CACHE = 20_000        # characters remembered by the fold tables
+_MAX_PASSES = 3                 # sweeps of all patterns over one shadow
 
 
-def _fold_run(run: str) -> str:
-    """Drop invisible, control and combining characters from non-ASCII text, fold look-alikes."""
-    kept = []
-    for char in unicodedata.normalize("NFKD", run):
-        category = unicodedata.category(char)
-        if category == "Cf" or category == "Mn" or (category == "Cc" and not char.isspace()):
-            continue
-        kept.append(char)
-    return unicodedata.normalize("NFC", "".join(kept).translate(_CONFUSABLES))
+def _is_invisible(char: str) -> bool:
+    """True for a character that is dropped from the shadow."""
+    category = unicodedata.category(char)
+    if category == "Cc":
+        return char not in _KEPT_CONTROLS
+    return category in _INVISIBLE_CATEGORIES or char in _EXTRA_INVISIBLE
 
 
-def _fold_text(text: str) -> str:
+def _fold_char(char: str) -> str:
+    """The shadow of one character of an NFKC text: "" (dropped) or exactly one character."""
+    if char in _SEPARATOR_LOOKALIKES:
+        return _SEPARATOR_LOOKALIKES[char]
+    if _is_invisible(char):
+        return ""
+    plain = "".join(
+        part for part in unicodedata.normalize("NFKD", char) if not _is_invisible(part)
+    ).translate(_CONFUSABLES)
+    return plain if len(plain) == 1 and plain.isascii() else char
+
+
+class _FoldTable(dict):  # type: ignore[type-arg]
+    """``str.translate`` table that works out each character once (the cache is bounded)."""
+
+    def __init__(self, keep_flags: bool) -> None:
+        super().__init__()
+        self._keep_flags = keep_flags
+
+    def __missing__(self, code: int) -> str:
+        folded = _fold_char(chr(code))
+        value = ("\x01" if folded else "\x00") if self._keep_flags else folded
+        if code < 128 or len(self) < _MAX_FOLD_CACHE:
+            self[code] = value
+        return value
+
+
+_FOLD = _FoldTable(False)       # code point -> shadow text ("" or one character)
+_KEEP = _FoldTable(True)        # code point -> "\x01" if it stays in the shadow, else "\x00"
+_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+_MARKER_RUN = re.compile(rb"\x01+")
+
+
+def _build_shadow(text: str) -> Optional[tuple[str, "array[int]"]]:
     """
-    The "shadow" of ``text``: invisible (Cf), control (Cc, except white space) and combining
-    (Mn) characters removed and Cyrillic and Greek look-alike letters folded to Latin, the same
-    folding that classifies key names. Returns ``text`` itself when there is nothing to fold.
+    The shadow of an NFKC-normalised ``text`` and, for each shadow character, the position of
+    the text character it came from. Returns None when the shadow is the text itself.
     """
-    shadow = text.translate(_ASCII_DROP)
-    if not shadow.isascii():
-        shadow = _NON_ASCII_RUN.sub(lambda match: _fold_run(match.group()), shadow)
-    return text if shadow == text else shadow
+    if text.isascii() and _ASCII_CONTROL.search(text) is None:
+        return None
+    shadow = text.translate(_FOLD)
+    if shadow == text:
+        return None
+    size = len(text)
+    if len(shadow) == size:                                # nothing dropped: one for one
+        return shadow, array("I", range(size))
+    keep = text.translate(_KEEP).encode("latin-1")
+    return shadow, array("I", compress(range(size), keep))
 
 
 def _apply_patterns(text: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _sweep(
+    shadow: str, first: "array[int]", last_of: "array[int]", marked: bytearray
+) -> tuple[str, "array[int]", "array[int]", bytearray, bool]:
+    """One pass of all patterns over ``shadow``, keeping the three tables in step."""
+    changed = False
+    for pattern, replacement in _SECRET_PATTERNS:
+        matches = list(pattern.finditer(shadow))
+        if not matches:
+            continue
+        changed = True
+        keeps_label = replacement.startswith("\\1")
+        marker = replacement[2:] if keeps_label else replacement
+        size = len(marker)
+        new_shadow: list[str] = []
+        new_first: "array[int]" = array("I")
+        new_last: "array[int]" = array("I")
+        new_marked = bytearray()
+        add_text, add_first = new_shadow.append, new_first.extend
+        add_last, add_marked = new_last.extend, new_marked.extend
+        ones = b"\x01" * size
+        done = 0
+        for match in matches:
+            start = match.end(1) if keeps_label else match.start()
+            end = match.end()
+            add_text(shadow[done:start])
+            add_first(first[done:start])
+            add_last(last_of[done:start])
+            add_marked(marked[done:start])
+            add_text(marker)
+            add_first(repeat(first[start], size))
+            add_last(repeat(last_of[end - 1], size))
+            add_marked(ones)
+            done = end
+        add_text(shadow[done:])
+        add_first(first[done:])
+        add_last(last_of[done:])
+        add_marked(marked[done:])
+        shadow, first, last_of, marked = "".join(new_shadow), new_first, new_last, new_marked
+    return shadow, first, last_of, marked, changed
+
+
+def _redact_mapped(text: str, shadow: str, first: "array[int]") -> str:
+    """
+    Run the patterns on ``shadow`` and hide what they find in ``text``.
+
+    Each pattern is applied exactly as in ``_apply_patterns`` (same order, same replacements),
+    but alongside the shadow three tables are kept for each character: the first and the end
+    of the span of ``text`` it stands for, and whether it belongs to a replacement. At the end
+    every replacement is cut into ``text`` over the span it stands for. Characters between
+    the replacements, invisible ones included, are not touched. The sweep over all patterns is
+    repeated (at most 3 sweeps) until a sweep hides nothing more.
+    """
+    last_of = array("I", map((1).__add__, first))
+    marked = bytearray(len(shadow))
+    for _ in range(_MAX_PASSES):
+        shadow, first, last_of, marked, changed = _sweep(shadow, first, last_of, marked)
+        if not changed:
+            break
+    pieces = []
+    cursor = 0
+    for run in _MARKER_RUN.finditer(marked):
+        begin, finish = run.span()
+        left = max(first[begin], cursor)
+        pieces.append(text[cursor:left])
+        pieces.append(shadow[begin:finish])
+        cursor = max(last_of[finish - 1], left)
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _redact_text(text: str) -> str:
+    """Hide secrets in an NFKC-normalised text, reading split and look-alike labels too."""
+    built = _build_shadow(text)
+    if built is None:                        # nothing to fold: one plain pass, as always
+        return _apply_patterns(text)
+    return _redact_mapped(text, built[0], built[1])
 
 
 def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
@@ -223,29 +358,24 @@ def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
 
     A text of more than 1,000,000 characters after NFKC normalisation is not scanned: it is
     replaced by ``<text, N characters, not scanned>`` so that nothing leaks and the work
-    stays bounded. The same marker is returned for a text with a run of more than 32
+    stays bounded. The cap is applied to the text before any redaction, so redaction making a
+    text longer can never trigger it. The same marker is returned for a text with a run of more than 32
     combining marks at a slice boundary (see ``_normalise_bounded``).
 
-    SPLIT AND LOOK-ALIKE LABELS. After the patterns have run on the normalised text, they run
-    a second time on a "shadow" of the result: invisible, control and combining characters
-    removed, Cyrillic and Greek look-alikes folded to Latin. So ``pa<zero width space>ssword=x``
-    and ``p<Cyrillic a>ssword=x`` are hidden too. If the second run hides something, the
-    shadow-based text is returned: the secret is hidden, and the rest of the text has lost its
-    invisible characters and accents and has its Cyrillic and Greek look-alike letters changed
-    to Latin ones. If it hides nothing, the text from the first run is returned unchanged.
+    SPLIT AND LOOK-ALIKE LABELS. The patterns are also run on a "shadow" of the text:
+    invisible, control, combining and other mark characters removed, Cyrillic and Greek
+    look-alike letters folded to Latin, look-alikes of ``:`` and ``=`` folded to those. So
+    ``pa<zero width space>ssword=x`` and ``p<Cyrillic a>ssword=x`` are hidden too. What the
+    patterns find in the shadow is hidden in the original text, and only there: the rest of
+    the text is returned as it was (invisible characters and accents included), except that
+    the hidden value and the characters inside it are replaced. The run is repeated (at most
+    3 passes) until a pass hides nothing more. See ``docs/redaction.md`` for the characters.
     """
     original_length = len(text)
     normalised = _normalise_bounded(text, _MAX_SANITIZE_CHARS)
     if normalised is None:
         return f"<text, {original_length} characters, not scanned>"
-    text = _apply_patterns(normalised)
-    shadow = _fold_text(text)
-    if shadow is not text:
-        if len(shadow) > _MAX_SANITIZE_CHARS:
-            return f"<text, {original_length} characters, not scanned>"
-        hidden = _apply_patterns(shadow)
-        if hidden != shadow:                  # a label that only the shadow could read
-            text = hidden
+    text = _redact_text(normalised)
     if len(text) > limit:
         text = f"{text[:limit]}... [truncated, original length {original_length} characters]"
     return text
@@ -304,7 +434,6 @@ _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
 _SURROGATES = re.compile(r"[\ud800-\udfff]")
 _DIGITS = "0123456789"
 _FULL = slice(None)
-_DROPPED_CATEGORIES = frozenset({"Cf", "Cc", "Mn"})   # invisible, control and combining marks
 
 
 def _is_secret_key(name: str) -> bool:
@@ -312,7 +441,8 @@ def _is_secret_key(name: str) -> bool:
     if len(name) > _MAX_KEY_CHARS:                     # cannot classify cheaply: fail closed
         return True
     name = unicodedata.normalize("NFKD", name)           # also splits "o" + accent apart
-    name = "".join(c for c in name if unicodedata.category(c) not in _DROPPED_CATEGORIES)
+    name = "".join(
+        c for c in name if unicodedata.category(c) != "Cc" and not _is_invisible(c))
     name = name.translate(_CONFUSABLES)
     name = _CAMEL_ACRONYM.sub("_", _CAMEL_LOWER_UPPER.sub("_", name))
     name = _NOT_ALNUM.sub("_", name.lower())

@@ -1708,12 +1708,10 @@ class TestSplitAndLookAlikeLabels:
         assert sanitize_error_text(text) == (HELLO_RU + " password=[REDACTED] " + HELLO_RU
                                              + " t" + CYR_E + "xt")
 
-    def test_secret_found_only_by_the_shadow_returns_the_shadow_text(self):
+    def test_secret_found_only_by_the_shadow_keeps_the_rest_of_the_text(self):
         text = "p" + CYR_A + "ssword=hunter2 " + HELLO_RU + " café"
         out = sanitize_error_text(text)
-        assert out.startswith("password=[REDACTED]")
-        assert HELLO_RU not in out                  # look-alike letters were folded to Latin
-        assert "hunter2" not in out
+        assert out == "p" + CYR_A + "ssword=[REDACTED] " + HELLO_RU + " café"
 
     def test_stable_when_applied_twice(self):
         for text in SPLIT_LABELS + [HELLO_RU + " p" + CYR_A + "ssword=x"]:
@@ -1733,15 +1731,27 @@ class TestSplitAndLookAlikeLabels:
             assert time.perf_counter() - start < TIME_LIMIT
             assert isinstance(out, str)
 
-    def test_cap_applies_to_the_text_and_its_shadow(self, monkeypatch):
+    def test_cap_applies_to_the_input(self, monkeypatch):
         monkeypatch.setattr(redact_module, "_MAX_SANITIZE_CHARS", 1000)
         text = "x" * 900 + " " + "pa" + ZWSP + "ssword=hunter2"      # 917 characters: scanned
-        assert sanitize_error_text(text, limit=5000) == "x" * 900 + " password=[REDACTED]"
+        assert (sanitize_error_text(text, limit=5000)
+                == "x" * 900 + " pa" + ZWSP + "ssword=[REDACTED]")
         text = "x" * 990 + " pa" + ZWSP + "ssword=hunter2"           # over the cap: not scanned
         assert sanitize_error_text(text).startswith("<text,")
-        # the shadow is checked against the cap as well
-        monkeypatch.setattr(redact_module, "_fold_text", lambda t: t + "y" * 2000)
-        assert sanitize_error_text("p" + CYR_A + "ssword=hunter2").startswith("<text,")
+
+    def test_redaction_growth_never_triggers_the_cap(self):
+        # 900,001 characters with one non-ASCII letter and many short secrets: each secret
+        # grows to "[REDACTED]", so the redacted text is longer than 1,000,000 characters
+        unit = "a=1 token=b "
+        text = chr(0xE9) + unit * (900_000 // len(unit))
+        out = sanitize_error_text(text, limit=10 ** 8)
+        assert not out.startswith("<text,")
+        assert out.count("token=[REDACTED]") == 900_000 // len(unit)
+        assert len(out) > 1_000_000
+        # and the same through the shadow path
+        text = chr(0xE9) + ("a=1 t" + ZWSP + "oken=b ") * (800_000 // 13)
+        out = sanitize_error_text(text, limit=10 ** 8)
+        assert not out.startswith("<text,") and "=b " not in out
 
     def test_shadow_time_on_soup(self):
         text = ("token=" + chr(34) + CYR_A + ZWSP) * 60_000
@@ -1848,3 +1858,240 @@ class TestErrorTextAndDigestMemory:
     def test_nested_huge_container_is_rejected(self):
         with pytest.raises(TypeError):
             ArgsDigester().digest({"a": [list(range(300_000))]})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Third review round (issue #58): invisible value starts, more invisible characters,
+# the size cap, speed, and a differential fuzz
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NUL = chr(0)
+WORD_JOINER = chr(0x2060)
+ENCLOSING = chr(0x20DD)          # Me
+SPACING_MARK = chr(0x0903)       # Mc
+HANGUL_CHOSEONG_FILLER = chr(0x115F)
+HANGUL_JUNGSEONG_FILLER = chr(0x1160)
+HANGUL_FILLER = chr(0x3164)
+BRAILLE_BLANK = chr(0x2800)
+PRIVATE_USE = chr(0xE000)        # Co
+UNASSIGNED = chr(0x0378)         # Cn
+LONE_SURROGATE = chr(0xD800)     # Cs
+TATWEEL = chr(0x0640)
+MODIFIER_APOSTROPHE = chr(0x02BC)
+RATIO = chr(0x2236)
+MODIFIER_COLON = chr(0xA789)
+COLON_EQUALS = chr(0x2254)
+EQUALS_COLON = chr(0x2255)
+MODIFIER_EQUALS = chr(0xA78A)
+
+
+# ─── N1: an invisible character at the start of a value ──────────────────────
+
+N1_INPUTS = [
+    "password:" + ZWSP + " hunter2",
+    "password= " + ZWSP + " hunter2",
+    "token=" + SHY + " hunter2",
+    "api_key=" + ZWSP + " hunter2",
+    "Authorization:" + ZWSP + " Bearer hunter2",
+    "password=" + NUL + " hunter2",
+    "password=" + ZWSP + "\nhunter2",
+    "password=" + ZWSP + "\thunter2",
+    "password:" + ZWSP + ZWSP + " hunter2",
+    "password=" + WORD_JOINER + " hunter2",
+    "cookie:" + ZWSP + " hunter2; a=b",
+    "password=" + COMBINING_ACUTE + " hunter2",
+    "password=" + HANGUL_FILLER + " hunter2",
+    "secret" + ZWSP + ":" + ZWSP + " hunter2",
+    "x " + ZWSP + "password: " + ZWSP + " hunter2 tail",
+]
+
+
+class TestInvisibleValueStart:
+    @pytest.mark.parametrize("text", N1_INPUTS, ids=lambda t: ascii(t)[:50])
+    def test_sanitize_hides_the_secret(self, text):
+        assert "hunter2" not in sanitize_error_text(text)
+
+    @pytest.mark.parametrize("text", N1_INPUTS, ids=lambda t: ascii(t)[:50])
+    def test_redact_args_hides_the_secret(self, text):
+        assert "hunter2" not in jsonable(redact_args({"note": text, "l": [text]}))
+
+    def test_only_the_value_is_replaced(self):
+        out = sanitize_error_text("pre " + HELLO_RU + " password:" + ZWSP + " hunter2 post " + ZWSP)
+        assert out == "pre " + HELLO_RU + " password:" + ZWSP + " [REDACTED] post " + ZWSP
+
+    def test_invisible_characters_inside_the_value_go_with_it(self):
+        out = sanitize_error_text("password=hu" + ZWSP + "nter2 tail")
+        assert out == "password=[REDACTED] tail"
+
+    def test_invariant_a_second_run_hides_nothing_more(self):
+        for text in N1_INPUTS + SPLIT_LABELS:
+            out = sanitize_error_text(text, limit=10 ** 6)
+            assert redact_module._redact_text(out) == out
+            built = redact_module._build_shadow(out)
+            if built is not None:
+                assert redact_module._apply_patterns(built[0]) == built[0]
+            assert sanitize_error_text(out, limit=10 ** 6) == out
+
+
+# ─── N2: more invisible characters and separator look-alikes ─────────────────
+
+INVISIBLE_FOR_LABELS = [
+    ("Me", ENCLOSING), ("Mc", SPACING_MARK), ("choseong filler", HANGUL_CHOSEONG_FILLER),
+    ("jungseong filler", HANGUL_JUNGSEONG_FILLER), ("hangul filler", HANGUL_FILLER),
+    ("braille blank", BRAILLE_BLANK), ("private use", PRIVATE_USE), ("unassigned", UNASSIGNED),
+    ("surrogate", LONE_SURROGATE), ("tatweel", TATWEEL), ("modifier apostrophe",
+                                                           MODIFIER_APOSTROPHE),
+    ("ZWSP", ZWSP), ("SHY", SHY), ("NUL", NUL), ("DEL", chr(0x7F)), ("C1 control", chr(0x80)),
+    ("FS", chr(0x1C)), ("combining", COMBINING_ACUTE), ("variation selector", chr(0xFE0F)),
+    ("tag", chr(0xE0041)), ("LRM", chr(0x200E)), ("BOM", chr(0xFEFF)),
+]
+
+
+class TestMoreInvisibleCharacters:
+    @pytest.mark.parametrize("label", ["password", "token", "api_key", "Authorization"])
+    @pytest.mark.parametrize("name, char", INVISIBLE_FOR_LABELS, ids=[n for n, _ in INVISIBLE_FOR_LABELS])
+    def test_label_split_by_the_character(self, label, name, char):
+        for position in (1, len(label) // 2, len(label) - 1):
+            split = label[:position] + char + label[position:]
+            for text in (f"{split}=hunter2", f"x {split}: hunter2 y",
+                         '{"' + split + '": "hunter2"}'):
+                out = sanitize_error_text(text)
+                assert "hunter2" not in out, (name, text, out)
+
+    @pytest.mark.parametrize("name, char", INVISIBLE_FOR_LABELS, ids=[n for n, _ in INVISIBLE_FOR_LABELS])
+    def test_value_starting_with_the_character(self, name, char):
+        out = sanitize_error_text("password=" + char + " hunter2")
+        assert "hunter2" not in out
+
+    @pytest.mark.parametrize("name, char", INVISIBLE_FOR_LABELS, ids=[n for n, _ in INVISIBLE_FOR_LABELS])
+    def test_key_names_split_by_the_character(self, name, char):
+        for key in ("pa" + char + "ssword", "to" + char + "ken", "api" + char + "_key"):
+            assert list(redact_args({key: "v"}).values()) == [REDACTED], (name, key)
+
+    @pytest.mark.parametrize("sep", [RATIO, MODIFIER_COLON, COLON_EQUALS, EQUALS_COLON,
+                                     MODIFIER_EQUALS], ids=lambda s: hex(ord(s)))
+    def test_separator_look_alikes(self, sep):
+        for text in ("password" + sep + "hunter2", "token " + sep + " hunter2 tail",
+                     "api_key" + sep + '"hunter2 x"'):
+            out = sanitize_error_text(text)
+            assert "hunter2" not in out and "x\"" not in out, (text, out)
+
+    def test_look_alike_separator_text_is_kept_when_there_is_no_label(self):
+        for sep in (RATIO, COLON_EQUALS):
+            text = "ratio 3" + sep + "4 and x" + sep + "y"
+            assert sanitize_error_text(text) == text
+
+    def test_visible_characters_in_a_label_are_a_known_gap(self):
+        # documented under "not covered": the shadow drops invisible characters only
+        for filler in (" ", ".", "'", "\t"):
+            text = "pa" + filler + "ssword=hunter2"
+            assert "hunter2" in sanitize_error_text(text)
+
+    def test_whitespace_controls_are_kept_exactly(self):
+        text = "a\tb\nc\x0bd\x0ce\rf" + chr(0x85) + "g"
+        assert sanitize_error_text(text) == unicodedata.normalize("NFKC", text)
+
+
+# ─── N4: speed ────────────────────────────────────────────────────────────────
+
+class TestShadowSpeed:
+    def test_hangul_text_with_a_secret_at_the_end(self):
+        text = chr(0xD55C) * 990_000 + " pass" + ZWSP + "word=hunter2"
+        start = time.perf_counter()
+        out = sanitize_error_text(text)
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert "hunter2" not in out
+
+    def test_redact_args_on_hangul_strings(self):
+        start = time.perf_counter()
+        redact_args([chr(0xD55C) * 66_000] * 15)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_dense_secrets_with_look_alike_labels(self):
+        text = ("p" + CYR_A + "ssword=x ") * 40_000            # about 360,000 characters
+        start = time.perf_counter()
+        out = sanitize_error_text(text, limit=10 ** 8)
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert out == ("p" + CYR_A + "ssword=[REDACTED] ") * 40_000
+
+    def test_fold_cache_is_bounded_and_stays_correct(self):
+        text = "".join(chr(code) for code in range(0x4E00, 0x4E00 + 30_000))
+        sanitize_error_text(text, limit=10)
+        assert len(redact_module._FOLD) <= redact_module._MAX_FOLD_CACHE + 128
+        assert len(redact_module._KEEP) <= redact_module._MAX_FOLD_CACHE + 128
+        assert "hunter2" not in sanitize_error_text(text + " p" + CYR_A + "ssword=hunter2")
+
+    def test_pure_ascii_and_cjk_texts_use_no_shadow(self):
+        assert redact_module._build_shadow("plain ascii password=x") is None
+        assert redact_module._build_shadow(chr(0x4E2D) * 10 + " text") is None
+        assert redact_module._build_shadow("a" + ZWSP + "b") is not None
+
+
+# ─── Differential fuzz (fixed seeds) ──────────────────────────────────────────
+
+FUZZ_LABELS = ["password", "secret", "token", "api_key", "cookie", "pwd", "sig", "passwd",
+               "access_token", "client_secret"]
+FUZZ_INVISIBLE = [ZWSP, SHY, WORD_JOINER, NUL, COMBINING_ACUTE, ENCLOSING, SPACING_MARK,
+                  HANGUL_FILLER, BRAILLE_BLANK, PRIVATE_USE, UNASSIGNED, TATWEEL,
+                  MODIFIER_APOSTROPHE, chr(0x200D), chr(0xFE0F)]
+FUZZ_LOOKALIKES = {"a": CYR_A, "e": CYR_E, "o": CYR_O, "p": chr(0x0440), "c": chr(0x0441),
+                   "s": chr(0x0455), "y": chr(0x0443), "i": chr(0x0456)}
+FUZZ_FILL = [" ", "\n", " x ", " " + HELLO_RU + " ", " caf" + chr(0xE9) + " ", " , ", " ; ",
+             " " + chr(0x4E2D) + chr(0x6587) + " "]
+FUZZ_SEPS = ["=", ": ", ":", "= ", "=\"", ": \"", RATIO, " : "]
+
+
+def fuzz_item(rng):
+    """One "label sep value" item with some obfuscation; returns (text, expects_hidden)."""
+    label = rng.choice(FUZZ_LABELS)
+    sep = rng.choice(FUZZ_SEPS)
+    quoted = sep.endswith("\"")
+    value = "hunter2 more" if quoted else "hunter2"
+    letters = list(label)
+    for _ in range(rng.randint(0, 2)):
+        position = rng.randint(0, len(letters))
+        letters.insert(position, rng.choice(FUZZ_INVISIBLE))
+    if rng.random() < 0.5:
+        indexes = [i for i, c in enumerate(letters) if c in FUZZ_LOOKALIKES]
+        if indexes:
+            index = rng.choice(indexes)
+            letters[index] = FUZZ_LOOKALIKES[letters[index]]
+    spelled = "".join(letters)
+    start = rng.choice(["", "", ZWSP, " " + ZWSP, SHY, NUL, COMBINING_ACUTE, HANGUL_FILLER])
+    if rng.random() < 0.3:
+        start += " "
+    end = "\"" if quoted else ""
+    return spelled + sep + start + value + end
+
+
+class TestDifferentialFuzz:
+    @pytest.mark.parametrize("seed", [1, 2, 3, 4])
+    def test_secret_never_appears_and_second_pass_changes_nothing(self, seed):
+        rng = random.Random(seed)
+        for _ in range(75):
+            items = [fuzz_item(rng) for _ in range(rng.randint(1, 4))]
+            text = "".join(rng.choice(FUZZ_FILL) + item for item in items) + rng.choice(FUZZ_FILL)
+            out = sanitize_error_text(text, limit=10 ** 6)
+            assert "hunter2" not in out, (text, out)
+            assert "more" not in out.replace("[REDACTED]", ""), (text, out)
+            assert sanitize_error_text(out, limit=10 ** 6) == out, (text, out)
+            args = redact_args({"note": text, "nested": [text]}, max_string=10 ** 5)
+            assert "hunter2" not in jsonable(args), text
+
+    @pytest.mark.parametrize("seed", [5, 6])
+    def test_same_number_of_redactions_as_the_clean_spelling(self, seed):
+        rng = random.Random(seed)
+        for _ in range(60):
+            label = rng.choice(FUZZ_LABELS)
+            sep = rng.choice(["=", ": "])
+            clean = f"{label}{sep}hunter2"
+            split = label[:2] + rng.choice(FUZZ_INVISIBLE) + label[2:]
+            dirty = f"x {split}{sep}{rng.choice(FUZZ_INVISIBLE)} hunter2 y {HELLO_RU}"
+            clean_text = f"x {clean} y {HELLO_RU}"
+            assert (sanitize_error_text(dirty).count("[REDACTED]")
+                    == sanitize_error_text(clean_text).count("[REDACTED]") == 1), dirty
+
+    def test_the_fuzz_covers_every_obfuscation(self):
+        rng = random.Random(1)
+        seen = {char for _ in range(300) for char in fuzz_item(rng) if char in FUZZ_INVISIBLE}
+        assert len(seen) >= 12
