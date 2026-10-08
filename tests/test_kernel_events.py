@@ -456,10 +456,20 @@ class TestOnce:
 
     def test_second_dispatch_with_older_snapshot_does_not_rerun(self, ev: Events) -> None:
         calls: List[str] = []
-        ev.on("a", lambda: ev.emit("a") if not calls else None)
+        reentered: List[int] = []
+
+        def reenter() -> None:
+            # Re-enter exactly once. The inner dispatch runs the once listener,
+            # then the outer dispatch (older snapshot) must not run it again.
+            if not reentered:
+                reentered.append(1)
+                ev.emit("a")
+
+        ev.on("a", reenter)
         ev.once("a", lambda: calls.append("once"))
         ev.emit("a")
         assert calls == ["once"]
+        assert ev.errors == []
 
     def test_disposer_before_first_run_cancels_it(self, ev: Events) -> None:
         calls: List[int] = []
