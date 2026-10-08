@@ -1000,7 +1000,15 @@ class Scope:
                 else:
                     await asyncio.wait({unwind, wake}, return_when=asyncio.FIRST_COMPLETED)
                     if wake.done():
-                        return  # the wait was cut short to open a ring
+                        # The wait was cut short to open a ring. Nothing can close
+                        # the ring again behind this return without being checked:
+                        # the entry no longer counts in any search (it is woken), so
+                        # a later outside wait runs the "would this close a ring"
+                        # check against a graph without it, and a later inside wait
+                        # (a parent waiting for a child) runs _break_ring. This call
+                        # makes no new wait on its own; its caller may start a new
+                        # dispose(), which goes through the same checks.
+                        return
                 unwind.result()  # re-raise what the unwind raised, as before
         finally:
             if waiter is not None:
