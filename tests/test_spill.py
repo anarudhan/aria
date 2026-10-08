@@ -571,3 +571,11 @@ class TestAgentWiring:
         agent = LLMAgent(agent_id="a", capabilities=["x"], domains=["d"], llm=ScriptedLLM([]))
         assert agent.spill_store is get_default_store()
         assert agent.spill_store.base_dir == tmp_path / "default-spill"
+
+
+def test_cut_marks_truncation_with_count():
+    from aria.agents.base import _cut
+
+    assert _cut("abc", 5) == "abc"
+    out = _cut("x" * 120, 100)
+    assert out.startswith("x" * 100) and "20 more characters not shown" in out

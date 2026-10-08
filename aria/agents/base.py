@@ -56,6 +56,13 @@ if TYPE_CHECKING:
 
 # ─── Base Agent ───────────────────────────────────────────────────────────────
 
+def _cut(text: str, limit: int) -> str:
+    """Shorten ``text`` to ``limit`` characters and say so, never silently."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [{len(text) - limit} more characters not shown]"
+
+
 class BaseAgent(ABC):
     """
     Abstract base class for all ARIA agents.
@@ -404,7 +411,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         for name, fn in self._tools.items():
             doc = inspect.getdoc(fn) or "No description available."
             sig = inspect.signature(fn)
-            lines.append(f"  {name}{sig}: {doc[:200]}")
+            lines.append(f"  {name}{sig}: {_cut(doc, 200)}")
         return "\n".join(lines)
 
     def _get_tool_schemas(self) -> list[dict]:
@@ -436,7 +443,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                     required.append(pname)
             schemas.append({
                 "name": name,
-                "description": doc[:300],
+                "description": _cut(doc, 300),
                 "parameters": {
                     "type": "object",
                     "properties": params,
@@ -481,7 +488,7 @@ def aria_agent(
     def decorator(func: Callable) -> Callable:
         _agent_id = agent_id or func.__name__
         doc = inspect.getdoc(func) or ""
-        all_capabilities = capabilities + ([doc[:100]] if doc else [])
+        all_capabilities = capabilities + ([_cut(doc, 100)] if doc else [])
 
         class FunctionalAgent(BaseAgent):
             def __init__(self):
