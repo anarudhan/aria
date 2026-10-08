@@ -12,7 +12,9 @@ Design philosophy:
     - Default is DENY. Everything starts refused.
     - Permissions are granted per capability, per user, per scope
     - Every permission has an expiry (never granted forever unless user insists)
-    - Every permission check is logged in an append-only audit trail
+    - Every permission check is logged in an append-only, hash-chained audit
+      trail that verify_chain() checks (memory only and unanchored: see
+      AuditEntry)
     - ARIA cannot grant itself permissions — only users can
     - Self-modification is an exception: ARIA can patch SECURITY FLAWS only,
       and even then it logs every change and users can review/revert
@@ -42,9 +44,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -186,9 +189,39 @@ class PermissionGrant:
 
 # ─── Audit Entry ─────────────────────────────────────────────────────────────
 
+# Value of prev_hash for the first entry of a chain, and of the engine's head
+# hash while the chain is empty.
+GENESIS_HASH = "genesis"
+
+# Longest `detail` string record_audit() accepts, in UTF-8 bytes.
+MAX_AUDIT_DETAIL_BYTES = 8 * 1024
+
+
 @dataclass
 class AuditEntry:
-    """Immutable record of every permission check, grant, or denial."""
+    """
+    One record in the audit chain: a permission check, grant, denial or
+    revoke, or an event added with PermissionEngine.record_audit().
+
+    What the chain gives you. compute_hash() covers EVERY field except
+    entry_hash itself, as the full SHA256 hex digest (64 characters) of a
+    canonical JSON encoding. prev_hash holds the previous entry's entry_hash,
+    so the entries form a chain, and PermissionEngine.verify_chain() walks it.
+    An edit, reorder, insertion, duplication or removal (including from the
+    end, which is checked against the engine's head hash) makes verify_chain()
+    fail.
+
+    What it does NOT give you:
+      - The entries and the head hash live in process memory and are not
+        anchored anywhere else. Whoever can rewrite process memory can edit
+        entries, recompute every hash and the head value, and verify_chain()
+        will then pass.
+      - The chain is lost on restart. Saving it to disk is issue #68.
+    See "The permission engine internals" in docs/architecture.md.
+
+    `detail` is a canonical JSON string that the CALLER must already have
+    redacted. The engine does not redact it.
+    """
     entry_id:   str = field(default_factory=lambda: str(uuid.uuid4())[:12])
     timestamp:  float = field(default_factory=time.time)
     user_id:    str = ""
@@ -198,19 +231,125 @@ class AuditEntry:
     reason:     str = ""
     agent_id:   str = ""
     task_id:    str = ""
-    # Hash of the previous entry. It links entries in order. It is NOT a
-    # tamper-proof seal: see compute_hash and docs/architecture.md.
+    # entry_hash of the previous entry ("genesis" for the first one).
     prev_hash:  str = ""
+    # Pipeline fields (issue #56, design 0042 section 2(f)).
+    call_id:    str = ""
+    stage:      str = ""
+    detail:     str = ""       # canonical JSON, already redacted by the caller
+    args_digest: str = ""
+    # This entry's own hash, set when the entry is appended to the chain. It
+    # is the only field that compute_hash() leaves out.
+    entry_hash: str = ""
 
     def compute_hash(self) -> str:
         """
-        Short fingerprint of this entry. Covers entry_id, timestamp, user_id,
-        capability, action and prev_hash. It does NOT cover scope, reason,
-        agent_id or task_id, it is cut to 16 hex characters (64 bits), and no
-        function verifies the chain yet. Do not treat it as tamper evidence.
+        Full SHA256 hex digest (64 characters) of every field except
+        entry_hash. The fields come from dataclasses.fields(), so a field
+        added later is covered automatically. The encoding is canonical JSON
+        of a dict of all fields (sorted keys, ASCII only, no whitespace). It
+        is unambiguous: one field's text cannot run into the next one's.
+
+        Raises TypeError or ValueError if a field holds something JSON cannot
+        encode (verify_chain() reports that as a bad entry).
         """
-        data = f"{self.entry_id}{self.timestamp}{self.user_id}{self.capability}{self.action}{self.prev_hash}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
+        data = {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name != "entry_hash"
+        }
+        text = json.dumps(
+            data, sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"), allow_nan=False,
+        )
+        return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ChainReport:
+    """
+    Result of PermissionEngine.verify_chain().
+
+    ok:              True if the whole chain checks out.
+    checked:         how many entries, counted from the start, passed before
+                     the first problem (all of them when ok).
+    first_bad_index: index in the audit list of the first entry that failed,
+                     or None when ok. If an attacker rewrites an entry AND
+                     recomputes its entry_hash, the break shows at the NEXT
+                     entry (its prev_hash no longer matches). If the last entry
+                     does not lead to the engine's head hash (entries removed
+                     from the end, or the last one rewritten), this is the
+                     index of the last entry present, or 0 if the list is empty.
+    reason:          short human-readable explanation ("" when ok).
+    """
+    ok: bool
+    checked: int
+    first_bad_index: Optional[int]
+    reason: str
+
+
+def _check_text(name: str, value: object) -> str:
+    """Return an exact `str` copy of value, or raise TypeError."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, not {type(value).__name__}")
+    return str.__str__(value)  # exact str, even when value is a str subclass
+
+
+_MAX_DETAIL_DEPTH = 32
+
+
+def _check_json_value(value: object, path: str, depth: int = 0) -> None:
+    """Allow only plain JSON data: str-keyed dicts, lists, str, int, finite float, bool, None."""
+    if depth > _MAX_DETAIL_DEPTH:
+        raise ValueError(f"detail is nested more than {_MAX_DETAIL_DEPTH} levels deep at {path}")
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise TypeError(f"detail has a non-finite number at {path}")
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise TypeError(
+                    f"detail has a non-str key {k!r} ({type(k).__name__}) at {path}"
+                )
+            _check_json_value(v, f"{path}.{k}", depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            _check_json_value(v, f"{path}[{i}]", depth + 1)
+        return
+    raise TypeError(f"detail is not JSON-serialisable: {type(value).__name__} at {path}")
+
+
+def _canonical_detail(detail: object) -> str:
+    """Turn record_audit's `detail` argument into the stored canonical string."""
+    if detail is None:
+        return ""
+    if isinstance(detail, str):
+        text = str.__str__(detail)
+    else:
+        if not isinstance(detail, (dict, list, tuple)):
+            raise TypeError(
+                "detail must be None, a str, a dict or a list, "
+                f"not {type(detail).__name__}"
+            )
+        _check_json_value(detail, "detail")
+        try:
+            text = json.dumps(
+                detail, sort_keys=True, ensure_ascii=True,
+                separators=(",", ":"), allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise TypeError(f"detail is not JSON-serialisable: {exc}") from exc
+    size = len(text.encode("utf-8", "surrogatepass"))
+    if size > MAX_AUDIT_DETAIL_BYTES:
+        raise ValueError(
+            f"detail is {size} bytes; the limit is {MAX_AUDIT_DETAIL_BYTES} bytes. "
+            "It is never truncated silently: shorten it."
+        )
+    return text
 
 
 # ─── Permission Engine ────────────────────────────────────────────────────────
@@ -232,6 +371,13 @@ class PermissionEngine:
     time is tracked in issue #42. See "What is and is not enforced today" in
     docs/architecture.md.
 
+    Audit trail. Grants, checks, denials and revokes, and events added with
+    record_audit(), go into one hash chain. Each entry's SHA256 covers every
+    field, and verify_chain() detects edits, reordering, insertion,
+    duplication and removal (also from the end). The chain is in memory only
+    and unanchored: someone who can rewrite process memory can recompute it
+    all, and it is gone after a restart (saving it is issue #68).
+
     The intent is that ARIA does nothing with user data or resources without
     an explicit grant, apart from: reading its own source for self-analysis,
     using in-memory data from the current session, logging to the audit
@@ -242,7 +388,9 @@ class PermissionEngine:
         # {user_id: {capability: [PermissionGrant]}}
         self._grants: dict[str, dict[str, list[PermissionGrant]]] = {}
         self._audit: list[AuditEntry] = []
-        self._last_hash = "genesis"
+        self._last_hash = GENESIS_HASH   # head of the chain
+        # Guards the append plus the head update, so threads cannot fork the chain.
+        self._audit_lock = threading.Lock()
         self._persist_path = Path(persist_path) if persist_path else None
 
         # Self-modify has an extra confirmation layer
@@ -531,19 +679,135 @@ class PermissionEngine:
         return results
 
     def get_audit_trail(self, user_id: str, last_n: int = 50) -> list[dict]:
-        """Return the last N audit entries for a user."""
-        user_entries = [e for e in self._audit if e.user_id == user_id]
-        return [
-            {
-                "time":       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.timestamp)),
+        """
+        Return the last N audit entries for a user. Every value is a str or
+        a float, so the result is always JSON-serialisable (json.dumps escapes
+        control characters in the text fields). `detail` stays a JSON string.
+        The keys time, capability, scope, action, reason and agent are the
+        original ones; the rest were added with the hardened chain.
+        """
+        with self._audit_lock:
+            user_entries = [e for e in self._audit if e.user_id == user_id]
+        out = []
+        for e in user_entries[-last_n:]:
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.timestamp))
+            except (OverflowError, OSError, ValueError, TypeError):
+                when = ""
+            out.append({
+                "time":       when,
                 "capability": e.capability,
                 "scope":      e.scope,
                 "action":     e.action,
                 "reason":     e.reason,
                 "agent":      e.agent_id,
-            }
-            for e in user_entries[-last_n:]
-        ]
+                "entry_id":   e.entry_id,
+                "timestamp":  e.timestamp,
+                "task_id":    e.task_id,
+                "call_id":    e.call_id,
+                "stage":      e.stage,
+                "detail":     e.detail,
+                "args_digest": e.args_digest,
+                "prev_hash":  e.prev_hash,
+                "entry_hash": e.entry_hash,
+            })
+        return out
+
+    def record_audit(
+        self,
+        user_id:     str,
+        capability:  str,
+        scope:       str,
+        action:      str,
+        reason:      str = "",
+        agent_id:    str = "",
+        task_id:     str = "",
+        call_id:     str = "",
+        stage:       str = "",
+        detail:      object = None,
+        args_digest: str = "",
+    ) -> AuditEntry:
+        """
+        Append an event to the SAME hash chain as grants and checks, and
+        return the new entry.
+
+        THIS DOES NOT REDACT. The caller must remove secrets (tokens,
+        passwords, raw arguments, personal data) from every argument, and from
+        `detail` in particular, BEFORE calling. What is passed in is stored and
+        hashed as given.
+
+        All arguments except `detail` must be str (TypeError otherwise).
+        Control characters are allowed: they are stored and hashed as given.
+        `detail` may be None, a str, or a dict or list of plain JSON data
+        (str keys; str, int, finite float, bool, None values). A dict or list
+        is stored as canonical JSON (sorted keys, ASCII, no spaces). Anything
+        else raises TypeError. Over MAX_AUDIT_DETAIL_BYTES (8 KiB) raises
+        ValueError; it is never cut short silently.
+        """
+        values = {
+            "user_id": user_id, "capability": capability, "scope": scope,
+            "action": action, "reason": reason, "agent_id": agent_id,
+            "task_id": task_id, "call_id": call_id, "stage": stage,
+            "args_digest": args_digest,
+        }
+        clean = {name: _check_text(name, v) for name, v in values.items()}
+        text = _canonical_detail(detail)
+        return self._audit_log(detail=text, **clean)
+
+    def verify_chain(self) -> ChainReport:
+        """
+        Walk the audit chain from the start and report the first problem.
+
+        Checks, for every entry in order: it is an AuditEntry; its prev_hash
+        equals the previous entry's entry_hash ("genesis" for the first); its
+        stored entry_hash equals a fresh compute_hash() over all its other
+        fields. Finally the last entry's entry_hash must equal the engine's
+        head hash, which is how entries removed from the END are caught (an
+        empty list is only valid while the head is still "genesis").
+
+        Honest limit: the entries and the head hash are plain objects in this
+        process. Anyone who can rewrite process memory can edit entries and
+        recompute every hash and the head value, and this will then report ok.
+        The chain is not saved or anchored anywhere (saving is issue #68).
+        This detects accidents and edits that leave the head alone, not a
+        determined attacker inside the process.
+        """
+        with self._audit_lock:
+            entries = list(self._audit)
+            head = self._last_hash
+
+        expected_prev = GENESIS_HASH
+        for i, e in enumerate(entries):
+            if not isinstance(e, AuditEntry):
+                return ChainReport(False, i, i, f"entry {i} is not an AuditEntry")
+            if e.prev_hash != expected_prev:
+                return ChainReport(
+                    False, i, i,
+                    f"entry {i}: prev_hash does not match the previous entry "
+                    "(entry reordered, inserted, duplicated or removed)",
+                )
+            try:
+                fresh = e.compute_hash()
+            except (TypeError, ValueError, RecursionError) as exc:
+                return ChainReport(
+                    False, i, i,
+                    f"entry {i}: cannot be hashed ({type(exc).__name__}: {exc})",
+                )
+            if e.entry_hash != fresh:
+                return ChainReport(
+                    False, i, i,
+                    f"entry {i}: contents do not match its entry_hash (edited)",
+                )
+            expected_prev = e.entry_hash
+
+        if head != expected_prev:
+            last = max(len(entries) - 1, 0)
+            return ChainReport(
+                False, len(entries), last,
+                "the last entry does not lead to the engine's head hash "
+                "(entries removed from the end, or the last entry rewritten)",
+            )
+        return ChainReport(True, len(entries), None, "")
 
     def print_grant_summary(self, user_id: str):
         grants = self.list_grants(user_id)
@@ -579,19 +843,41 @@ class PermissionEngine:
         user_id: str, capability: str, scope: str,
         action: str, reason: str = "",
         agent_id: str = "", task_id: str = "",
-    ):
-        entry = AuditEntry(
-            user_id    = user_id,
-            capability = capability,
-            scope      = scope,
-            action     = action,
-            reason     = reason,
-            agent_id   = agent_id,
-            task_id    = task_id,
-            prev_hash  = self._last_hash,
+        call_id: str = "", stage: str = "",
+        detail: str = "", args_digest: str = "",
+    ) -> AuditEntry:
+        """
+        Append one entry to the chain. Internal: no validation (the engine's
+        own callers pass strings). `detail` must already be a canonical string.
+        Use record_audit() from outside.
+        """
+        # Internal callers may pass odd objects (a Path as scope); make them
+        # text so a hash failure can never make check() raise.
+        user_id, capability, scope, action, reason, agent_id, task_id = (
+            v if isinstance(v, str) else str(v)
+            for v in (user_id, capability, scope, action, reason, agent_id, task_id)
         )
-        self._last_hash = entry.compute_hash()
-        self._audit.append(entry)
+        # The lock covers reading the head, hashing, appending and moving the
+        # head, so two threads cannot both extend the same head.
+        with self._audit_lock:
+            entry = AuditEntry(
+                user_id    = user_id,
+                capability = capability,
+                scope      = scope,
+                action     = action,
+                reason     = reason,
+                agent_id   = agent_id,
+                task_id    = task_id,
+                prev_hash  = self._last_hash,
+                call_id    = call_id,
+                stage      = stage,
+                detail     = detail,
+                args_digest = args_digest,
+            )
+            entry.entry_hash = entry.compute_hash()
+            self._audit.append(entry)
+            self._last_hash = entry.entry_hash
+            return entry
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
