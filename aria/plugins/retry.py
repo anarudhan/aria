@@ -160,8 +160,7 @@ _NAME_RULES: tuple[tuple[LLMErrorCode, tuple[str, ...]], ...] = (
     (LLMErrorCode.RATE_LIMIT,  ("ratelimit", "toomanyrequests")),
     (LLMErrorCode.AUTH,        ("authentication", "permissiondenied", "unauthorized",
                                 "forbidden")),
-    (LLMErrorCode.BAD_REQUEST, ("badrequest", "invalidrequest", "unprocessable",
-                                "notfound")),
+    (LLMErrorCode.BAD_REQUEST, ("badrequest", "invalidrequest", "unprocessable")),
     (LLMErrorCode.SERVER,      ("internalserver", "servererror", "serviceunavailable",
                                 "overloaded", "badgateway", "gatewaytimeout")),
     (LLMErrorCode.TIMEOUT,     ("timeout", "timedout")),
@@ -169,6 +168,12 @@ _NAME_RULES: tuple[tuple[LLMErrorCode, tuple[str, ...]], ...] = (
                                 "remoteprotocol", "readerror", "writeerror",
                                 "closedresource")),
 )
+
+# Names that must match exactly: as a fragment "notfounderror" would also catch the builtin
+# FileNotFoundError, which has nothing to do with the provider.
+_EXACT_NAMES: dict[str, LLMErrorCode] = {
+    "notfounderror": LLMErrorCode.BAD_REQUEST,
+}
 
 _NETWORK_ERRNOS = frozenset(
     getattr(_errno, name) for name in (
@@ -233,6 +238,8 @@ def classify(exc: BaseException) -> LLMErrorCode:
 
     for klass in type(exc).__mro__:
         name = klass.__name__.lower()
+        if name in _EXACT_NAMES:
+            return _EXACT_NAMES[name]
         for code, fragments in _NAME_RULES:
             if any(fragment in name for fragment in fragments):
                 return code
