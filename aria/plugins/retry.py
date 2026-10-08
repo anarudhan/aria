@@ -29,6 +29,7 @@ import inspect
 import logging
 import math
 import random
+import re
 import socket
 import ssl
 import time
@@ -45,6 +46,7 @@ __all__ = [
     "call_with_retry",
     "classify",
     "get_retry_after",
+    "sanitize_error_text",
 ]
 
 logger = logging.getLogger(__name__)
@@ -95,9 +97,8 @@ class LLMError(Exception):
         cause:     the original exception (also chained as ``__cause__``)
         history:   the attempt records of this one call, oldest first
 
-    When the original exception was a normal Exception subclass (for example
-    ``ConnectionError``), the raised error is also an instance of that class. Code that
-    already catches the original type keeps working.
+    It is a plain exception (not a subclass of the original one), so catch ``LLMError`` and
+    look at ``.cause`` or ``.code`` to decide what to do. The original is never modified.
     """
 
     def __init__(
@@ -120,18 +121,6 @@ class LLMError(Exception):
         return self.message
 
 
-_COMPAT_CLASSES: dict[type, type] = {}
-
-
-def _compat_class(cause_type: type) -> type:
-    """A subclass of both LLMError and the original exception type (cached)."""
-    cls = _COMPAT_CLASSES.get(cause_type)
-    if cls is None:
-        cls = type("LLMError", (LLMError, cause_type), {"__module__": __name__})
-        _COMPAT_CLASSES[cause_type] = cls
-    return cls
-
-
 def _build_error(
     message: str,
     code: LLMErrorCode,
@@ -139,16 +128,6 @@ def _build_error(
     cause: BaseException,
     history: tuple[AttemptRecord, ...],
 ) -> LLMError:
-    cause_type = type(cause)
-    if isinstance(cause, Exception) and not isinstance(cause, LLMError):
-        try:
-            err = _compat_class(cause_type)(
-                message, code=code, attempts=attempts, cause=cause, history=history,
-            )
-            if isinstance(err, LLMError):
-                return err
-        except Exception:  # odd exception layouts cannot be combined; fall back
-            _COMPAT_CLASSES.pop(cause_type, None)
     return LLMError(message, code=code, attempts=attempts, cause=cause, history=history)
 
 
@@ -166,7 +145,7 @@ _NAME_RULES: tuple[tuple[LLMErrorCode, tuple[str, ...]], ...] = (
     (LLMErrorCode.TIMEOUT,     ("timeout", "timedout")),
     (LLMErrorCode.TRANSPORT,   ("connection", "connecterror", "networkerror",
                                 "remoteprotocol", "readerror", "writeerror",
-                                "closedresource")),
+                                "closedresource", "proxyerror")),
 )
 
 # Names that must match exactly: as a fragment "notfounderror" would also catch the builtin
@@ -174,6 +153,13 @@ _NAME_RULES: tuple[tuple[LLMErrorCode, tuple[str, ...]], ...] = (
 _EXACT_NAMES: dict[str, LLMErrorCode] = {
     "notfounderror": LLMErrorCode.BAD_REQUEST,
 }
+
+# Plain programming errors are never classified by their class NAME (a "TimeoutConfigError"
+# that is a ValueError is a bug in the caller, not a provider timeout). A real HTTP status on
+# them is still honoured.
+_PROGRAMMING_ERRORS = (
+    ValueError, TypeError, KeyError, IndexError, AttributeError, AssertionError, LookupError,
+)
 
 _NETWORK_ERRNOS = frozenset(
     getattr(_errno, name) for name in (
@@ -188,6 +174,8 @@ def _status_to_code(status: int) -> Optional[LLMErrorCode]:
         return LLMErrorCode.RATE_LIMIT
     if status == 408:
         return LLMErrorCode.TIMEOUT
+    if status == 409:  # conflict: both vendor SDKs retry it; SERVER is the closest code
+        return LLMErrorCode.SERVER
     if status in (401, 403):
         return LLMErrorCode.AUTH
     if 500 <= status <= 599:  # includes 529 (overloaded)
@@ -203,16 +191,24 @@ def _as_status(value: Any) -> Optional[int]:
     return value if 100 <= value <= 599 else None
 
 
+def _safe_getattr(obj: Any, name: str) -> Any:
+    """getattr that never raises: a property that blows up simply reads as None."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
 def _status_of(exc: BaseException) -> Optional[int]:
     """Find an HTTP status on the error or on its ``response``."""
     for attr in ("status_code", "status", "http_status"):
-        status = _as_status(getattr(exc, attr, None))
+        status = _as_status(_safe_getattr(exc, attr))
         if status is not None:
             return status
-    response = getattr(exc, "response", None)
+    response = _safe_getattr(exc, "response")
     if response is not None:
         for attr in ("status_code", "status"):
-            status = _as_status(getattr(response, attr, None))
+            status = _as_status(_safe_getattr(response, attr))
             if status is not None:
                 return status
     return None
@@ -220,11 +216,20 @@ def _status_of(exc: BaseException) -> Optional[int]:
 
 def classify(exc: BaseException) -> LLMErrorCode:
     """
-    Map any exception to an LLMErrorCode without importing a vendor SDK.
+    Map any exception to an LLMErrorCode without importing a vendor SDK. Never raises.
 
     Order: our own errors, then an HTTP status, then exception class names (the whole
-    class hierarchy, most specific class first), then builtin timeout and network errors.
+    class hierarchy, most specific class first; skipped for plain programming errors such
+    as ValueError unless they carry an HTTP status), then builtin timeout, TLS and network
+    errors.
     """
+    try:
+        return _classify(exc)
+    except Exception:
+        return LLMErrorCode.UNKNOWN
+
+
+def _classify(exc: BaseException) -> LLMErrorCode:
     if isinstance(exc, LLMError):
         return exc.code
     if isinstance(exc, EmptyResponseError):
@@ -236,14 +241,17 @@ def classify(exc: BaseException) -> LLMErrorCode:
         if code is not None:
             return code
 
-    for klass in type(exc).__mro__:
-        name = klass.__name__.lower()
-        if name in _EXACT_NAMES:
-            return _EXACT_NAMES[name]
-        for code, fragments in _NAME_RULES:
-            if any(fragment in name for fragment in fragments):
-                return code
+    if status is not None or not isinstance(exc, _PROGRAMMING_ERRORS):
+        for klass in type(exc).__mro__:
+            name = klass.__name__.lower()
+            if name in _EXACT_NAMES:
+                return _EXACT_NAMES[name]
+            for code, fragments in _NAME_RULES:
+                if any(fragment in name for fragment in fragments):
+                    return code
 
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return LLMErrorCode.AUTH   # a bad certificate will not fix itself
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, socket.timeout)):
         return LLMErrorCode.TIMEOUT
     if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror, ssl.SSLError)):
@@ -261,7 +269,7 @@ def _to_seconds(value: Any) -> Optional[float]:
         return None
     try:
         seconds = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if math.isnan(seconds) or math.isinf(seconds) or seconds < 0:
         return None
@@ -292,11 +300,11 @@ def get_retry_after(exc: BaseException) -> Optional[float]:
     headers on ``response.headers`` (or ``headers``). Only numeric values are understood;
     an HTTP date or a negative number is ignored.
     """
-    seconds = _to_seconds(getattr(exc, "retry_after", None))
+    seconds = _to_seconds(_safe_getattr(exc, "retry_after"))
     if seconds is not None:
         return seconds
-    response = getattr(exc, "response", None)
-    for headers in (getattr(response, "headers", None), getattr(exc, "headers", None)):
+    response = _safe_getattr(exc, "response")
+    for headers in (_safe_getattr(response, "headers"), _safe_getattr(exc, "headers")):
         millis = _to_seconds(_header(headers, "retry-after-ms"))
         if millis is not None:
             return millis / 1000.0
@@ -318,7 +326,7 @@ class AttemptRecord:
         "retry"          failed, will wait ``delay`` seconds and try again
         "exhausted"      failed and no retries are left (final)
         "not_retryable"  failed with an error that is never retried (final)
-        "cancelled"      the caller cancelled while waiting to retry (final)
+        "cancelled"      the caller cancelled, during the call or the wait (final)
     """
 
     operation:   str
@@ -336,6 +344,29 @@ class AttemptRecord:
         return data
 
 
+def _check_int(name: str, value: Any, *, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be {minimum} or more, got {value!r}")
+
+
+def _check_number(
+    name: str, value: Any, *, minimum: float, maximum: Optional[float] = None
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number, got {value!r}")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an int too big for a float
+        finite = False
+    if not finite:
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if value < minimum or (maximum is not None and value > maximum):
+        bounds = f"{minimum} or more" if maximum is None else f"between {minimum} and {maximum}"
+        raise ValueError(f"{name} must be {bounds}, got {value!r}")
+
+
 # ─── Policy ───────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -348,7 +379,9 @@ class RetryPolicy:
     jitter only shortens the wait, so it can never go above ``max_delay``. When the error
     carries a retry-after value, that value is used instead, up to ``max_delay``.
 
-    ``sleep``, ``clock`` and ``rng`` are injectable so tests never really wait.
+    ``sleep``, ``clock`` and ``rng`` are injectable so tests never really wait. Leave
+    ``sleep`` as None to use ``asyncio.sleep``, looked up at the moment of waiting (so
+    monkeypatching ``asyncio.sleep`` works).
     ``history`` keeps the last ``max_history`` attempt records; the counters in ``stats()``
     are not bounded.
     """
@@ -359,7 +392,7 @@ class RetryPolicy:
     multiplier:  float = 2.0
     jitter:      float = 0.25
     max_history: int   = 200
-    sleep: Callable[[float], Awaitable[Any]] = field(default=asyncio.sleep, repr=False)
+    sleep: Optional[Callable[[float], Awaitable[Any]]] = field(default=None, repr=False)
     clock: Callable[[], float]               = field(default=time.time, repr=False)
     rng:   Callable[[], float]               = field(default=random.random, repr=False)
 
@@ -369,18 +402,19 @@ class RetryPolicy:
     _last_error: Optional[dict[str, Any]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.max_retries < 0:
-            raise ValueError("max_retries must be 0 or more")
-        if self.base_delay < 0 or self.max_delay < 0:
-            raise ValueError("base_delay and max_delay must be 0 or more")
-        if self.multiplier < 1:
-            raise ValueError("multiplier must be 1 or more")
-        if not 0 <= self.jitter <= 1:
-            raise ValueError("jitter must be between 0 and 1")
-        if self.max_history < 1:
-            raise ValueError("max_history must be 1 or more")
+        _check_int("max_retries", self.max_retries, minimum=0)
+        _check_number("base_delay", self.base_delay, minimum=0)
+        _check_number("max_delay", self.max_delay, minimum=0)
+        _check_number("multiplier", self.multiplier, minimum=1)
+        _check_number("jitter", self.jitter, minimum=0, maximum=1)
+        _check_int("max_history", self.max_history, minimum=1)
         self.history = deque(maxlen=self.max_history)
         self.reset()
+
+    async def _sleep(self, seconds: float) -> None:
+        """Wait ``seconds`` with the injected sleep, or asyncio.sleep resolved right now."""
+        sleeper = self.sleep if self.sleep is not None else asyncio.sleep
+        await sleeper(seconds)
 
     # ── timing ──
 
@@ -420,18 +454,23 @@ class RetryPolicy:
         delay: float,
         error: str,
         retry_after: Optional[float] = None,
+        *,
+        extra: bool = False,
     ) -> AttemptRecord:
+        # extra=True marks a follow-up record for an attempt that was already counted
+        # (for example "the wait itself failed"), so counters are not incremented twice.
         record = AttemptRecord(
             operation=operation, attempt=attempt, outcome=outcome, code=code,
             delay=delay, error=error, timestamp=self.clock(), retry_after=retry_after,
         )
         self.history.append(record)
-        if outcome != "cancelled":
+        if outcome != "cancelled" and not extra:
             self._counters["attempts"] += 1
         if outcome == "retry":
             self._counters["retries"] += 1
         if code is not None and outcome != "cancelled":
-            self._by_code[code.value] = self._by_code.get(code.value, 0) + 1
+            if not extra:
+                self._by_code[code.value] = self._by_code.get(code.value, 0) + 1
             self._last_error = record.to_dict()
         if outcome == "success":
             self._counters["succeeded"] += 1
@@ -442,7 +481,13 @@ class RetryPolicy:
         return record
 
     def stats(self) -> dict[str, Any]:
-        """Counters for the health report. Safe to log: no prompts or responses inside."""
+        """
+        Counters for the health report.
+
+        ``last_error`` holds the redacted, truncated error text (see ``sanitize_error_text``).
+        Prompts and responses are never stored by this module, but error text written by the
+        provider can quote parts of a request, so treat it as potentially sensitive.
+        """
         return {
             **self._counters,
             "failures_by_code": dict(self._by_code),
@@ -464,11 +509,59 @@ class RetryPolicy:
         }
 
 
+# ─── Error text safety ────────────────────────────────────────────────────────
+
+MAX_ERROR_TEXT = 500
+
+_REDACTED = "[REDACTED]"
+
+# Applied in order. Each keeps the label and hides only the secret value.
+_SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # Header or field style: Authorization: Bearer abc / 'x-api-key': 'abc' / api_key="abc"
+    (re.compile(
+        r"""(?ix)
+        ((?:proxy-)?authorization|x-api-key|api[-_]?key)   # label
+        (["']?\s*[:=]\s*["']?)                              # separator
+        (?:(?:bearer|basic)\s+)?                            # optional scheme
+        [^\s,;'"&}\])]+                                     # the secret
+        """), r"\1\2" + _REDACTED),
+    # Bearer tokens anywhere
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+"), "Bearer " + _REDACTED),
+    # sk-... style keys (sk-ant-api03-..., sk-proj-..., sk-live-...)
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"), "sk-" + _REDACTED),
+    # URL query values: ?key=abc&other=1
+    (re.compile(r"(?i)([?&](?:key|api[-_]?key|access[-_]?token|token)=)[^&\s'\"]+"),
+     r"\1" + _REDACTED),
+)
+
+
+def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
+    """
+    Make error text safe to store and print: hide obvious secrets, then cut it to ``limit``
+    characters (an ellipsis and the original length are added when it is cut).
+
+    Redacted: ``sk-...`` keys, ``Bearer`` tokens, ``Authorization`` / ``x-api-key`` /
+    ``api_key`` values and ``key=`` / ``token=`` URL query values. This is a best-effort
+    filter for common shapes, not a guarantee: other secrets or personal data inside an
+    error message are not detected.
+    """
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    if len(text) > limit:
+        text = f"{text[:limit]}... [truncated, original length {len(text)} characters]"
+    return text
+
+
 # ─── The retry loop ───────────────────────────────────────────────────────────
 
 def _error_text(exc: BaseException) -> str:
-    text = str(exc).strip()
-    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    """Redacted and truncated ``ExceptionType: message`` for records and messages."""
+    try:
+        text = str(exc).strip()
+    except Exception:
+        text = "<error text unavailable>"
+    name = type(exc).__name__
+    return sanitize_error_text(f"{name}: {text}" if text else name)
 
 
 async def _notify(
@@ -500,8 +593,12 @@ async def call_with_retry(
 
     Raises:
         LLMError: the error is not retryable, or the retries ran out. It carries ``code``,
-            ``attempts`` and ``cause`` and is chained to the original exception.
-        asyncio.CancelledError: always passed through, also while waiting between attempts.
+            ``attempts`` and ``cause`` and is chained to the original exception. If the
+            wait between attempts itself fails (a broken injected ``sleep``), the error
+            says so and is chained to that failure.
+        asyncio.CancelledError: always passed through, whether the cancel arrives while
+            the call is running or while waiting between attempts. It is recorded as a
+            "cancelled" outcome first.
     """
     pol = policy if policy is not None else RetryPolicy()
     pol._counters["calls"] += 1
@@ -513,6 +610,8 @@ async def call_with_retry(
         try:
             result = await fn()
         except asyncio.CancelledError:
+            pol._record(operation, attempt, "cancelled", None, 0.0,
+                        "cancelled while the call was running")
             raise
         except Exception as exc:
             code = classify(exc)
@@ -537,11 +636,21 @@ async def call_with_retry(
             own.append(record)
             await _notify(on_attempt, record)
             try:
-                await pol.sleep(delay)
+                await pol._sleep(delay)
             except asyncio.CancelledError:
                 pol._record(operation, attempt, "cancelled", code, delay,
                             "cancelled while waiting to retry", retry_after)
                 raise
+            except Exception as sleep_exc:
+                wait_text = _error_text(sleep_exc)
+                record = pol._record(
+                    operation, attempt, "exhausted", code, delay,
+                    f"retry wait failed: {wait_text}", retry_after, extra=True)
+                own.append(record)
+                await _notify(on_attempt, record)
+                message = (f"LLM call failed after {attempt} attempt(s) [{code.value}]: "
+                           f"{text}; the wait before the next retry also failed: {wait_text}")
+                raise _build_error(message, code, attempt, exc, tuple(own)) from sleep_exc
             continue
 
         record = pol._record(operation, attempt, "success", None, 0.0, "")

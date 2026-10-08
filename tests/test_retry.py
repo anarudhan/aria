@@ -6,7 +6,9 @@ fixed random source. The vendor SDKs are replaced by fakes injected into sys.mod
 """
 import asyncio
 import errno
+import pickle
 import socket
+import ssl
 import sys
 import types
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from aria.plugins.retry import (
     call_with_retry,
     classify,
     get_retry_after,
+    sanitize_error_text,
 )
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -103,6 +106,19 @@ class NotFoundError(Exception):
     pass
 
 
+class ProxyError(Exception):
+    pass
+
+
+class FakeAPIStatusError(Exception):
+    """Like the real SDK errors: required keyword-only arguments in __init__."""
+
+    def __init__(self, message, *, response, body):
+        super().__init__(message)
+        self.response = response
+        self.body = body
+
+
 class InternalServerError(Exception):
     pass
 
@@ -120,6 +136,10 @@ def with_status(status, **kwargs):
     return APIStatusError(f"status {status}", status_code=status, **kwargs)
 
 
+async def _raising_sleep(seconds):
+    raise RuntimeError("clock broke")
+
+
 # ─── classify ─────────────────────────────────────────────────────────────────
 
 class TestClassify:
@@ -132,11 +152,11 @@ class TestClassify:
         (529, LLMErrorCode.SERVER),
         (599, LLMErrorCode.SERVER),
         (408, LLMErrorCode.TIMEOUT),
+        (409, LLMErrorCode.SERVER),      # conflict: both vendor SDKs retry it
         (401, LLMErrorCode.AUTH),
         (403, LLMErrorCode.AUTH),
         (400, LLMErrorCode.BAD_REQUEST),
         (404, LLMErrorCode.BAD_REQUEST),
-        (409, LLMErrorCode.BAD_REQUEST),
         (413, LLMErrorCode.BAD_REQUEST),
         (422, LLMErrorCode.BAD_REQUEST),
     ])
@@ -174,6 +194,7 @@ class TestClassify:
         (PermissionDeniedError("p"), LLMErrorCode.AUTH),
         (BadRequestError("b"), LLMErrorCode.BAD_REQUEST),
         (NotFoundError("model not found"), LLMErrorCode.BAD_REQUEST),
+        (ProxyError("proxy refused"), LLMErrorCode.TRANSPORT),
     ])
     def test_class_names_without_any_status(self, exc, code):
         assert classify(exc) is code
@@ -208,6 +229,71 @@ class TestClassify:
     ])
     def test_everything_else_is_unknown(self, exc):
         assert classify(exc) is LLMErrorCode.UNKNOWN
+
+    def test_bad_certificate_is_not_retryable_but_other_tls_errors_are(self):
+        cert = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        assert classify(cert) is LLMErrorCode.AUTH
+        assert not classify(cert).retryable
+        assert classify(ssl.SSLError(1, "handshake failure")) is LLMErrorCode.TRANSPORT
+
+    def test_plain_programming_errors_are_not_classified_by_name(self):
+        class TimeoutConfigError(ValueError):
+            pass
+
+        class ConnectionStringError(ValueError):
+            pass
+
+        class RateLimitConfigError(KeyError):
+            pass
+
+        for exc in (TimeoutConfigError("x"), ConnectionStringError("x"),
+                    RateLimitConfigError("x"), TypeError("x")):
+            assert classify(exc) is LLMErrorCode.UNKNOWN
+
+    def test_a_programming_error_with_an_http_status_is_still_classified(self):
+        class TimeoutConfigError(ValueError):
+            pass
+
+        exc = TimeoutConfigError("x")
+        exc.status_code = 503
+        assert classify(exc) is LLMErrorCode.SERVER
+        exc.status_code = 302      # not mapped to a code, but still counts as "has a status"
+        assert classify(exc) is LLMErrorCode.TIMEOUT
+
+    def test_classify_never_raises_on_hostile_attributes(self):
+        class Hostile(Exception):
+            @property
+            def status_code(self):
+                raise RuntimeError("boom")
+
+            @property
+            def status(self):
+                raise RuntimeError("boom")
+
+            @property
+            def response(self):
+                raise RuntimeError("boom")
+
+            @property
+            def retry_after(self):
+                raise RuntimeError("boom")
+
+        exc = Hostile("x")
+        assert classify(exc) is LLMErrorCode.UNKNOWN
+        assert get_retry_after(exc) is None
+
+    def test_a_raising_response_headers_property_is_survived(self):
+        class Response:
+            status_code = 429
+
+            @property
+            def headers(self):
+                raise RuntimeError("boom")
+
+        exc = Exception("x")
+        exc.response = Response()
+        assert classify(exc) is LLMErrorCode.RATE_LIMIT
+        assert get_retry_after(exc) is None
 
     def test_empty_response_error(self):
         assert classify(EmptyResponseError("nothing")) is LLMErrorCode.EMPTY
@@ -336,10 +422,43 @@ class TestBackoff:
     @pytest.mark.parametrize("kwargs", [
         {"max_retries": -1}, {"base_delay": -0.1}, {"max_delay": -1},
         {"multiplier": 0.5}, {"jitter": -0.1}, {"jitter": 1.1}, {"max_history": 0},
+        {"base_delay": float("nan")}, {"base_delay": float("inf")},
+        {"max_delay": float("nan")}, {"max_delay": float("inf")},
+        {"multiplier": float("nan")}, {"multiplier": float("inf")},
+        {"jitter": float("nan")}, {"jitter": float("inf")},
+        {"base_delay": 10 ** 400},
     ])
-    def test_invalid_settings_are_rejected(self, kwargs):
-        with pytest.raises(ValueError):
+    def test_out_of_range_settings_are_rejected(self, kwargs):
+        with pytest.raises(ValueError, match=next(iter(kwargs))):
             RetryPolicy(**kwargs)
+
+    @pytest.mark.parametrize("kwargs", [
+        {"max_retries": True}, {"max_retries": 2.0}, {"max_retries": 1.5},
+        {"max_retries": "3"}, {"max_retries": None},
+        {"max_retries": float("nan")}, {"max_retries": float("inf")},
+        {"max_history": True}, {"max_history": 5.0}, {"max_history": "5"},
+        {"base_delay": "1"}, {"base_delay": None}, {"base_delay": True},
+        {"max_delay": "30"}, {"multiplier": "2"}, {"jitter": "0.1"}, {"jitter": True},
+    ])
+    def test_wrongly_typed_settings_are_rejected(self, kwargs):
+        with pytest.raises(TypeError, match=next(iter(kwargs))):
+            RetryPolicy(**kwargs)
+
+    def test_boundary_values_are_accepted(self):
+        RetryPolicy(max_retries=0, base_delay=0, max_delay=0, multiplier=1, jitter=0,
+                    max_history=1)
+        RetryPolicy(jitter=1, base_delay=1, max_delay=2.5)
+
+    async def test_default_sleep_is_looked_up_when_used(self, monkeypatch):
+        waits = []
+
+        async def fake_sleep(seconds):
+            waits.append(seconds)
+
+        policy = RetryPolicy(jitter=0.0)          # no sleep injected
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        await call_with_retry(Flaky([RateLimitError("x")]), policy)
+        assert waits == [0.5]
 
     async def test_waits_grow_between_real_retries(self):
         policy = make_policy(jitter=0.0)
@@ -432,31 +551,118 @@ class TestCallWithRetry:
         assert fn.calls == 1 and info.value.attempts == 1
         assert policy.sleeper.delays == []
 
-    async def test_llm_error_is_also_the_original_exception_type(self):
-        with pytest.raises(ConnectionError):
-            await call_with_retry(Flaky([ConnectionError("down")] * 9), make_policy())
-        with pytest.raises(RuntimeError, match="mystery"):
-            await call_with_retry(Flaky([RuntimeError("mystery")]), make_policy())
-
-    async def test_exotic_exception_types_still_give_an_llm_error(self):
-        class Weird(Exception):
-            __slots__ = ()
-
+    async def test_llm_error_is_a_plain_error_that_keeps_the_original_as_cause(self):
+        original = ConnectionError("down")
         with pytest.raises(LLMError) as info:
-            await call_with_retry(Flaky([Weird("w")]), make_policy())
-        assert info.value.code is LLMErrorCode.UNKNOWN
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        err = info.value
+        assert type(err) is LLMError
+        assert not isinstance(err, ConnectionError)
+        assert err.cause is original and err.__cause__ is original
+
+    async def test_original_exception_is_left_untouched(self):
+        original = OSError(104, "reset")
+        with pytest.raises(LLMError):
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        assert (original.errno, original.strerror) == (104, "reset")
+        assert str(original) == "[Errno 104] reset"
+
+    @pytest.mark.parametrize("original", [
+        FakeAPIStatusError("kw-only", response=SimpleNamespace(status_code=500, headers={}),
+                           body={"error": "x"}),
+        FakeAPIStatusError("kw-only 400", response=SimpleNamespace(status_code=400, headers={}),
+                           body=None),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        OSError(104, "reset"),
+        KeyError("k"),
+    ])
+    async def test_awkward_exception_types_can_be_wrapped(self, original):
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        assert info.value.cause is original
+        assert info.value.__cause__ is original
+        assert type(original).__name__ in str(info.value)
+
+    async def test_vendor_attributes_are_not_overwritten(self):
+        original = with_status(500)
+        original.code = "vendor_code"
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        assert original.code == "vendor_code"
+        assert info.value.code is LLMErrorCode.SERVER
+
+    async def test_llm_error_can_be_pickled(self):
+        policy = make_policy()
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([ConnectionError("down")] * 9), policy)
+        clone = pickle.loads(pickle.dumps(info.value))
+        assert type(clone) is LLMError
+        assert str(clone) == str(info.value)
+        assert (clone.code, clone.attempts) == (LLMErrorCode.TRANSPORT, 4)
+        assert isinstance(clone.cause, ConnectionError)
+        assert [r.outcome for r in clone.history] == ["retry", "retry", "retry", "exhausted"]
+
+    async def test_many_different_exception_types_do_not_create_new_error_classes(self):
+        before = LLMError.__subclasses__()
+        for i in range(5):
+            cls = type(f"Err{i}", (Exception,), {})
+            with pytest.raises(LLMError):
+                await call_with_retry(Flaky([cls("x")]), make_policy())
+        assert LLMError.__subclasses__() == before
 
     async def test_keyboard_interrupt_is_not_caught(self):
         with pytest.raises(KeyboardInterrupt):
             await call_with_retry(Flaky([KeyboardInterrupt()]), make_policy())
 
-    async def test_cancelled_error_from_the_call_is_not_retried(self):
+    async def test_cancelled_error_from_the_call_is_not_retried_but_recorded(self):
         policy = make_policy()
         fn = Flaky([asyncio.CancelledError()])
         with pytest.raises(asyncio.CancelledError):
             await call_with_retry(fn, policy)
         assert fn.calls == 1
         assert policy.sleeper.delays == []
+        assert [r.outcome for r in policy.history] == ["cancelled"]
+        assert policy.history[0].attempt == 1
+        assert "call was running" in policy.history[0].error
+        stats = policy.stats()
+        assert stats["cancelled"] == 1 and stats["failed"] == 0 and stats["attempts"] == 0
+
+    async def test_task_cancelled_while_the_call_is_running_is_recorded(self):
+        started = asyncio.Event()
+
+        async def slow_call():
+            started.set()
+            await asyncio.sleep(3600)
+
+        policy = make_policy()
+        task = asyncio.ensure_future(call_with_retry(slow_call, policy))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert [r.outcome for r in policy.history] == ["cancelled"]
+        assert policy.stats()["cancelled"] == 1
+
+    @pytest.mark.parametrize("make_sleep", [
+        lambda: _raising_sleep,
+        lambda: (lambda seconds: None),          # returns a non-awaitable
+    ])
+    async def test_a_broken_sleep_gives_a_final_recorded_error(self, make_sleep):
+        policy = make_policy(sleep=make_sleep())
+        fn = Flaky([RateLimitError("limit")] * 5)
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(fn, policy)
+        err = info.value
+        assert fn.calls == 1
+        assert err.code is LLMErrorCode.RATE_LIMIT and err.attempts == 1
+        assert isinstance(err.cause, RateLimitError)
+        assert err.__cause__ is not err.cause            # chained to the sleep failure
+        assert "wait before the next retry also failed" in str(err)
+        assert [r.outcome for r in policy.history] == ["retry", "exhausted"]
+        assert "retry wait failed" in policy.history[-1].error
+        stats = policy.stats()
+        assert stats["attempts"] == 1 and stats["failed"] == 1
+        assert stats["failures_by_code"] == {"rate_limit": 1}
 
     async def test_cancellation_during_the_wait_stops_everything(self):
         started = asyncio.Event()
@@ -587,6 +793,91 @@ class TestRecords:
         policy.reset()
         assert len(policy.history) == 0
         assert policy.stats()["calls"] == 0 and policy.stats()["last_error"] is None
+
+
+# ─── Error text safety ────────────────────────────────────────────────────────
+
+class TestErrorTextSafety:
+
+    @pytest.mark.parametrize("text,secret", [
+        ("invalid key sk-ant-api03-FAKEFAKEFAKEFAKE1234 rejected", "FAKEFAKEFAKEFAKE1234"),
+        ("bad sk-proj-fakefakefake5678", "fakefakefake5678"),
+        ("Authorization: Bearer eyJfake.bearer-token_123", "eyJfake.bearer-token_123"),
+        ("sent Bearer eyJfake.bearer-token_123 to server", "eyJfake.bearer-token_123"),
+        ("authorization=Basic hunter2hunter2", "hunter2hunter2"),
+        ("{'x-api-key': 'hunter2hunter2', 'content-type': 'json'}", "hunter2hunter2"),
+        ('headers: {"X-Api-Key": "hunter2hunter2"}', "hunter2hunter2"),
+        ("GET /v1/models?key=AIzaFakeQueryKey999&alt=json", "AIzaFakeQueryKey999"),
+        ("url ?alt=json&api_key=AIzaFakeQueryKey999", "AIzaFakeQueryKey999"),
+        ('request api_key="hunter2hunter2" failed', "hunter2hunter2"),
+        ("api-key: hunter2hunter2", "hunter2hunter2"),
+        ("Proxy-Authorization: Basic hunter2hunter2", "hunter2hunter2"),
+    ])
+    def test_secrets_are_redacted(self, text, secret):
+        cleaned = sanitize_error_text(text)
+        assert secret not in cleaned
+        assert "[REDACTED]" in cleaned
+
+    def test_text_around_a_secret_is_kept(self):
+        cleaned = sanitize_error_text("call failed: x-api-key: abc123 (status 401)")
+        assert cleaned.startswith("call failed: x-api-key:")
+        assert cleaned.endswith("(status 401)")
+
+    @pytest.mark.parametrize("text", ["plain failure", "monkey=banana", "task-skill-1", ""])
+    def test_harmless_text_is_unchanged(self, text):
+        assert sanitize_error_text(text) == text
+
+    def test_long_text_is_cut_with_an_ellipsis_and_the_original_length(self):
+        cleaned = sanitize_error_text("x" * 1200)
+        assert cleaned.startswith("x" * 500 + "...")
+        assert "original length 1200" in cleaned
+        assert len(cleaned) < 600
+
+    def test_text_at_the_limit_is_not_cut(self):
+        assert sanitize_error_text("y" * 500) == "y" * 500
+
+    def test_a_secret_on_the_cut_boundary_is_redacted_before_cutting(self):
+        text = "a" * 495 + " sk-ant-api03-FAKEFAKEFAKEFAKE1234 " + "b" * 100
+        cleaned = sanitize_error_text(text)
+        assert "FAKEFAKE" not in cleaned and "sk-ant" not in cleaned
+
+    async def test_records_stats_and_message_are_sanitised_but_cause_is_untouched(self):
+        secret_text = ("401 for sk-ant-api03-FAKEFAKEFAKEFAKE1234, "
+                       "Authorization: Bearer eyJfake.bearer-token_123 " + "z" * 800)
+        original = AuthenticationError(secret_text)
+        policy = make_policy()
+        seen = []
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original]), policy, on_attempt=seen.append)
+
+        err = info.value
+        assert err.cause is original
+        assert "FAKEFAKEFAKEFAKE1234" in str(original)          # cause keeps everything
+        everything = [str(err), err.history[0].error, seen[0].error,
+                      policy.history[0].error, policy.stats()["last_error"]["error"],
+                      str(policy.describe())]
+        for text in everything:
+            assert "FAKEFAKEFAKEFAKE1234" not in text
+            assert "eyJfake.bearer-token_123" not in text
+        assert "original length" in err.history[0].error
+        assert len(err.history[0].error) < 700
+        assert len(str(err)) < 800
+
+    async def test_retry_record_text_is_sanitised_too(self):
+        policy = make_policy()
+        exc = RateLimitError(f"?key=AIzaFakeQueryKey999 {'q' * 900}")
+        await call_with_retry(Flaky([exc]), policy)
+        assert "AIzaFakeQueryKey999" not in policy.history[0].error
+        assert len(policy.history[0].error) < 700
+
+    async def test_error_whose_str_raises_is_still_handled(self):
+        class BadStr(Exception):
+            def __str__(self):
+                raise RuntimeError("no str")
+
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([BadStr()]), make_policy())
+        assert "BadStr" in str(info.value)
 
 
 # ─── Fake SDKs for the plugin tests ───────────────────────────────────────────
