@@ -18,6 +18,7 @@ import pickle
 import random
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -1644,3 +1645,206 @@ class TestHardLimitsAndFailureHandling:
 
         monkeypatch.setattr(redact_module, "_clean_str", mutating)
         jsonable(redact_args({"s": items}))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Final review round (issue #58)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+COMBINING_ACUTE = chr(0x301)
+DOT_ABOVE = chr(0x307)
+CYR_A = chr(0x0430)
+CYR_E = chr(0x0435)
+GR_O = chr(0x03BF)
+S_DOT = chr(0x1E61)          # s with dot above, what NFKC makes of "s" + DOT_ABOVE
+HELLO_RU = "".join(chr(c) for c in (0x41F, 0x440, 0x438, 0x432, 0x435, 0x442))   # Cyrillic word
+
+
+# ─── S1: split and look-alike labels in text ─────────────────────────────────
+
+SPLIT_LABELS = [
+    "pa" + ZWSP + "ssword=hunter2",
+    "secret" + ZWSP + "=hunter2",
+    "pas" + S_DOT + "word=hunter2",
+    "pas" + "s" + DOT_ABOVE + "word=hunter2",
+    "tok" + CYR_E + "n=hunter2",
+    "p" + CYR_A + "ssword=hunter2",
+    "t" + GR_O + "ken: hunter2",
+    "pa" + SHY + "ss" + chr(0x2060) + "word=hunter2",
+    "pa" + chr(0) + "ssword=hunter2",
+    "pa" + chr(1) + "ssword=hunter2",
+    "api" + ZWSP + "_key=hunter2",
+    "Author" + ZWSP + "ization: Bearer hunter2",
+    "Coo" + ZWSP + "kie: sid=hunter2",
+    "postgres://user:hunter2@host" + ZWSP,
+    "x-api-key" + COMBINING_ACUTE + ": hunter2",
+    "Set-Cookie: sid" + CYR_E + "=1; password=hunter2",
+    "pass" + ZWSP + "word=" + '"hunter2 more"',
+]
+
+
+class TestSplitAndLookAlikeLabels:
+    @pytest.mark.parametrize("text", SPLIT_LABELS, ids=lambda t: ascii(t)[:50])
+    def test_sanitize_hides_the_secret(self, text):
+        assert "hunter2" not in sanitize_error_text(text)
+
+    @pytest.mark.parametrize("text", SPLIT_LABELS, ids=lambda t: ascii(t)[:50])
+    def test_redact_args_hides_the_secret(self, text):
+        out = redact_args({"note": text, "list": [text], "deep": {"x": [text]}})
+        assert "hunter2" not in jsonable(out)
+
+    def test_split_label_in_quoted_value_with_spaces(self):
+        out = sanitize_error_text("pa" + ZWSP + 'ssword="hunter2 and more" tail')
+        assert "hunter2" not in out and "and more" not in out and out.endswith("tail")
+
+    def test_text_without_a_secret_is_returned_unchanged(self):
+        for text in (HELLO_RU + " ok", "café " + ZWSP + "x", "t" + CYR_E + "xt " + SHY + "y",
+                     "pa" + ZWSP + "ss word", chr(0x4E2D) * 10):
+            assert sanitize_error_text(text) == text
+
+    def test_plain_secret_keeps_the_rest_of_the_text(self):
+        # the first run hides it, the second finds nothing: the text is not folded
+        text = HELLO_RU + " password=hunter2 " + HELLO_RU + " t" + CYR_E + "xt"
+        assert sanitize_error_text(text) == (HELLO_RU + " password=[REDACTED] " + HELLO_RU
+                                             + " t" + CYR_E + "xt")
+
+    def test_secret_found_only_by_the_shadow_returns_the_shadow_text(self):
+        text = "p" + CYR_A + "ssword=hunter2 " + HELLO_RU + " café"
+        out = sanitize_error_text(text)
+        assert out.startswith("password=[REDACTED]")
+        assert HELLO_RU not in out                  # look-alike letters were folded to Latin
+        assert "hunter2" not in out
+
+    def test_stable_when_applied_twice(self):
+        for text in SPLIT_LABELS + [HELLO_RU + " p" + CYR_A + "ssword=x"]:
+            once = sanitize_error_text(text)
+            assert sanitize_error_text(once) == once
+
+    def test_white_space_is_not_removed_from_the_shadow(self):
+        text = "pa" + ZWSP + "ssword: hunter2\tx\r\ncookie: a b"
+        out = sanitize_error_text(text)
+        assert "hunter2" not in out and "\r\n" in out and "\t" in out
+
+    def test_shadow_is_bounded(self):
+        for text in (CYR_A * 1_000_000, ZWSP * 1_000_000, chr(0x4E2D) * 1_000_000,
+                     (ZWSP + "x") * 400_000):
+            start = time.perf_counter()
+            out = sanitize_error_text(text)
+            assert time.perf_counter() - start < TIME_LIMIT
+            assert isinstance(out, str)
+
+    def test_cap_applies_to_the_text_and_its_shadow(self, monkeypatch):
+        monkeypatch.setattr(redact_module, "_MAX_SANITIZE_CHARS", 1000)
+        text = "x" * 900 + " " + "pa" + ZWSP + "ssword=hunter2"      # 917 characters: scanned
+        assert sanitize_error_text(text, limit=5000) == "x" * 900 + " password=[REDACTED]"
+        text = "x" * 990 + " pa" + ZWSP + "ssword=hunter2"           # over the cap: not scanned
+        assert sanitize_error_text(text).startswith("<text,")
+        # the shadow is checked against the cap as well
+        monkeypatch.setattr(redact_module, "_fold_text", lambda t: t + "y" * 2000)
+        assert sanitize_error_text("p" + CYR_A + "ssword=hunter2").startswith("<text,")
+
+    def test_shadow_time_on_soup(self):
+        text = ("token=" + chr(34) + CYR_A + ZWSP) * 60_000
+        start = time.perf_counter()
+        sanitize_error_text(text)
+        redact_args([text] * 5)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+
+# ─── S2: long runs of combining marks ────────────────────────────────────────
+
+class TestCombiningMarkRuns:
+    @pytest.mark.parametrize("size", [100_000, 600_000, 3_000_000])
+    def test_long_run_is_not_scanned_and_is_fast(self, size):
+        text = "a" + COMBINING_ACUTE * size
+        start = time.perf_counter()
+        out = sanitize_error_text(text)
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert out == f"<text, {size + 1} characters, not scanned>"
+
+    def test_long_run_hides_a_secret_in_front_of_it(self):
+        text = "password=hunter2 a" + COMBINING_ACUTE * 3_000_000
+        out = sanitize_error_text(text)
+        assert "hunter2" not in out and "not scanned" in out
+
+    def test_long_run_through_redact_args(self):
+        start = time.perf_counter()
+        out = redact_args({"s": "a" + COMBINING_ACUTE * 150_000, "t": ["password=x"]})
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert out["s"].startswith("<string,") and out["t"] == ["password=[REDACTED]"]
+
+    def test_run_at_a_slice_boundary(self):
+        short = "a" * 10_000 + COMBINING_ACUTE * 20            # inside the allowance
+        assert sanitize_error_text(short, limit=10 ** 7) == unicodedata.normalize("NFKC", short)
+        long_run = "a" * 10_000 + COMBINING_ACUTE * 40
+        assert sanitize_error_text(long_run).startswith("<text,")
+
+    def test_ordinary_marks_are_normalised_as_before(self):
+        text = ("e" + COMBINING_ACUTE) * 20_000
+        assert sanitize_error_text(text, limit=10 ** 7) == unicodedata.normalize("NFKC", text)
+
+    def test_error_text_via_retry_with_a_hostile_message(self):
+        start = time.perf_counter()
+        out = retry_module._error_text(ValueError("a" + COMBINING_ACUTE * 3_000_000))
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert out.startswith("ValueError: <text,")
+
+
+# ─── M1, M2: PGP blocks, sessionid ───────────────────────────────────────────
+
+class TestPgpAndSessionId:
+    def test_pgp_private_key_block(self):
+        pgp = ("-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: x\n\nlQOYBFhunter2body\n=abcd\n"
+               "-----END PGP PRIVATE KEY BLOCK-----")
+        out = sanitize_error_text("key " + pgp + " after")
+        assert "hunter2" not in out and "lQOY" not in out and out.endswith("after")
+
+    def test_pgp_block_without_end(self):
+        out = sanitize_error_text("-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYhunter2")
+        assert "hunter2" not in out
+
+    def test_pgp_public_block_is_not_touched(self):
+        text = "-----BEGIN PGP PUBLIC KEY BLOCK-----\nabc\n-----END PGP PUBLIC KEY BLOCK-----"
+        assert sanitize_error_text(text) == text
+
+    @pytest.mark.parametrize("key", ["sessionid", "SessionID", "sessionId", "session_id",
+                                     "SESSIONID", "x-sessionid", "phpsessionid", "JSESSIONID"])
+    def test_session_id_spellings(self, key):
+        assert list(redact_args({key: "abc"}).values()) == [REDACTED]
+
+
+# ─── M5, M6 ───────────────────────────────────────────────────────────────────
+
+class TestErrorTextAndDigestMemory:
+    def test_error_text_keeps_the_type_name_for_a_huge_message(self):
+        out = retry_module._error_text(ValueError("password=hunter2 " + "x" * 2_000_000))
+        assert out.startswith("ValueError: <text, ")
+        assert "hunter2" not in out and out.endswith("not scanned>")
+
+    def test_error_text_normal_message_is_unchanged(self):
+        out = retry_module._error_text(ValueError("password=hunter2 failed"))
+        assert out == "ValueError: password=[REDACTED] failed"
+
+    def test_huge_containers_are_rejected_before_they_are_copied(self):
+        import tracemalloc
+
+        limit = redact_module._DIGEST_MAX_NODES
+        values = [
+            list(range(limit + 100_000)),
+            tuple(range(limit + 100_000)),
+            dict.fromkeys((str(i) for i in range(limit + 100_000)), 0),
+        ]
+        digester = ArgsDigester()
+        for value in values:
+            tracemalloc.start()
+            try:
+                with pytest.raises(TypeError):
+                    digester.digest(value)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            assert peak < 200_000, peak
+
+    def test_nested_huge_container_is_rejected(self):
+        with pytest.raises(TypeError):
+            ArgsDigester().digest({"a": [list(range(300_000))]})

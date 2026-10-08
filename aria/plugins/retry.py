@@ -588,7 +588,11 @@ def _error_text(exc: BaseException) -> str:
     """Redacted and truncated ``ExceptionType: message`` for records and messages."""
     text = _safe_str(exc)
     name = _type_name(exc)
-    return sanitize_error_text(f"{name}: {text}" if text else name)
+    cleaned = sanitize_error_text(f"{name}: {text}" if text else name)
+    if cleaned.startswith("<text, ") and cleaned.endswith(" not scanned>"):
+        # the message was too long to scan: keep the type name, the marker replaces the message
+        cleaned = f"{sanitize_error_text(name)}: {cleaned}"
+    return cleaned
 
 
 async def _notify(

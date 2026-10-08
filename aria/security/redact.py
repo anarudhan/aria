@@ -44,7 +44,8 @@ __all__ = [
     "sanitize_error_text",
 ]
 
-# ─── Error text safety (moved here from aria/plugins/retry.py, unchanged) ─────
+# ─── Error text safety (moved here from aria/plugins/retry.py; the patterns have since
+# been extended on purpose, see docs/redaction.md) ─────────────────────────────
 
 MAX_ERROR_TEXT = 500
 
@@ -77,8 +78,8 @@ def _label(words: str) -> "re.Pattern[str]":
 # Applied in order after NFKC normalisation. Each keeps the label and hides only the value.
 _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
     # PEM private keys: from the BEGIN line to the END line (or to the end of the text)
-    (re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----.*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|\Z)",
-                re.DOTALL),
+    (re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----.*?"
+                r"(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|\Z)", re.DOTALL),
      _REDACTED),
     # scheme://user:password@host  -> hide the password (proxy and connection errors print these)
     (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,30}://[^\s/:@?#]{0,200}:)[^\s/@?#]{1,500}(?=@)"),
@@ -124,13 +125,16 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
 # expand to 18: U+FDFA). A longer text is replaced by a marker, never passed through unscanned.
 _MAX_SANITIZE_CHARS = 1_000_000
 _NFKC_CHUNK = 10_000
+_MAX_MARK_RUN = 32          # combining marks allowed after a slice boundary (see below)
 
 
 def _normalise_bounded(text: str, cap: int) -> Optional[str]:
     """
     NFKC-normalise ``text`` in slices and give up (return None) as soon as the result would
     be longer than ``cap``, so a text that expands cannot make the work large. A slice never
-    ends in front of a combining mark. Plain ASCII needs no normalisation.
+    ends in front of a combining mark, but a run of more than 32 combining marks at a slice
+    boundary also gives up (returns None): nobody writes text like that, and following the
+    run to its end would make the work unbounded. Plain ASCII needs no normalisation.
     """
     if text.isascii():
         return text if len(text) <= cap else None
@@ -140,8 +144,12 @@ def _normalise_bounded(text: str, cap: int) -> Optional[str]:
     size = len(text)
     while start < size:
         end = min(start + _NFKC_CHUNK, size)
+        marks = 0
         while end < size and unicodedata.combining(text[end]):
             end += 1
+            marks += 1
+            if marks > _MAX_MARK_RUN:
+                return None
         piece = unicodedata.normalize("NFKC", text[start:end])
         total += len(piece)
         if total > cap:
@@ -149,6 +157,40 @@ def _normalise_bounded(text: str, cap: int) -> Optional[str]:
         parts.append(piece)
         start = end
     return "".join(parts)
+
+
+_ASCII_DROP = dict.fromkeys(
+    [c for c in range(32) if chr(c) not in "\t\n\r\x0b\x0c"] + [127])   # control characters
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+
+
+def _fold_run(run: str) -> str:
+    """Drop invisible, control and combining characters from non-ASCII text, fold look-alikes."""
+    kept = []
+    for char in unicodedata.normalize("NFKD", run):
+        category = unicodedata.category(char)
+        if category == "Cf" or category == "Mn" or (category == "Cc" and not char.isspace()):
+            continue
+        kept.append(char)
+    return unicodedata.normalize("NFC", "".join(kept).translate(_CONFUSABLES))
+
+
+def _fold_text(text: str) -> str:
+    """
+    The "shadow" of ``text``: invisible (Cf), control (Cc, except white space) and combining
+    (Mn) characters removed and Cyrillic and Greek look-alike letters folded to Latin, the same
+    folding that classifies key names. Returns ``text`` itself when there is nothing to fold.
+    """
+    shadow = text.translate(_ASCII_DROP)
+    if not shadow.isascii():
+        shadow = _NON_ASCII_RUN.sub(lambda match: _fold_run(match.group()), shadow)
+    return text if shadow == text else shadow
+
+
+def _apply_patterns(text: str) -> str:
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
@@ -181,15 +223,29 @@ def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
 
     A text of more than 1,000,000 characters after NFKC normalisation is not scanned: it is
     replaced by ``<text, N characters, not scanned>`` so that nothing leaks and the work
-    stays bounded.
+    stays bounded. The same marker is returned for a text with a run of more than 32
+    combining marks at a slice boundary (see ``_normalise_bounded``).
+
+    SPLIT AND LOOK-ALIKE LABELS. After the patterns have run on the normalised text, they run
+    a second time on a "shadow" of the result: invisible, control and combining characters
+    removed, Cyrillic and Greek look-alikes folded to Latin. So ``pa<zero width space>ssword=x``
+    and ``p<Cyrillic a>ssword=x`` are hidden too. If the second run hides something, the
+    shadow-based text is returned: the secret is hidden, and the rest of the text has lost its
+    invisible characters and accents and has its Cyrillic and Greek look-alike letters changed
+    to Latin ones. If it hides nothing, the text from the first run is returned unchanged.
     """
     original_length = len(text)
     normalised = _normalise_bounded(text, _MAX_SANITIZE_CHARS)
     if normalised is None:
         return f"<text, {original_length} characters, not scanned>"
-    text = normalised
-    for pattern, replacement in _SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
+    text = _apply_patterns(normalised)
+    shadow = _fold_text(text)
+    if shadow is not text:
+        if len(shadow) > _MAX_SANITIZE_CHARS:
+            return f"<text, {original_length} characters, not scanned>"
+        hidden = _apply_patterns(shadow)
+        if hidden != shadow:                  # a label that only the shadow could read
+            text = hidden
     if len(text) > limit:
         text = f"{text[:limit]}... [truncated, original length {original_length} characters]"
     return text
@@ -224,7 +280,7 @@ _SECRET_FRAGMENTS = (
     "apikey", "accesskey", "privatekey", "signingkey", "encryptionkey", "masterkey",
     "sshkey", "authkey", "sessionkey", "clientkey", "token", "pwd", "cookie", "jwt",
     "bearer", "signature", "mnemonic", "privkey", "privatepem", "keydata", "keymaterial",
-    "pincode",
+    "pincode", "sessionid",
 )
 
 # Letters of other alphabets that look like Latin ones (Cyrillic and Greek), folded to Latin
@@ -606,6 +662,8 @@ def _snapshot(obj: Any) -> Any:
                 raise TypeError(_NOT_JSON)
             parent[slot] = src
         elif kind is list or kind is tuple:
+            if nodes + len(stack) + len(src) > _DIGEST_MAX_NODES:     # before copying
+                raise TypeError(_TOO_BIG)
             items = list(src)
             if nodes + len(stack) + len(items) > _DIGEST_MAX_NODES:
                 raise TypeError(_TOO_BIG)
@@ -614,6 +672,8 @@ def _snapshot(obj: Any) -> Any:
             for index, child in enumerate(items):
                 stack.append((child, copy_, index, depth + 1))
         elif kind is dict:
+            if nodes + len(stack) + len(src) > _DIGEST_MAX_NODES:     # before copying
+                raise TypeError(_TOO_BIG)
             pairs = list(src.items())
             if nodes + len(stack) + len(pairs) > _DIGEST_MAX_NODES:
                 raise TypeError(_TOO_BIG)
