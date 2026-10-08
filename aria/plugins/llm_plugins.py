@@ -16,10 +16,54 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
+
+from .retry import AttemptRecord, EmptyResponseError, RetryPolicy, call_with_retry
+
+_T = TypeVar("_T")
 
 
-class AnthropicPlugin:
+class _RetryMixin:
+    """
+    Shared retry behaviour for LLM plugins.
+
+    ``retry_policy`` holds the backoff settings, the bounded list of attempt records and
+    the counters. Pass your own RetryPolicy (for example RetryPolicy(max_retries=0) to turn
+    retries off) or leave it out for the defaults. ``on_attempt`` is called with every
+    AttemptRecord so the audit trail can listen.
+    """
+
+    retry_policy: RetryPolicy
+    on_attempt: Optional[Callable[[AttemptRecord], Any]]
+
+    def _init_retry(
+        self,
+        retry_policy: Optional[RetryPolicy],
+        on_attempt: Optional[Callable[[AttemptRecord], Any]],
+    ) -> None:
+        self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self.on_attempt = on_attempt
+
+    async def _with_retry(self, operation: str, fn: Callable[[], Awaitable[_T]]) -> _T:
+        return await call_with_retry(
+            fn, self.retry_policy, on_attempt=self.on_attempt, operation=operation,
+        )
+
+    def retry_stats(self) -> dict[str, Any]:
+        """Counters: calls, attempts, retries, failures by error code, last error."""
+        return self.retry_policy.stats()
+
+    def retry_history(self) -> list[AttemptRecord]:
+        """The most recent attempt records, oldest first (bounded)."""
+        return list(self.retry_policy.history)
+
+    def describe(self) -> dict[str, Any]:
+        """Retry settings, counters and recent attempts, for the health report."""
+        return {"plugin": type(self).__name__, "model": getattr(self, "model", None),
+                "retry": self.retry_policy.describe()}
+
+
+class AnthropicPlugin(_RetryMixin):
     """
     Anthropic Claude plugin for ARIA.
 
@@ -34,11 +78,14 @@ class AnthropicPlugin:
         model: str = "claude-sonnet-4-20250514",
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        retry_policy: Optional[RetryPolicy] = None,
+        on_attempt: Optional[Callable[[AttemptRecord], Any]] = None,
     ):
         self.model       = model
         self.max_tokens  = max_tokens
         self.temperature = temperature
         self._api_key    = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._init_retry(retry_policy, on_attempt)
 
         if not self._api_key:
             raise ValueError(
@@ -61,16 +108,26 @@ class AnthropicPlugin:
         max_tokens: int = 2000,
         model: Optional[str] = None,
     ) -> str:
-        """Single-turn text completion. Used by the decomposer."""
-        response = await self._client.messages.create(
-            model      = model or self.model,
-            max_tokens = max_tokens,
-            messages   = [{"role": "user", "content": prompt}],
-        )
-        block = response.content[0]
-        if block.type == "text":
-            return block.text
-        return ""
+        """
+        Single-turn text completion. Used by the decomposer.
+
+        Failed calls are retried (see aria/plugins/retry.py). When the provider keeps
+        returning no content blocks, or the retries run out, LLMError is raised.
+        """
+        async def attempt() -> str:
+            response = await self._client.messages.create(
+                model      = model or self.model,
+                max_tokens = max_tokens,
+                messages   = [{"role": "user", "content": prompt}],
+            )
+            if not response.content:
+                raise EmptyResponseError("Anthropic returned a response with no content blocks")
+            block = response.content[0]
+            if block.type == "text":
+                return block.text
+            return ""
+
+        return await self._with_retry("anthropic.complete", attempt)
 
     async def chat(
         self,
@@ -122,32 +179,38 @@ class AnthropicPlugin:
                 for t in tools
             ]
 
-        response = await self._client.messages.create(**kwargs)
+        async def attempt() -> dict:
+            response = await self._client.messages.create(**kwargs)
 
-        # Parse response
-        text_content = ""
-        tool_calls   = []
+            # Parse response
+            text_content = ""
+            tool_calls   = []
 
-        for block in response.content:
-            if block.type == "text":
-                text_content += block.text
-            elif block.type == "tool_use":
-                tool_calls.append({
-                    "name":      block.name,
-                    "arguments": block.input,
-                    "id":        block.id,
-                })
+            for block in response.content:
+                if block.type == "text":
+                    text_content += block.text
+                elif block.type == "tool_use":
+                    tool_calls.append({
+                        "name":      block.name,
+                        "arguments": block.input,
+                        "id":        block.id,
+                    })
 
-        tokens_used = response.usage.input_tokens + response.usage.output_tokens
+            if not text_content and not tool_calls:
+                raise EmptyResponseError("Anthropic returned no text and no tool calls")
 
-        return {
-            "content":    text_content,
-            "tool_calls": tool_calls,
-            "tokens_used": tokens_used,
-        }
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+
+            return {
+                "content":    text_content,
+                "tool_calls": tool_calls,
+                "tokens_used": tokens_used,
+            }
+
+        return await self._with_retry("anthropic.chat", attempt)
 
 
-class OpenAIPlugin:
+class OpenAIPlugin(_RetryMixin):
     """
     OpenAI GPT plugin for ARIA.
 
@@ -162,11 +225,14 @@ class OpenAIPlugin:
         model: str = "gpt-4o",
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        retry_policy: Optional[RetryPolicy] = None,
+        on_attempt: Optional[Callable[[AttemptRecord], Any]] = None,
     ):
         self.model       = model
         self.max_tokens  = max_tokens
         self.temperature = temperature
         self._api_key    = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self._init_retry(retry_policy, on_attempt)
 
         if not self._api_key:
             raise ValueError("OpenAI API key not provided.")
@@ -178,12 +244,17 @@ class OpenAIPlugin:
             raise ImportError("Install openai with: pip install openai")
 
     async def complete(self, prompt: str, max_tokens: int = 2000, model: Optional[str] = None) -> str:
-        response = await self._client.chat.completions.create(
-            model    = model or self.model,
-            messages = [{"role": "user", "content": prompt}],
-            max_tokens = max_tokens,
-        )
-        return response.choices[0].message.content or ""
+        async def attempt() -> str:
+            response = await self._client.chat.completions.create(
+                model    = model or self.model,
+                messages = [{"role": "user", "content": prompt}],
+                max_tokens = max_tokens,
+            )
+            if not response.choices:
+                raise EmptyResponseError("OpenAI returned a response with no choices")
+            return response.choices[0].message.content or ""
+
+        return await self._with_retry("openai.complete", attempt)
 
     async def chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: Optional[int] = None) -> dict:
         kwargs: dict[str, Any] = {
@@ -195,21 +266,29 @@ class OpenAIPlugin:
             kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
             kwargs["tool_choice"] = "auto"
 
-        response = await self._client.chat.completions.create(**kwargs)
-        msg = response.choices[0].message
+        async def attempt() -> dict:
+            response = await self._client.chat.completions.create(**kwargs)
+            if not response.choices:
+                raise EmptyResponseError("OpenAI returned a response with no choices")
+            msg = response.choices[0].message
 
-        tool_calls = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-                tool_calls.append({"name": tc.function.name, "arguments": args, "id": tc.id})
+            tool_calls = []
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    tool_calls.append({"name": tc.function.name, "arguments": args, "id": tc.id})
 
-        tokens_used = response.usage.total_tokens if response.usage else 0
-        return {
-            "content":     msg.content or "",
-            "tool_calls":  tool_calls,
-            "tokens_used": tokens_used,
-        }
+            if not msg.content and not tool_calls:
+                raise EmptyResponseError("OpenAI returned no text and no tool calls")
+
+            tokens_used = response.usage.total_tokens if response.usage else 0
+            return {
+                "content":     msg.content or "",
+                "tool_calls":  tool_calls,
+                "tokens_used": tokens_used,
+            }
+
+        return await self._with_retry("openai.chat", attempt)
