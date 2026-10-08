@@ -375,3 +375,111 @@ class TestWebAgent:
 
         assert url_match1 is not None, "URL task must be detected as browse"
         assert url_match2 is None,     "Non-URL task must route to search"
+
+
+# ─── No silent truncation (issue #48) ─────────────────────────────────────────
+
+class AllowAll:
+    def require(self, user_id: str, capability):
+        return None
+
+
+class TestNoSilentTruncation:
+    """Long web output is previewed with an omitted count, never cut quietly."""
+
+    def _make_agent(self, tmp_path):
+        from aria.core.spill import SpillStore
+        mem   = TemporalMemory(persist_path=str(tmp_path / "memory.db"))
+        agent = WebAgent(
+            permissions       = AllowAll(),
+            memory            = mem,
+            anthropic_api_key = None,
+            domain_trust_path = str(tmp_path / "trust.json"),
+        )
+        agent._spill_store = SpillStore(tmp_path / "spill")
+        return agent, mem
+
+    def _search(self, agent, monkeypatch, content, tavily=False):
+        import aria.agents.web_agent as wa
+
+        async def fake_ddg(query, max_results=5):
+            return [{"url": "https://example.com/a", "title": "A", "content": content}]
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ARIA_TAVILY_KEY", raising=False)
+        monkeypatch.setattr(wa, "_search_duckduckgo", fake_ddg)
+        return asyncio.run(agent._execute_search("q", "user1", make_node()))
+
+    def test_short_snippet_unchanged(self, tmp_path, monkeypatch):
+        agent, _ = self._make_agent(tmp_path)
+        out = self._search(agent, monkeypatch, "short snippet")
+        assert "   short snippet\n" in out
+        assert "omitted" not in out
+        assert agent.spill_store.spills_total == 0
+
+    def test_long_snippet_says_how_much_was_omitted(self, tmp_path, monkeypatch):
+        agent, _ = self._make_agent(tmp_path)
+        content = "x" * 3000
+        out = self._search(agent, monkeypatch, content)
+        assert "2500" in out                      # 3000 - 500 characters left out
+        assert agent.spill_store.spills_total == 1   # the full text is saved
+        assert out.count("x") < 3000
+
+    def test_long_snippet_full_text_is_recoverable(self, tmp_path, monkeypatch):
+        agent, _ = self._make_agent(tmp_path)
+        content = "".join(str(i % 10) for i in range(3000))
+        self._search(agent, monkeypatch, content)
+        locator = next(iter(agent.spill_store._issued))
+        page = agent.spill_store.read_page(locator, 0, 3000)
+        assert page.text == content
+
+    def test_search_result_keeps_full_tavily_content(self, tmp_path, monkeypatch):
+        """The search helper no longer cuts; the display step reports omissions."""
+        import sys
+        import types
+
+        import aria.agents.web_agent as wa
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"results": [{"title": "t", "url": "u", "content": "y" * 2000}]}
+
+        class Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, *a, **k): return Resp()
+
+        fake = types.ModuleType("httpx")
+        fake.AsyncClient = Client  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        results = asyncio.run(wa._search_tavily("q", "key"))
+        assert len(results[0]["content"]) == 2000
+
+    def test_browse_summary_reports_omitted_count(self, tmp_path):
+        agent, mem = self._make_agent(tmp_path)
+        url     = "https://example.com/long"
+        content = "Detailed content paragraph. " * 200   # 5600 chars
+        agent._store_browse_result(url, content, _fingerprint(content), "user1", make_node())
+        hot = mem.recall(url, rings=[MemoryRing.HOT])
+        summary = next(h for h in hot if h.metadata.get("is_summary"))
+        assert str(len(content) - 500) in summary.content
+        assert "[see WARM memory" not in summary.content
+
+    def test_warm_store_over_cap_reports_omitted_count(self, tmp_path):
+        agent, mem = self._make_agent(tmp_path)
+        agent._max_content_chars = 1000
+        url     = "https://example.com/huge"
+        content = "z" * 5000
+        agent._store_browse_result(url, content, _fingerprint(content), "user1", make_node())
+        warm = mem.recall(url, rings=[MemoryRing.WARM])
+        assert "4000" in warm[0].content
+        assert warm[0].metadata["char_count"] == 5000
+
+    def test_content_under_cap_stored_unchanged(self, tmp_path):
+        agent, mem = self._make_agent(tmp_path)
+        url     = "https://example.com/small"
+        content = "small page " * 20
+        agent._store_browse_result(url, content, _fingerprint(content), "user1", make_node())
+        warm = mem.recall(url, rings=[MemoryRing.WARM])
+        assert warm[0].content == content

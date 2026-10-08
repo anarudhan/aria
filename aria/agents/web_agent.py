@@ -78,6 +78,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..core.models import MemoryRing, TaskNode
+from ..core.spill import SpillStore, get_default_store
 from .base import BaseAgent
 
 # ─── Content Helpers ──────────────────────────────────────────────────────────
@@ -266,7 +267,7 @@ async def _search_tavily(query: str, api_key: str, max_results: int = 5) -> list
         results.append({
             "title":   r.get("title", ""),
             "url":     r.get("url", ""),
-            "content": r.get("content", "")[:500],
+            "content": r.get("content", ""),
         })
     return results
 
@@ -385,6 +386,7 @@ class WebAgent(BaseAgent):
         max_content_chars:  int = 12000,
         domain_trust_path:  Optional[str] = None,
         max_claude_searches: int = 3,
+        spill_store: Optional[SpillStore] = None,
     ):
         super().__init__(
             agent_id="aria_web_agent",
@@ -413,6 +415,22 @@ class WebAgent(BaseAgent):
         self._max_content_chars  = max_content_chars
         self._domain_trust       = DomainTrustStore(domain_trust_path)
         self._max_claude_searches = max_claude_searches
+        self._spill_store = spill_store   # None: use the shared default on first need
+
+    # Search snippets and browse summaries longer than this are shown as a head
+    # and tail preview that says how much was left out (issue #48).
+    SNIPPET_PREVIEW_CHARS = 500
+
+    @property
+    def spill_store(self) -> SpillStore:
+        """Where oversized output is saved (the shared default unless one was given)."""
+        if self._spill_store is None:
+            self._spill_store = get_default_store()
+        return self._spill_store
+
+    def _show(self, text: str, max_chars: int) -> str:
+        """Return text as-is if it fits, else an honest preview (never a silent cut)."""
+        return self.spill_store.preview_or_spill(text, max_chars).text
 
     async def execute(self, node: TaskNode, context: dict, memory: object) -> Any:
         task    = node.description.strip()
@@ -592,11 +610,15 @@ class WebAgent(BaseAgent):
         for i, r in enumerate(results, 1):
             url     = r.get("url", "")
             trust   = self._domain_trust.score(url) if url else 0.5
-            snippet = r.get("content", "")[:500]
+            content = r.get("content", "")
+            snippet = self._show(content, self.SNIPPET_PREVIEW_CHARS)
             lines.append(f"{i}. {r.get('title', 'No title')}")
             if url:
                 lines.append(f"   {url}  [trust: {trust:.2f}]")
-                self._domain_trust.record(url, success=bool(snippet), content_length=len(snippet))
+                self._domain_trust.record(
+                    url, success=bool(content),
+                    content_length=min(len(content), self.SNIPPET_PREVIEW_CHARS),
+                )
             lines.append(f"   {snippet}\n")
 
         formatted = "\n".join(lines)
@@ -628,7 +650,7 @@ class WebAgent(BaseAgent):
     def _store_browse_result(
         self, url: str, content: str, fingerprint: str, user_id: str, node: TaskNode
     ):
-        truncated = content[:self._max_content_chars]
+        truncated = self._show(content, self._max_content_chars)
         metadata  = {
             "source_url": url, "fingerprint": fingerprint,
             "browsed_at": datetime.now(timezone.utc).isoformat(),
@@ -640,7 +662,7 @@ class WebAgent(BaseAgent):
             metadata=metadata, user_id=user_id,
         )
         if len(content) > 2000:
-            summary = content[:500] + "... [see WARM memory for full content]"
+            summary = self._show(content, self.SNIPPET_PREVIEW_CHARS)
             self._memory.store(
                 content=summary, ring=MemoryRing.HOT,
                 tags=["web_browse", "summary", f"url:{url[:120]}"],
