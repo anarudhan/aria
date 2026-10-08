@@ -95,7 +95,50 @@ def _check_scope_text(value: str, label: str) -> None:
         raise ToolSpecError(f"{label} is longer than {MAX_SCOPE_CHARS} characters")
 
 
-@dataclass(frozen=True, slots=True)
+def _is_ready(obj: object) -> bool:
+    """True once ``__init__`` finished validating and assigning every field.
+
+    A blank object (``copyreg.__newobj__``, ``object.__new__``) or one whose
+    initialisation failed is never ready. Code that reads a Need or ToolSpec it did
+    not build itself must check this first."""
+    try:
+        return bool(object.__getattribute__(obj, "_ready") is True)
+    except AttributeError:
+        return False
+
+
+def _validate_need(capability: Any, scope: Any, scope_from: Any) -> None:
+    if not isinstance(capability, Capability):
+        raise ToolSpecError(
+            f"Need.capability must be a Capability member, got {_type_name(capability)}"
+        )
+    if not _is_exact_str(scope):
+        raise ToolSpecError(f"Need.scope must be a str, got {_type_name(scope)}")
+    _check_scope_text(scope, "Need.scope")
+    source = scope_from
+    if source is None:
+        return
+    if scope != "*":
+        raise ToolSpecError(
+            "Need takes either a fixed scope or scope_from, not both "
+            f"(scope={scope[:40]!r} and scope_from set)"
+        )
+    if isinstance(source, str):
+        if not _is_exact_str(source) or not source.strip():
+            raise ToolSpecError("Need.scope_from must name an argument (a non-empty str)")
+        if len(source) > 256:
+            raise ToolSpecError("Need.scope_from argument name is too long (max 256)")
+    elif callable(source):
+        if inspect.iscoroutinefunction(source):
+            raise ToolSpecError("Need.scope_from must be a plain function, not async")
+    else:
+        raise ToolSpecError(
+            "Need.scope_from must be an argument name (str) or a callable, "
+            f"got {_type_name(source)}"
+        )
+
+
+@dataclass(frozen=True, init=False)
 class Need:
     """
     One capability a tool needs, and the scope it needs it over.
@@ -117,42 +160,31 @@ class Need:
     string through every later stage; it must never call the callable again.
     """
 
+    __slots__ = ("capability", "scope", "scope_from", "_ready")
+
     capability: Capability
-    scope: str = "*"
-    scope_from: Optional[ScopeFrom] = None
+    scope: str
+    scope_from: Optional[ScopeFrom]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         raise TypeError("Need cannot be subclassed")
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.capability, Capability):
-            raise ToolSpecError(
-                f"Need.capability must be a Capability member, got {_type_name(self.capability)}"
-            )
-        if not _is_exact_str(self.scope):
-            raise ToolSpecError(f"Need.scope must be a str, got {_type_name(self.scope)}")
-        _check_scope_text(self.scope, "Need.scope")
-        source = self.scope_from
-        if source is None:
-            return
-        if self.scope != "*":
-            raise ToolSpecError(
-                "Need takes either a fixed scope or scope_from, not both "
-                f"(scope={self.scope[:40]!r} and scope_from set)"
-            )
-        if isinstance(source, str):
-            if not _is_exact_str(source) or not source.strip():
-                raise ToolSpecError("Need.scope_from must name an argument (a non-empty str)")
-            if len(source) > 256:
-                raise ToolSpecError("Need.scope_from argument name is too long (max 256)")
-        elif callable(source):
-            if inspect.iscoroutinefunction(source):
-                raise ToolSpecError("Need.scope_from must be a plain function, not async")
-        else:
-            raise ToolSpecError(
-                "Need.scope_from must be an argument name (str) or a callable, "
-                f"got {_type_name(source)}"
-            )
+    def __init__(
+        self,
+        capability: Capability,
+        scope: str = "*",
+        scope_from: Optional[ScopeFrom] = None,
+    ) -> None:
+        # Validate on locals first, assign only when everything is valid, and mark the
+        # object ready last. A second __init__ call on a ready object is refused, so
+        # an invalid value can never be left behind by a failed re-initialisation.
+        if _is_ready(self):
+            raise ToolSpecError("this Need is already initialised and cannot be initialised again")
+        _validate_need(capability, scope, scope_from)
+        object.__setattr__(self, "capability", capability)
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "scope_from", scope_from)
+        object.__setattr__(self, "_ready", True)
 
     def resolve_scope(self, arguments: Mapping[str, Any]) -> str:
         """
@@ -165,6 +197,8 @@ class Need:
         empty str. THE CALLER MUST DENY THE CALL ON ToolSpecError. Messages
         carry argument names and type names, never argument values.
         """
+        if not _is_ready(self):
+            raise ToolSpecError("cannot resolve scope: this Need was never initialised")
         source = self.scope_from
         if source is None:
             return self.scope
@@ -211,7 +245,7 @@ class Need:
         return str(value)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, init=False)
 class ToolSpec:
     """
     What a tool declares about itself. Immutable and validated on creation.
@@ -228,19 +262,51 @@ class ToolSpec:
     never treat it as authority to skip a permission check.
     """
 
+    __slots__ = (
+        "name",
+        "needs",
+        "timeout_s",
+        "concurrency_safe",
+        "approval",
+        "internal",
+        "description",
+        "_ready",
+    )
+
     name: str
     needs: tuple[Need, ...]
-    timeout_s: float = 30.0
-    concurrency_safe: bool = False
-    approval: str = "auto"
-    internal: bool = False
-    description: str = ""
+    timeout_s: float
+    concurrency_safe: bool
+    approval: str
+    internal: bool
+    description: str
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         raise TypeError("ToolSpec cannot be subclassed")
 
-    def __post_init__(self) -> None:
-        _validate_spec(self, allow_internal=False)
+    def __init__(
+        self,
+        name: str,
+        needs: tuple[Need, ...],
+        timeout_s: float = 30.0,
+        concurrency_safe: bool = False,
+        approval: str = "auto",
+        internal: bool = False,
+        description: str = "",
+    ) -> None:
+        _initialise_spec(
+            self,
+            {
+                "name": name,
+                "needs": needs,
+                "timeout_s": timeout_s,
+                "concurrency_safe": concurrency_safe,
+                "approval": approval,
+                "internal": internal,
+                "description": description,
+            },
+            allow_internal=False,
+        )
 
     @property
     def risk(self) -> str:
@@ -248,6 +314,8 @@ class ToolSpec:
 
         A capability with no known risk level counts as "critical", so a gap in
         RISK_LEVEL makes a tool look more dangerous, never less."""
+        if not _is_ready(self):
+            raise ToolSpecError("this ToolSpec was never initialised")
         unknown = len(RISK_ORDER) - 1
         highest = 0
         for need in self.needs:
@@ -257,44 +325,58 @@ class ToolSpec:
         return RISK_ORDER[highest]
 
 
-def _validate_spec(spec: ToolSpec, allow_internal: bool) -> None:
-    """Check every field of ``spec``. ``__post_init__`` calls this with
-    allow_internal=False; only the registry's ``_build_spec`` passes True.
+_SPEC_FIELDS = (
+    "name",
+    "needs",
+    "timeout_s",
+    "concurrency_safe",
+    "approval",
+    "internal",
+    "description",
+)
 
-    There is deliberately no flag or window that user code could reach while the
-    registry builds a spec: the permission to be internal is an argument, not state."""
-    validate_tool_name(spec.name)
 
-    if type(spec.needs) is not tuple:
-        raise ToolSpecError(f"ToolSpec.needs must be a tuple, got {_type_name(spec.needs)}")
-    if len(spec.needs) > MAX_NEEDS:
+def _check_spec_fields(raw: dict[str, Any], allow_internal: bool) -> dict[str, Any]:
+    """Validate a dict of ToolSpec fields and return a normalised copy.
+
+    Nothing is assigned anywhere: the caller assigns only after this returns. There is
+    deliberately no flag or window that user code could reach while the registry builds
+    a spec: the permission to be internal is an argument, not state."""
+    values = dict(raw)
+    validate_tool_name(values["name"])
+
+    if type(values["needs"]) is not tuple:
+        raise ToolSpecError(f"ToolSpec.needs must be a tuple, got {_type_name(values['needs'])}")
+    if len(values["needs"]) > MAX_NEEDS:
         raise ToolSpecError(f"ToolSpec.needs has more than {MAX_NEEDS} entries")
-    for index, need in enumerate(spec.needs):
+    for index, need in enumerate(values["needs"]):
         if type(need) is not Need:
             raise ToolSpecError(
                 f"ToolSpec.needs[{index}] must be a Need, got {_type_name(need)}"
             )
+        if not _is_ready(need):
+            raise ToolSpecError(f"ToolSpec.needs[{index}] is a Need that was never initialised")
 
-    if type(spec.internal) is not bool:
+    if type(values["internal"]) is not bool:
         raise ToolSpecError(
-            f"ToolSpec.internal must be a bool, got {_type_name(spec.internal)}"
+            f"ToolSpec.internal must be a bool, got {_type_name(values['internal'])}"
         )
-    if type(spec.concurrency_safe) is not bool:
+    if type(values["concurrency_safe"]) is not bool:
         raise ToolSpecError(
-            f"ToolSpec.concurrency_safe must be a bool, got {_type_name(spec.concurrency_safe)}"
+            f"ToolSpec.concurrency_safe must be a bool, got {_type_name(values['concurrency_safe'])}"
         )
-    if spec.internal and not allow_internal:
+    if values["internal"] and not allow_internal:
         raise ToolSpecError(
             "a tool cannot declare itself internal. Internal status is granted only by "
             "the registry (ToolRegistry(internal_tools=...)) and is not a permission exemption"
         )
-    if not spec.needs and not spec.internal:
+    if not values["needs"] and not values["internal"]:
         raise ToolSpecError(
-            f"tool {spec.name!r} declares no needs. A tool that is not internal must "
+            f"tool {values['name']!r} declares no needs. A tool that is not internal must "
             "declare at least one capability it needs"
         )
 
-    timeout = spec.timeout_s
+    timeout = values["timeout_s"]
     if type(timeout) not in (int, float):  # also rejects bool, Decimal, numpy scalars
         raise ToolSpecError(
             f"ToolSpec.timeout_s must be an int or float, got {_type_name(timeout)}"
@@ -309,21 +391,38 @@ def _validate_spec(spec: ToolSpec, allow_internal: bool) -> None:
         raise ToolSpecError(
             f"ToolSpec.timeout_s must be above 0 and at most {MAX_TIMEOUT_S:g}"
         )
-    object.__setattr__(spec, "timeout_s", float(timeout))
+    values["timeout_s"] = float(timeout)
 
-    if not _is_exact_str(spec.approval):
-        raise ToolSpecError(f"ToolSpec.approval must be a str, got {_type_name(spec.approval)}")
-    if spec.approval not in APPROVAL_MODES:
+    if not _is_exact_str(values["approval"]):
+        raise ToolSpecError(f"ToolSpec.approval must be a str, got {_type_name(values['approval'])}")
+    if values["approval"] not in APPROVAL_MODES:
         raise ToolSpecError(
-            f"ToolSpec.approval must be one of {APPROVAL_MODES}, got {spec.approval[:20]!r}"
+            f"ToolSpec.approval must be one of {APPROVAL_MODES}, got {values['approval'][:20]!r}"
         )
 
-    if not _is_exact_str(spec.description):
+    if not _is_exact_str(values["description"]):
         raise ToolSpecError(
-            f"ToolSpec.description must be a str, got {_type_name(spec.description)}"
+            f"ToolSpec.description must be a str, got {_type_name(values['description'])}"
         )
-    if len(spec.description) > MAX_DESCRIPTION_CHARS:
+    if len(values["description"]) > MAX_DESCRIPTION_CHARS:
         raise ToolSpecError(f"ToolSpec.description is longer than {MAX_DESCRIPTION_CHARS}")
+    return values
+
+
+def _validate_spec(spec: ToolSpec, allow_internal: bool) -> None:
+    """Check the fields of an existing ``spec`` (used by tests and by readers)."""
+    if not _is_ready(spec):
+        raise ToolSpecError("this ToolSpec was never initialised")
+    _check_spec_fields({f: getattr(spec, f) for f in _SPEC_FIELDS}, allow_internal)
+
+
+def _initialise_spec(spec: ToolSpec, raw: dict[str, Any], allow_internal: bool) -> None:
+    if _is_ready(spec):
+        raise ToolSpecError("this ToolSpec is already initialised and cannot be initialised again")
+    values = _check_spec_fields(raw, allow_internal)
+    for key in _SPEC_FIELDS:
+        object.__setattr__(spec, key, values[key])
+    object.__setattr__(spec, "_ready", True)  # last: only a fully valid spec is ready
 
 
 def _refuse(*_args: Any, **_kwargs: Any) -> Any:
@@ -373,7 +472,5 @@ def _build_spec(internal: object, **fields: Any) -> ToolSpec:
     if unknown:
         raise ToolSpecError(f"unknown ToolSpec fields: {sorted(unknown)}")
     values.update(fields)
-    for key, value in values.items():
-        object.__setattr__(spec, key, value)
-    _validate_spec(spec, allow_internal=True)
+    _initialise_spec(spec, values, allow_internal=True)
     return spec

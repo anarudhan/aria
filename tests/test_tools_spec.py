@@ -768,3 +768,114 @@ class TestCopyAndPickleCannotBypassValidation:
             spec.__reduce_ex__(2)
         with pytest.raises(TypeError):
             spec.__getstate__()
+
+
+class TestInitCannotBeReused:
+    """__init__ validates before it assigns and runs only once per object."""
+
+    def test_reinit_with_invalid_values_raises_and_changes_nothing(self):
+        spec = dataclasses.replace(make())
+        before = dataclasses.astuple(spec)
+        with pytest.raises(ToolSpecError):
+            spec.__init__("evil", (), 30.0, False, "auto", True, "")  # type: ignore[misc]
+        assert dataclasses.astuple(spec) == before
+        assert spec.internal is False and spec.needs == (Need(C.FILE_READ),)
+
+    def test_reinit_with_valid_values_is_refused_too(self):
+        spec = make()
+        with pytest.raises(ToolSpecError, match="already initialised"):
+            spec.__init__("other", (Need(C.NETWORK),))  # type: ignore[misc]
+        assert spec.name == "t"
+
+    def test_need_reinit_raises_and_changes_nothing(self):
+        need = Need(C.FILE_READ)
+        with pytest.raises(ToolSpecError):
+            need.__init__(C.FILE_READ, "", None)  # type: ignore[misc]
+        assert need.scope == "*" and need.capability is C.FILE_READ
+        with pytest.raises(ToolSpecError, match="already initialised"):
+            need.__init__(C.NETWORK, "/ok", None)  # type: ignore[misc]
+        assert need.capability is C.FILE_READ and need.scope == "*"
+
+    def test_failed_first_init_leaves_a_blank_object_that_is_not_usable(self):
+        from aria.tools.spec import _is_ready
+
+        spec = object.__new__(ToolSpec)
+        with pytest.raises(ToolSpecError):
+            spec.__init__("bad name", ())  # type: ignore[misc]
+        assert not _is_ready(spec)
+        with pytest.raises(AttributeError):
+            spec.name  # nothing was half-written
+        need = object.__new__(Need)
+        with pytest.raises(ToolSpecError):
+            need.__init__("not a capability")  # type: ignore[misc]
+        assert not _is_ready(need)
+        with pytest.raises(AttributeError):
+            need.scope
+
+    def test_the_generated_setattr_still_blocks_assignment(self):
+        spec = make()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.internal = True  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec._ready = False  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            del spec.name
+
+    @pytest.mark.parametrize("make_blank", [
+        lambda cls: __import__("copyreg").__newobj__(cls),
+        lambda cls: object.__new__(cls),
+    ], ids=["copyreg", "object.__new__"])
+    def test_blank_objects_are_refused_everywhere(self, make_blank):
+        from aria.tools import ToolRegistry
+
+        blank_spec = make_blank(ToolSpec)
+        blank_need = make_blank(Need)
+        with pytest.raises(ToolSpecError):
+            blank_spec.risk
+        with pytest.raises(ToolSpecError):
+            blank_need.resolve_scope(freeze_args({}))
+        reg = ToolRegistry()
+        with pytest.raises(ToolSpecError):
+            reg.register(lambda: 1, blank_spec, name="blank")
+        with pytest.raises(ToolSpecError):
+            reg.register(
+                lambda: 1,
+                ToolSpec(name="x", needs=(blank_need,)),
+                name="blank2",
+            )
+        assert len(reg) == 0
+        with pytest.raises(ToolSpecError):
+            ToolSpec(name="t", needs=(blank_need,))
+        # a spec that was tampered into holding a blank Need is refused by the registry
+        tampered = make()
+        object.__setattr__(tampered, "needs", (blank_need,))
+        with pytest.raises(ToolSpecError):
+            reg.register(lambda: 1, tampered, name="blank3")
+
+    def test_replace_equality_hash_repr_asdict_still_work(self):
+        spec = make(timeout_s=5)
+        other = dataclasses.replace(spec, name="other", timeout_s=7)
+        assert other.name == "other" and other.timeout_s == 7.0 and other.needs == spec.needs
+        assert spec == dataclasses.replace(spec)
+        assert spec != other
+        assert hash(spec) == hash(dataclasses.replace(spec))
+        assert "ToolSpec(name='t'" in repr(spec)
+        assert "_ready" not in repr(spec)
+        data = dataclasses.asdict(spec)
+        assert data["name"] == "t" and data["timeout_s"] == 5.0 and "_ready" not in data
+        need = Need(C.FILE_READ, scope="/d")
+        assert need == dataclasses.replace(need) and hash(need) == hash(dataclasses.replace(need))
+        assert dataclasses.replace(need, scope="/e").scope == "/e"
+        assert dataclasses.asdict(need)["scope"] == "/d"
+        assert repr(need).startswith("Need(capability=")
+        with pytest.raises(ToolSpecError):
+            dataclasses.replace(spec, internal=True)
+        with pytest.raises(ToolSpecError):
+            dataclasses.replace(need, scope="")
+
+    def test_positional_and_keyword_construction(self):
+        assert Need(C.FILE_READ, "/x") == Need(capability=C.FILE_READ, scope="/x")
+        assert ToolSpec("t", (Need(C.FILE_READ),), 5, True, "always", False, "d").approval == "always"
+
+    def test_no_instance_dict(self):
+        assert not hasattr(make(), "__dict__") and not hasattr(Need(C.FILE_READ), "__dict__")

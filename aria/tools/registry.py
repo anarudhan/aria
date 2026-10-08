@@ -29,7 +29,7 @@ from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 from .decorator import declared_spec
-from .spec import Need, ToolSpec, ToolSpecError, _build_spec, validate_tool_name
+from .spec import Need, ToolSpec, ToolSpecError, _build_spec, _is_ready, validate_tool_name
 
 __all__ = ["ToolRegistry"]
 
@@ -42,6 +42,8 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
     instead of being trusted. A non-internal spec with no needs is rejected."""
     if type(spec) is not ToolSpec:
         raise ToolSpecError(f"spec must be a ToolSpec, got {type(spec).__name__}")
+    if not _is_ready(spec):
+        raise ToolSpecError("spec was never initialised (a blank or half-built ToolSpec)")
     needs = spec.needs
     if type(needs) is not tuple:
         raise ToolSpecError("spec.needs must be a tuple")
@@ -49,6 +51,8 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
     for need in needs:
         if type(need) is not Need:
             raise ToolSpecError(f"spec.needs holds a {type(need).__name__}, expected Need")
+        if not _is_ready(need):
+            raise ToolSpecError("spec.needs holds a Need that was never initialised")
         copied.append(Need(need.capability, need.scope, need.scope_from))
     return _build_spec(
         spec.internal,
@@ -167,6 +171,12 @@ class ToolRegistry:
         if spec is None:
             # Raises for a wrapper or subclass that inherited a spec it does not own.
             spec = declared_spec(fn)
+
+        if spec is not None and (type(spec) is not ToolSpec or not _is_ready(spec)):
+            raise ToolSpecError(
+                "spec must be a fully built ToolSpec, got "
+                + ("a blank or half-built ToolSpec" if type(spec) is ToolSpec else type(spec).__name__)
+            )
 
         if name is not None and type(name) is not str:
             raise ToolSpecError(f"name must be a str, got {type(name).__name__}")

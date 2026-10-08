@@ -909,3 +909,26 @@ class TestMetaclassOwnership:
                 pass
 
         ToolRegistry().register(Memo())
+
+
+class TestInternalBoundMethods:
+    def test_the_same_bound_method_object_is_internal_but_a_fresh_access_is_refused(self):
+        class Spill:
+            def m(self):
+                pass
+
+        inst = Spill()
+        bound = inst.m
+        assert inst.m is not bound  # a new object on every attribute access
+        reg = ToolRegistry(internal_tools={"m": bound})
+        with pytest.raises(ToolSpecError, match="reserved"):
+            reg.register(inst.m)
+        assert reg.register(bound).internal is True
+
+    def test_internal_callable_under_another_name_without_a_spec_is_undeclared(self):
+        def impl():
+            pass
+
+        reg = ToolRegistry(internal_tools={"read_spilled": impl})
+        assert reg.register(impl, name="alias") is None
+        assert reg.undeclared() == ["alias"]
