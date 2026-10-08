@@ -765,6 +765,15 @@ class PermissionEngine:
         head hash, which is how entries removed from the END are caught (an
         empty list is only valid while the head is still "genesis").
 
+        It does not trust the objects it checks. Every entry must be exactly
+        an AuditEntry (a subclass could override compute_hash()), the hash is
+        computed with AuditEntry.compute_hash() itself, and entry_hash,
+        prev_hash and the head hash must be exactly str (a str subclass could
+        claim to equal anything). It never raises for a bad entry (an
+        attribute deleted, a field JSON cannot encode): it returns ok=False
+        with a reason that names the problem but holds no field values.
+        KeyboardInterrupt and SystemExit still propagate.
+
         Honest limit: the entries and the head hash are plain objects in this
         process. Anyone who can rewrite process memory can edit entries and
         recompute every hash and the head value, and this will then report ok.
@@ -776,29 +785,50 @@ class PermissionEngine:
             entries = list(self._audit)
             head = self._last_hash
 
+        # The objects are checked for what they EXACTLY are, not for what they
+        # claim to be: a subclass can override compute_hash(), and a str
+        # subclass can override __eq__. Both are rejected, and the hash is
+        # computed with the class's own function. Nothing here may raise.
+        if type(head) is not str:
+            return ChainReport(
+                False, len(entries), max(len(entries) - 1, 0),
+                "the engine's head hash is not an exact str",
+            )
+
         expected_prev = GENESIS_HASH
         for i, e in enumerate(entries):
-            if not isinstance(e, AuditEntry):
-                return ChainReport(False, i, i, f"entry {i} is not an AuditEntry")
-            if e.prev_hash != expected_prev:
-                return ChainReport(
-                    False, i, i,
-                    f"entry {i}: prev_hash does not match the previous entry "
-                    "(entry reordered, inserted, duplicated or removed)",
-                )
             try:
-                fresh = e.compute_hash()
-            except (TypeError, ValueError, RecursionError) as exc:
+                if type(e) is not AuditEntry:
+                    return ChainReport(
+                        False, i, i, f"entry {i} is not an exact AuditEntry"
+                    )
+                prev_hash = e.prev_hash
+                stored_hash = e.entry_hash
+                if type(prev_hash) is not str or type(stored_hash) is not str:
+                    return ChainReport(
+                        False, i, i,
+                        f"entry {i}: prev_hash or entry_hash is not an exact str",
+                    )
+                if prev_hash != expected_prev:
+                    return ChainReport(
+                        False, i, i,
+                        f"entry {i}: prev_hash does not match the previous entry "
+                        "(entry reordered, inserted, duplicated or removed)",
+                    )
+                fresh = AuditEntry.compute_hash(e)
+                if stored_hash != fresh:
+                    return ChainReport(
+                        False, i, i,
+                        f"entry {i}: contents do not match its entry_hash (edited)",
+                    )
+                expected_prev = stored_hash
+            except Exception as exc:  # noqa: BLE001 - a bad entry must be a report, not a crash
+                # Only the exception type is reported, never its message, so
+                # no field value can leak into the reason.
                 return ChainReport(
                     False, i, i,
-                    f"entry {i}: cannot be hashed ({type(exc).__name__}: {exc})",
+                    f"entry {i}: cannot be hashed or read ({type(exc).__name__})",
                 )
-            if e.entry_hash != fresh:
-                return ChainReport(
-                    False, i, i,
-                    f"entry {i}: contents do not match its entry_hash (edited)",
-                )
-            expected_prev = e.entry_hash
 
         if head != expected_prev:
             last = max(len(entries) - 1, 0)

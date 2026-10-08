@@ -251,6 +251,122 @@ def test_non_entry_object_in_list_is_detected():
     assert not report.ok and report.first_bad_index == 3
 
 
+# ─── verify_chain does not trust the objects it verifies ─────────────────────
+
+class _LyingEntry(AuditEntry):
+    """An AuditEntry whose compute_hash() always agrees with the stored hash."""
+
+    def compute_hash(self) -> str:
+        return self.entry_hash
+
+
+class _PlainSubclass(AuditEntry):
+    """A subclass that changes nothing."""
+
+
+class _AlwaysEqual(str):
+    """A str that claims to equal everything."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
+def _copy_as(cls: type, entry: AuditEntry):
+    return cls(**{f.name: getattr(entry, f.name) for f in dataclasses.fields(AuditEntry)})
+
+
+def test_subclass_with_lying_compute_hash_is_rejected():
+    e = _mixed_engine()
+    forged = _copy_as(_LyingEntry, e._audit[2])
+    forged.scope = "/etc/shadow"          # the edit; entry_hash is left alone
+    e._audit[2] = forged
+    # Its own method now agrees with the stored hash.
+    assert forged.compute_hash() == forged.entry_hash
+    report = e.verify_chain()
+    assert not report.ok
+    assert report.first_bad_index == 2
+    assert "AuditEntry" in report.reason
+
+
+def test_plain_subclass_is_rejected_too():
+    e = _mixed_engine()
+    e._audit[1] = _copy_as(_PlainSubclass, e._audit[1])
+    report = e.verify_chain()
+    assert not report.ok and report.first_bad_index == 1
+
+
+def test_always_equal_str_as_entry_hash_is_rejected():
+    e = _mixed_engine()
+    e._audit[2].scope = "/etc/shadow"
+    e._audit[2].entry_hash = _AlwaysEqual("not the real hash")
+    report = e.verify_chain()
+    assert not report.ok and report.first_bad_index == 2
+
+
+def test_always_equal_str_as_prev_hash_cannot_hide_a_removed_entry():
+    """
+    Remove entry 2 and give entry 3 an always-equal prev_hash with the SAME
+    text it had. Its contents and hash are unchanged, so only the type check
+    can catch this.
+    """
+    e = _mixed_engine()
+    del e._audit[2]
+    victim = e._audit[2]                # was entry 3
+    victim.prev_hash = _AlwaysEqual(victim.prev_hash)
+    report = e.verify_chain()
+    assert not report.ok and report.first_bad_index == 2
+
+
+def test_always_equal_str_as_head_is_rejected():
+    e = _mixed_engine()
+    e._audit.pop()                       # entry removed from the end
+    e._last_hash = _AlwaysEqual("not the real head")
+    report = e.verify_chain()
+    assert not report.ok
+    assert "head" in report.reason
+
+
+def test_always_equal_str_as_head_of_an_empty_chain_is_rejected():
+    e = PermissionEngine()
+    e._last_hash = _AlwaysEqual("genesis?")
+    assert not e.verify_chain().ok
+
+
+@pytest.mark.parametrize("name", ALL_FIELDS)
+def test_deleted_attribute_is_reported_not_raised(name):
+    e = _mixed_engine()
+    del e._audit[3].__dict__[name]
+    report = e.verify_chain()           # must not raise
+    assert isinstance(report, ChainReport)
+    # entry_id and timestamp have no class-level default, so reading them
+    # fails; the other fields fall back to the default, which is an edit.
+    assert not report.ok and report.first_bad_index == 3
+
+
+def test_malformed_entry_reason_names_no_values():
+    e = _mixed_engine()
+    e._audit[2].scope = {"secret-token-123"}  # type: ignore[assignment]
+    report = e.verify_chain()
+    assert not report.ok
+    assert "secret-token-123" not in report.reason
+
+
+def test_keyboard_interrupt_still_propagates(monkeypatch):
+    e = _mixed_engine()
+
+    def boom(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(AuditEntry, "compute_hash", boom)
+    with pytest.raises(KeyboardInterrupt):
+        e.verify_chain()
+
+
 # ─── Tampering: structure ────────────────────────────────────────────────────
 
 def test_swapping_two_entries_is_detected():
