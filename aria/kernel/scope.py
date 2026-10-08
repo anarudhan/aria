@@ -40,6 +40,7 @@ import functools
 import inspect
 import itertools
 import time
+import weakref
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Coroutine,
     Deque,
     Dict,
     FrozenSet,
@@ -120,24 +122,37 @@ class ChildScopeErrors(Exception):
         super().__init__(f"child scope {scope!r} finished with {count} recorded error(s)")
 
 
-# Scopes whose disposal is running in the current context. A disposer that
-# calls dispose() on its own scope would wait for itself; this lets it return
-# instead. Tasks started inside a disposer inherit the marker.
+# Unwinding work is numbered: every unwind pass of a scope, and every remover
+# task, gets a fresh epoch number. The epochs of the work that is running are
+# kept in a context variable, so tasks started by a disposer inherit them. A
+# scope remembers which of its own epochs are still live (``Scope._live``).
+# A dispose() call whose context holds a live epoch of the scope is made from
+# inside that scope's own unwinding and returns at once instead of waiting for
+# itself. An epoch is never reused and stops counting when its work ends, so a
+# leftover task from an earlier unwind, or a new scope that happens to get the
+# same ``id()``, can never be mistaken for it.
+_EPOCHS = itertools.count(1)
+_SERIALS = itertools.count(1)
 _DISPOSING: ContextVar[FrozenSet[int]] = ContextVar("aria_scope_disposing", default=frozenset())
 
-# Who is waiting for whose disposal: waiter id -> {target id: how many waits}.
-# Only disposals that wait inside another disposal appear here. It lets two
-# scopes that dispose each other at the same time notice the cycle and return
-# instead of waiting for each other forever.
+# Which scope's unwinding a task belongs to (the unwind task, the tasks that run
+# its async disposers, remover tasks): task -> scope serial number.
+_OWNERS: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
+
+# Who is waiting for whose disposal: waiter serial -> {target serial: how many
+# waits}. Only a wait made by a task that belongs to some scope's unwinding is
+# recorded, so a background task that merely inherited a marker adds nothing. It
+# lets two scopes that dispose each other at the same time notice the cycle and
+# return instead of waiting for each other forever.
 _WAITS: Dict[int, Dict[int, int]] = {}
 
 
-def _waits_reach(start: int, goal: FrozenSet[int]) -> bool:
+def _waits_reach(start: int, goal: int) -> bool:
     seen: Set[int] = set()
     stack = [start]
     while stack:
         node = stack.pop()
-        if node in goal:
+        if node == goal:
             return True
         if node in seen:
             continue
@@ -146,28 +161,40 @@ def _waits_reach(start: int, goal: FrozenSet[int]) -> bool:
     return False
 
 
-def _add_waits(waiters: FrozenSet[int], target: int) -> None:
-    for w in waiters:
-        edges = _WAITS.setdefault(w, {})
-        edges[target] = edges.get(target, 0) + 1
+def _add_wait(waiter: int, target: int) -> None:
+    edges = _WAITS.setdefault(waiter, {})
+    edges[target] = edges.get(target, 0) + 1
 
 
-def _drop_waits(waiters: FrozenSet[int], target: int) -> None:
-    for w in waiters:
-        edges = _WAITS.get(w)
-        if edges is None:
-            continue
-        left = edges.get(target, 0) - 1
-        if left > 0:
-            edges[target] = left
-        else:
-            edges.pop(target, None)
-            if not edges:
-                del _WAITS[w]
+def _drop_wait(waiter: int, target: int) -> None:
+    edges = _WAITS.get(waiter)
+    if edges is None:
+        return
+    left = edges.get(target, 0) - 1
+    if left > 0:
+        edges[target] = left
+    else:
+        edges.pop(target, None)
+        if not edges:
+            del _WAITS[waiter]
 
 
-class _Done:
-    """An already finished awaitable. Awaiting it does nothing."""
+def _current_owner() -> Optional[int]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    return _OWNERS.get(task) if task is not None else None
+
+
+class _Done(Coroutine[Any, Any, None]):
+    """An already finished awaitable. Awaiting it does nothing.
+
+    It is a coroutine in the ``collections.abc`` sense, so ``asyncio.run`` and
+    ``asyncio.create_task`` accept it, but not a native coroutine object, so it
+    never triggers Python's "coroutine was never awaited" warning when ignored.
+    It holds no state and can be shared.
+    """
 
     __slots__ = ()
 
@@ -175,12 +202,55 @@ class _Done:
         return
         yield  # pragma: no cover - makes this a generator
 
+    def send(self, value: Any) -> Any:
+        raise StopIteration
+
+    def throw(self, *args: Any) -> Any:  # type: ignore[override]
+        exc = args[0]
+        raise exc if isinstance(exc, BaseException) else exc(*args[1:2])
+
+    def close(self) -> None:
+        return None
+
 
 _DONE = _Done()
 
 
+class _Waiter(Coroutine[Any, Any, None]):
+    """What a remover hands back while work is scheduled: waits for it to finish.
+
+    Like ``_Done`` it is a ``collections.abc`` coroutine, so ``await``,
+    ``asyncio.run`` and ``asyncio.create_task`` all work, and ignoring it is
+    harmless (the scheduled work happens either way).
+    """
+
+    __slots__ = ("_inner", "_it")
+
+    def __init__(self, inner: Awaitable[Any]) -> None:
+        self._inner = inner
+        self._it: Any = None
+
+    def __await__(self) -> Generator[Any, None, None]:
+        return self._inner.__await__()  # type: ignore[no-any-return]
+
+    def _iter(self) -> Any:
+        if self._it is None:
+            self._it = self._inner.__await__()
+        return self._it
+
+    def send(self, value: Any) -> Any:
+        return self._iter().send(value)
+
+    def throw(self, *args: Any) -> Any:  # type: ignore[override]
+        return self._iter().throw(*args)
+
+    def close(self) -> None:
+        if self._it is not None:
+            self._it.close()
+
+
 class _Effect:
-    __slots__ = ("id", "label", "disposers", "task", "child")
+    __slots__ = ("id", "label", "disposers", "task", "child", "cancel_sent")
 
     def __init__(self, ident: int, label: str, disposers: List[Callable[[], Any]]) -> None:
         self.id = ident
@@ -189,6 +259,15 @@ class _Effect:
         # Set while an async effect has not resolved yet.
         self.task: Optional["asyncio.Future[None]"] = None
         self.child: Optional["Scope"] = None
+        # Cancelling a resolving effect is asked once only: an effect that
+        # chooses to finish anyway must not be hit by a second cancel.
+        self.cancel_sent = False
+
+    def cancel_resolving(self) -> None:
+        task = self.task
+        if task is not None and not task.done() and not self.cancel_sent:
+            self.cancel_sent = True
+            task.cancel()
 
 
 class Remover:
@@ -286,6 +365,8 @@ class Scope:
         self.events = events
         self.parent = parent
         self._state = ScopeState.PENDING
+        self._serial = next(_SERIALS)
+        self._live: Set[int] = set()  # epochs of this scope's running unwind work
         self._ids = itertools.count(1)
         # Insertion ordered: popitem() gives the newest entry first. Child
         # scopes are kept apart from the other effects: a disposal undoes all
@@ -557,6 +638,10 @@ class Scope:
             bag = []
         task = eff.task
         if task is not None and not task.done():
+            # Still resolving: ask it to stop, so a hanging effect cannot hold the
+            # undo (and with it dispose()) forever. One that ignores the request
+            # and resolves anyway is still undone, once.
+            eff.cancel_resolving()
             return self._undo_late(eff, bag, own)
         rest = list(eff.disposers)
         eff.disposers = []
@@ -626,6 +711,7 @@ class Scope:
             _discard_awaitable(aw)
             self._record(label, exc)
             return
+        _OWNERS[task] = self._serial
         while not task.done():
             try:
                 await asyncio.wait({task})
@@ -653,15 +739,19 @@ class Scope:
         except RuntimeError:
             return aw  # no loop: the caller has to run it
         task = loop.create_task(self._marked(aw))
+        _OWNERS[task] = self._serial
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
-        return asyncio.shield(task)
+        return _Waiter(asyncio.shield(task))
 
     async def _marked(self, aw: Awaitable[Any]) -> None:
-        token = _DISPOSING.set(_DISPOSING.get() | {id(self)})
+        epoch = next(_EPOCHS)
+        self._live.add(epoch)
+        token = _DISPOSING.set(_DISPOSING.get() | {epoch})
         try:
             await aw
         finally:
+            self._live.discard(epoch)
             try:
                 _DISPOSING.reset(token)
             except ValueError:  # pragma: no cover - context changed under us
@@ -673,9 +763,7 @@ class Scope:
     def _cancel_unresolved(self) -> None:
         """Cancel async effects that have not resolved (used when setup is abandoned)."""
         for eff in list(self._effects.values()):
-            task = eff.task
-            if task is not None and not task.done():
-                task.cancel()
+            eff.cancel_resolving()
 
     # ------------------------------------------------------------------
     # Unwinding and disposal
@@ -705,10 +793,14 @@ class Scope:
             raise bag[0]
 
     async def _run(self) -> None:
-        token = _DISPOSING.set(_DISPOSING.get() | {id(self)})
+        epoch = next(_EPOCHS)
+        self._live.add(epoch)
+        token = _DISPOSING.set(_DISPOSING.get() | {epoch})
         try:
+            self._cancel_unresolved()
             await self._unwind_loop()
         finally:
+            self._live.discard(epoch)
             try:
                 _DISPOSING.reset(token)
             except ValueError:
@@ -724,12 +816,13 @@ class Scope:
         if task is None or task.done():
             self._unwinding = True
             task = self._task = asyncio.get_running_loop().create_task(self._run())
+            _OWNERS[task] = self._serial
         return task
 
     async def _join_unwind(self) -> None:
         """Undo every effect (without disposing), or wait for a running unwind."""
-        if id(self) in _DISPOSING.get():
-            return
+        if _DISPOSING.get() & self._live:
+            return  # called from inside this scope's own unwinding
         task = self._task
         if (task is None or task.done()) and not self._has_work():
             return
@@ -773,24 +866,24 @@ class Scope:
         example by ``asyncio.wait_for``), it stops waiting, but the unwinding
         carries on until it is done, so nothing is left behind.
         """
-        marks = _DISPOSING.get()
-        if self._state is ScopeState.DISPOSED or id(self) in marks:
-            return
-        if marks and _waits_reach(id(self), marks):
+        if self._state is ScopeState.DISPOSED or _DISPOSING.get() & self._live:
+            return  # finished, or called from inside this scope's own unwinding
+        waiter = _current_owner()
+        if waiter is not None and _waits_reach(self._serial, waiter):
             return  # waiting would close a cycle: two disposals waiting for each other
         self._closing = True
         task = self._task
         if (task is None or task.done()) and not self._has_work():
             self._finish_dispose()
             return
-        if marks:
-            _add_waits(marks, id(self))
+        if waiter is not None:
+            _add_wait(waiter, self._serial)
         try:
             while self._state is not ScopeState.DISPOSED:
                 await asyncio.shield(self._ensure_task())
         finally:
-            if marks:
-                _drop_waits(marks, id(self))
+            if waiter is not None:
+                _drop_wait(waiter, self._serial)
 
     # ------------------------------------------------------------------
     # Start, restart
@@ -830,6 +923,10 @@ class Scope:
                 "ACTIVE scope"
             )
         self._starting = True
+        # PENDING first: if the restart is cancelled while the old effects are
+        # being undone, the scope is left PENDING (empty, may be started again)
+        # and not ACTIVE with nothing in it.
+        self._set_state(ScopeState.PENDING)
         try:
             await self._join_unwind()
         except BaseException:
@@ -839,7 +936,6 @@ class Scope:
             self._starting = False
             await self.dispose()
             return self
-        self._set_state(ScopeState.PENDING)
         return await self._run_setup(setup)
 
     async def _settle(self) -> None:

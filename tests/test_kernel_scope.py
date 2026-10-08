@@ -27,6 +27,7 @@ from aria.kernel import (
     ScopeState,
 )
 from aria.kernel import scope as scope_module
+from aria.kernel.scope import _DISPOSING
 
 
 def rec(log: List[Any], name: Any) -> Callable[[], Callable[[], None]]:
@@ -90,7 +91,8 @@ async def test_awaitable_effect_resolving_to_a_disposer() -> None:
         return lambda: log.append("closed")
 
     s.effect(connect)
-    await s.dispose()  # waits for the effect to resolve, then undoes it
+    await turns()  # let it resolve (an effect still running at dispose is cancelled)
+    await s.dispose()
     assert log == ["closed"]
 
 
@@ -107,6 +109,7 @@ async def test_awaitable_effect_resolving_to_list_or_none() -> None:
 
     s.effect(many)
     s.effect(nothing)
+    await turns()
     await s.dispose()
     assert log == ["y", "x"]
     assert s.errors == []
@@ -351,10 +354,14 @@ async def test_remover_of_a_pending_async_effect_waits_for_it() -> None:
     s = Scope(name="s")
 
     async def slow() -> Callable[[], None]:
-        await gate.wait()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            await gate.wait()  # ignores the request to stop and finishes anyway
         return lambda: log.append("undone")
 
     remove = s.effect(slow)
+    await turns()  # the effect is running (a cancel before its first step would end it)
     t = asyncio.ensure_future(remove())
     await turns()
     assert not t.done() and log == []
@@ -998,7 +1005,10 @@ async def test_async_effect_resolving_after_dispose_began_is_undone_in_order() -
     s = Scope(name="s")
 
     async def slow() -> Callable[[], None]:
-        await gate.wait()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            await gate.wait()  # ignores the request to stop and finishes anyway
         return lambda: log.append("slow")
 
     s.effect(rec(log, "first"))
@@ -1776,10 +1786,14 @@ async def test_unawaited_remover_of_a_resolving_effect_does_not_leak() -> None:
     s = Scope(name="s")
 
     async def slow() -> Callable[[], None]:
-        await gate.wait()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            await gate.wait()  # ignores the request to stop and finishes anyway
         return lambda: log.append("undone")
 
     remove = s.effect(slow)
+    await turns()  # the effect is running (a cancel before its first step would end it)
     remove()  # not awaited, effect still resolving
     assert s.effect_count == 0
     d = asyncio.ensure_future(s.dispose())
@@ -2310,3 +2324,324 @@ async def test_main_scenarios_leave_no_loop_errors_unraisables_or_warnings() -> 
         sys.unraisablehook = old_hook
     assert loop_errors == []
     assert unraisable == []
+
+
+# ----------------------------------------------------------------------
+# Second review round: stale markers, wait edges, hanging effects
+# ----------------------------------------------------------------------
+
+
+async def test_leftover_task_from_an_earlier_unwind_cannot_swallow_a_later_dispose() -> None:
+    gate = asyncio.Event()
+    log: List[str] = []
+    leftovers: List["asyncio.Future[None]"] = []
+    s = Scope(name="s")
+
+    def first(sc: Scope) -> None:
+        def effect() -> Callable[[], None]:
+            def undo() -> None:
+                async def background() -> None:
+                    await gate.wait()
+                    await s.dispose()  # a real request, made long after the unwind
+
+                leftovers.append(asyncio.ensure_future(background()))
+
+            return undo
+
+        sc.effect(effect)
+
+    def second(sc: Scope) -> None:
+        sc.effect(rec(log, "e1"))
+        sc.effect(rec(log, "e2"))
+
+    await s.start(first)
+    await s.restart(second)  # the first unwind (and its marker) is over
+    assert s.state is ScopeState.ACTIVE and s.effect_count == 2
+    gate.set()
+    await asyncio.wait_for(leftovers[0], 5)
+    assert s.state is ScopeState.DISPOSED
+    assert log == ["e2", "e1"] and s.effect_count == 0
+
+
+async def test_recycled_id_of_a_disposed_scope_cannot_make_dispose_a_noop() -> None:
+    gate = asyncio.Event()
+    log: List[str] = []
+    holder: List[Scope] = []
+    leftovers: List["asyncio.Future[None]"] = []
+
+    async def background() -> None:
+        await gate.wait()
+        await holder[0].dispose()
+
+    old = Scope(name="old")
+
+    def effect() -> Callable[[], None]:
+        return lambda: leftovers.append(asyncio.ensure_future(background()))
+
+    old.effect(effect)
+    await old.dispose()  # the leftover task is born inside this unwind
+    old_id = id(old)
+    del old, effect
+    gc.collect()
+    keep: List[Scope] = []
+    fresh = Scope(name="fresh")
+    for _ in range(5000):  # try to get the dead scope's id back
+        if id(fresh) == old_id:
+            break
+        keep.append(fresh)
+        fresh = Scope(name="fresh")
+    # (If this interpreter never recycles the id, the check below still holds.)
+    fresh.effect(rec(log, "fresh-undo"))
+    holder.append(fresh)
+    gate.set()
+    await asyncio.wait_for(leftovers[0], 5)
+    assert fresh.state is ScopeState.DISPOSED and log == ["fresh-undo"]
+
+
+async def test_markers_naming_a_scope_but_not_its_live_work_are_ignored() -> None:
+    log: List[str] = []
+    c = Scope(name="c")
+    c.effect(rec(log, "undo"))
+    token = _DISPOSING.set(frozenset({id(c), c._serial, 1, 2, 3}))
+    try:
+        await asyncio.wait_for(c.dispose(), 5)
+    finally:
+        _DISPOSING.reset(token)
+    assert c.disposed and log == ["undo"]
+
+
+async def test_background_task_started_by_a_disposer_adds_no_wait_edge() -> None:
+    a_gate = asyncio.Event()
+    log: List[str] = []
+    a = Scope(name="a")
+    b = Scope(name="b")
+    background: List["asyncio.Future[None]"] = []
+
+    def a_effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            async def bg() -> None:
+                await b.dispose()  # fire and forget: A does not wait for this
+
+            background.append(asyncio.ensure_future(bg()))
+            await a_gate.wait()
+            log.append("a-undone")
+
+        return undo
+
+    def b_effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await turns(5)  # let A's background task make its call first
+            await a.dispose()  # a real wait: there is no cycle, A is not waiting for B
+            log.append("b-after-a")
+
+        return undo
+
+    a.effect(a_effect)
+    b.effect(b_effect)
+    both = asyncio.gather(a.dispose(), b.dispose())
+    await turns(10)
+    assert log == []  # B is waiting for A to finish
+    a_gate.set()
+    await asyncio.wait_for(both, 5)
+    await asyncio.wait_for(asyncio.gather(*background), 5)
+    assert log == ["a-undone", "b-after-a"]
+    assert a.disposed and b.disposed and scope_module._WAITS == {}
+
+
+async def test_randomized_dispose_rings_never_deadlock_and_undo_exactly_once() -> None:
+    for seed in range(150):
+        rng = random.Random(20_000 + seed)
+        n = rng.randint(2, 6)
+        scopes = [Scope(name=f"s{i}") for i in range(n)]
+        counts = [0] * n
+        tasks: List["asyncio.Future[None]"] = []
+
+        def make(i: int, targets: List[int], spawn: bool) -> Callable[[], Callable[[], Any]]:
+            def effect() -> Callable[[], Any]:
+                async def undo() -> None:
+                    counts[i] += 1
+                    for j in targets:
+                        if spawn:
+                            tasks.append(asyncio.ensure_future(scopes[j].dispose()))
+                        else:
+                            await scopes[j].dispose()
+                    await asyncio.sleep(0)
+
+                return undo
+
+            return effect
+
+        for i in range(n):
+            targets = [j for j in range(n) if rng.random() < 0.4]
+            scopes[i].effect(make(i, targets, rng.random() < 0.3))
+        chosen = [i for i in range(n) if rng.random() < 0.7] or [0]
+        await asyncio.wait_for(asyncio.gather(*(scopes[i].dispose() for i in chosen)), 5)
+        await asyncio.wait_for(asyncio.gather(*(sc.dispose() for sc in scopes)), 5)
+        if tasks:
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert all(sc.disposed for sc in scopes), f"seed {seed}"
+        assert counts == [1] * n, f"seed {seed}"
+        assert scope_module._WAITS == {}, f"seed {seed}"
+
+
+async def test_dispose_completes_with_an_async_effect_that_never_resolves() -> None:
+    s = Scope(name="s")
+    log: List[str] = []
+    s.effect(rec(log, "earlier"))
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    s.effect(hang, label="hang")
+    await turns()
+    await asyncio.wait_for(s.dispose(), 5)  # 5 s is only a hang guard
+    assert s.disposed and log == ["earlier"] and s.errors == []
+    assert not s._live_pending()
+
+
+async def test_remover_of_an_async_effect_that_never_resolves_completes() -> None:
+    s = Scope(name="s")
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    remove = s.effect(hang)
+    await turns()
+    await asyncio.wait_for(remove(), 5)
+    assert s.effect_count == 0 and not s._live_pending()
+    await s.dispose()
+
+
+async def test_effect_that_ignores_the_cancel_request_is_undone_exactly_once() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    attempts: List[int] = []
+    s = Scope(name="s")
+
+    async def stubborn() -> Callable[[], None]:
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            attempts.append(1)
+            await gate.wait()  # a second cancel request would end it here
+        return lambda: log.append("undo")
+
+    s.effect(stubborn)
+    await turns()  # it is running
+    d = asyncio.ensure_future(s.dispose())
+    await turns()
+    assert not d.done()  # still waiting for the effect, which ignored the request
+    gate.set()
+    await d
+    assert log == ["undo"] and attempts == [1]  # asked once, undone once
+
+
+async def test_effect_cancelled_before_its_first_step_leaves_no_warning() -> None:
+    unraisable: List[Any] = []
+    old_hook = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            s = Scope(name="s")
+
+            async def never_started() -> None:
+                await asyncio.sleep(0)
+
+            s.effect(never_started)
+            await s.dispose()
+            gc.collect()
+    finally:
+        sys.unraisablehook = old_hook
+    assert unraisable == [] and s.errors == [] and s.disposed
+
+
+# ----------------------------------------------------------------------
+# Second review round: cancelled restart, remover results
+# ----------------------------------------------------------------------
+
+
+async def test_cancelled_restart_leaves_the_scope_pending_not_active_and_empty() -> None:
+    gate = asyncio.Event()
+    s = Scope(name="s")
+
+    def first(sc: Scope) -> None:
+        def effect() -> Callable[[], Any]:
+            async def undo() -> None:
+                await gate.wait()
+
+            return undo
+
+        sc.effect(effect)
+
+    await s.start(first)
+    ran: List[str] = []
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.restart(lambda sc: ran.append("setup")), 0.05)
+    assert s.state is ScopeState.PENDING and ran == []
+    gate.set()
+    await turns()
+    assert s.state is ScopeState.PENDING and s.effect_count == 0
+    await s.start(lambda sc: ran.append("again"))  # it can be started again
+    assert s.state is ScopeState.ACTIVE and ran == ["again"]
+
+
+def test_remover_result_works_with_asyncio_run_when_there_is_no_loop() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    asyncio.run(s.effect(rec(log, "sync"))())  # already finished, still accepted
+    assert log == ["sync"]
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            log.append("async")
+
+        return undo
+
+    remove = s.effect(effect)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        asyncio.run(remove())  # a plain coroutine: no wrapper needed
+        gc.collect()
+    assert log == ["sync", "async"]
+
+
+async def test_remover_result_works_with_create_task() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    await asyncio.create_task(s.effect(rec(log, "sync"))())
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await asyncio.sleep(0)
+            log.append("async")
+
+        return undo
+
+    await asyncio.create_task(s.effect(effect)())
+    again = s.effect(rec(log, "again"))
+    again()
+    await asyncio.create_task(again())  # second call: finished awaitable
+    assert log == ["sync", "async", "again"]
+
+
+async def test_cancelling_a_task_that_wraps_a_remover_result_does_not_stop_the_undo() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            log.append("done")
+
+        return undo
+
+    t = asyncio.create_task(s.effect(effect)())
+    await turns()
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    gate.set()
+    await s.dispose()
+    assert log == ["done"]
