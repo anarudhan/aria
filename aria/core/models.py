@@ -307,7 +307,7 @@ class TaskResult:
     completed_at: Optional[float] = None
     # Extra diagnostics attached by the orchestrator (e.g. "prism", "echo_profile").
     # Declared so every TaskResult has it, including early-return failure results.
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def summary(self) -> str:
         lines = [
