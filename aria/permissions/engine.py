@@ -219,8 +219,14 @@ class AuditEntry:
       - The chain is lost on restart. Saving it to disk is issue #68.
     See "The permission engine internals" in docs/architecture.md.
 
-    `detail` is a canonical JSON string that the CALLER must already have
-    redacted. The engine does not redact it.
+    The chain gives integrity, not authenticity: record_audit() is public,
+    so any code in the process can write an entry that looks like an engine
+    decision, or one in another user's trail, and it is a valid link. Nothing
+    in aria/ reads the trail to make a decision.
+
+    `detail` is a str that the CALLER must already have redacted. The engine
+    does not redact it. record_audit() stores a dict or list as canonical JSON
+    but a str is stored verbatim, so it is only JSON if the caller made it so.
     """
     entry_id:   str = field(default_factory=lambda: str(uuid.uuid4())[:12])
     timestamp:  float = field(default_factory=time.time)
@@ -236,7 +242,7 @@ class AuditEntry:
     # Pipeline fields (issue #56, design 0042 section 2(f)).
     call_id:    str = ""
     stage:      str = ""
-    detail:     str = ""       # canonical JSON, already redacted by the caller
+    detail:     str = ""       # str stored as given (JSON only if the caller made it so), already redacted
     args_digest: str = ""
     # This entry's own hash, set when the entry is appended to the chain. It
     # is the only field that compute_hash() leaves out.
@@ -400,6 +406,11 @@ class PermissionEngine:
         self._audit: list[AuditEntry] = []
         self._last_hash = GENESIS_HASH   # head of the chain
         # Guards the append plus the head update, so threads cannot fork the chain.
+        # Deliberately a plain Lock, NOT an RLock: a re-entrant append (from a
+        # signal handler, __del__ or gc callback on the thread already inside
+        # the append) would read the same head and fork the chain. The cost is
+        # a known limit: such a call on that thread blocks forever. Do not
+        # call the engine from signal handlers or finalizers (docs/architecture.md).
         self._audit_lock = threading.Lock()
         self._persist_path = Path(persist_path) if persist_path else None
 
