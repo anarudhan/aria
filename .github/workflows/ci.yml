@@ -110,12 +110,13 @@ jobs:
 
   typecheck:
     # Informational only. The codebase has existing mypy errors, so this job is
-    # not part of the gate yet. Remove continue-on-error and add it to the
-    # gate's needs list once the errors are cleaned up.
+    # not part of the gate yet. The mypy step is allowed to fail so the job
+    # shows green, and its output stays visible in the log. Remove
+    # continue-on-error and add this job to the gate's needs list once the
+    # errors are cleaned up.
     name: Type check (informational)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -130,6 +131,7 @@ jobs:
         run: pip install "mypy>=1.10.0"
 
       - name: Run mypy
+        continue-on-error: true
         run: mypy aria/
 
   ci-gate:
