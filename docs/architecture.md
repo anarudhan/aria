@@ -276,6 +276,12 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 
 ---
 
+## LLM retry policy
+
+`AnthropicPlugin` and `OpenAIPlugin` send every call through `call_with_retry` in `aria/plugins/retry.py`. Temporary failures (rate limit, server error, timeout, dropped connection, empty answer) are retried with exponential backoff, a cap and jitter. A wrong key or a bad request is never retried. A retry-after value from the provider is respected up to the cap, and cancellation is never swallowed. When the retries run out the caller gets an `LLMError` that carries the failure code, the attempt count and the original error. Error text kept in the records is redacted for common secret shapes and cut to 500 characters, on a best-effort basis; the original exception stays on `LLMError.cause` unredacted, so log `str(err)` and `err.code`, not the traceback. Every attempt is recorded and counted, so `retry_stats()` and `describe()` on a plugin can feed the health report and no failure is hidden. The module uses only the standard library. Full details are in `docs/llm-retry.md`.
+
+---
+
 ## Security model
 
 **What ARIA cannot do by default:**
