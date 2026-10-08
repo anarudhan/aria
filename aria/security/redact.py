@@ -9,11 +9,17 @@ Helpers that hide secrets before text or tool arguments are stored, logged or au
                                  guessed from a stored digest
 * ``default_digester()``         the shared per-process digester
 
-Standard library only. This module imports nothing from the rest of ARIA, so any layer
-(plugins, permissions, tools, the pipeline) can use it without creating an import cycle.
+Standard library only. This file itself imports nothing from ARIA, but importing
+``aria.security.redact`` still runs ``aria/__init__.py`` and ``aria/security/__init__.py``
+(patcher, scanner). It is free of import cycles today only because ``aria/security/patcher.py``
+imports the permission engine under ``TYPE_CHECKING`` only. That rule must stay: nothing in
+``aria/security/`` may import ``aria.permissions.engine`` at run time.
 
 BEST EFFORT, NOT A GUARANTEE. Redaction knows a list of secret shapes and key names. A
-secret in any other shape goes through unchanged. See ``docs/redaction.md``.
+secret in any other shape goes through unchanged. Work is bounded by explicit budgets
+(see the limits in ``redact_args``, ``sanitize_error_text`` and ``ArgsDigester``); the
+timings were measured with the tests in ``tests/test_redact.py``, not proven. See
+``docs/redaction.md``.
 """
 
 from __future__ import annotations
@@ -49,7 +55,15 @@ _REDACTED = "[REDACTED]"
 # stays linear in the input size (see the 100k-character timing test).
 _S = r"(?:[-_]|%5[Ff]|%2[Dd])?"                      # optional "_" or "-" inside a label
 _SEP = r"""(?:\\?["'])?\s{0,5}(?:[:=]|%3[AaDd])\s{0,5}"""   # [closing quote] : or = [spaces]
-_QUOTED = r"""\\?"[^"\\]{0,1000}\\?"|\\?'[^'\\]{0,1000}\\?'"""   # also JSON-escaped \"..\"
+# Tried in this order: JSON-escaped \"..\" (a whole JSON document inside a string), then an
+# ordinary quoted value that may hold backslash escapes ("ab\"cd ef"), then the loose forms
+# that tolerate a missing or extra backslash. The inner repetitions are bounded and their two
+# branches cannot match the same character, so matching stays linear.
+_QUOTED = (
+    r"""\\"[^"\\]{0,1000}\\"|\\'[^'\\]{0,1000}\\'"""
+    r"""|"(?:[^"\\]|\\.){0,1000}"|'(?:[^'\\]|\\.){0,1000}'"""
+    r"""|\\?"[^"\\]{0,1000}\\?"|\\?'[^'\\]{0,1000}\\?'"""
+)
 _BARE_CHARS = r"""[^\s,;'"&}\])\\]"""
 _BARE = rf"""\\?["']?{_BARE_CHARS}+"""                # also an unterminated opening quote
 _NOT_DONE = r"(?!\s*\[REDACTED\])"                      # never re-redact our own marker
@@ -62,8 +76,12 @@ def _label(words: str) -> "re.Pattern[str]":
 
 # Applied in order after NFKC normalisation. Each keeps the label and hides only the value.
 _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # PEM private keys: from the BEGIN line to the END line (or to the end of the text)
+    (re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----.*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|\Z)",
+                re.DOTALL),
+     _REDACTED),
     # scheme://user:password@host  -> hide the password (proxy and connection errors print these)
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,30}://[^\s/:@?#]{1,200}:)[^\s/@?#]{1,500}(?=@)"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,30}://[^\s/:@?#]{0,200}:)[^\s/@?#]{1,500}(?=@)"),
      r"\1" + _REDACTED),
     # Authorization: Digest username="x", nonce="y", response="z"  -> the whole header value
     (re.compile(r"(?i)(authorization" + _SEP + r")digest\b[^\n\r]{0,2000}"),
@@ -79,7 +97,9 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
     # password=, passwd=, secret=, token=, api_key=, access_key=, openai-organization= ...
     # (in plain text, JSON, escaped JSON, URL-encoded and with quoted values that hold spaces)
     (_label(rf"pass(?:word|wd|phrase)|secret|token|api{_S}key|access{_S}key|private{_S}key"
-            rf"|openai{_S}organization"), r"\1" + _REDACTED),
+            rf"|openai{_S}organization|signature"), r"\1" + _REDACTED),
+    # pwd=, pass=, DB_PASS=, sig=  (only as a whole word, so "bypass=" and "design=" stay)
+    (re.compile(rf"(?i)((?<![A-Za-z0-9])(?:pwd|pass|sig){_SEP}){_VALUE}"), r"\1" + _REDACTED),
     # a bare key=value, such as a URL query ?key=abc (not "monkey=")
     (re.compile(rf"(?i)((?<![A-Za-z0-9])key(?:=|%3[Dd])){_VALUE}"), r"\1" + _REDACTED),
     # Bearer tokens anywhere
@@ -100,6 +120,37 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
 )
 
 
+# Longest text sanitize_error_text will scan, counted AFTER NFKC normalisation (one character can
+# expand to 18: U+FDFA). A longer text is replaced by a marker, never passed through unscanned.
+_MAX_SANITIZE_CHARS = 1_000_000
+_NFKC_CHUNK = 10_000
+
+
+def _normalise_bounded(text: str, cap: int) -> Optional[str]:
+    """
+    NFKC-normalise ``text`` in slices and give up (return None) as soon as the result would
+    be longer than ``cap``, so a text that expands cannot make the work large. A slice never
+    ends in front of a combining mark. Plain ASCII needs no normalisation.
+    """
+    if text.isascii():
+        return text if len(text) <= cap else None
+    parts = []
+    total = 0
+    start = 0
+    size = len(text)
+    while start < size:
+        end = min(start + _NFKC_CHUNK, size)
+        while end < size and unicodedata.combining(text[end]):
+            end += 1
+        piece = unicodedata.normalize("NFKC", text[start:end])
+        total += len(piece)
+        if total > cap:
+            return None
+        parts.append(piece)
+        start = end
+    return "".join(parts)
+
+
 def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
     """
     Make error text safer to store and print: hide common secrets, then cut it to ``limit``
@@ -111,13 +162,15 @@ def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
     * values after ``password``, ``passwd``, ``passphrase``, ``secret`` (so also
       ``client_secret``), ``token`` (``access_token``, ``x-auth-token``), ``api_key``
       (``x-api-key``), ``access_key`` (``aws_secret_access_key``), ``private_key``,
-      ``openai-organization`` and a bare ``key=``, written with ``=`` or ``:``, in plain
-      text, JSON (also backslash-escaped) and URL-encoded (``api%5Fkey=``, ``key%3D``);
-      quoted values may contain spaces
-    * the password in ``scheme://user:password@host`` URLs
+      ``openai-organization``, ``signature`` (``x-amz-signature``), the whole words ``pwd``,
+      ``pass`` (``DB_PASS``) and ``sig``, and a bare ``key=``, written with ``=`` or ``:``, in
+      plain text, JSON (also backslash-escaped) and URL-encoded (``api%5Fkey=``, ``key%3D``);
+      quoted values may contain spaces and backslash escapes
+    * the password in ``scheme://user:password@host`` URLs (the user may be empty)
     * ``Authorization`` / ``Proxy-Authorization`` values with any scheme (Basic, Bearer,
       Token, Digest ...); for Digest the whole header value
     * ``Cookie`` / ``Set-Cookie`` header values
+    * PEM private keys (``-----BEGIN ... PRIVATE KEY-----`` up to the END line or the end)
     * ``Bearer`` tokens, ``sk-`` keys (also with dots), JSON web tokens, AWS key ids
       (``AKIA``/``ASIA``), Google keys (``AIza``), GitHub tokens (``ghp_`` ``gho_``
       ``ghu_`` ``ghs_`` ``ghr_`` ``github_pat_``), Slack tokens (``xox[abprs]-``)
@@ -125,9 +178,16 @@ def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
     Anything else (other secret formats, secrets with no label, personal data, a secret
     split by markup) is NOT detected. Redaction runs before cutting, and the marker
     reports the length of the text as it was given.
+
+    A text of more than 1,000,000 characters after NFKC normalisation is not scanned: it is
+    replaced by ``<text, N characters, not scanned>`` so that nothing leaks and the work
+    stays bounded.
     """
     original_length = len(text)
-    text = unicodedata.normalize("NFKC", text)
+    normalised = _normalise_bounded(text, _MAX_SANITIZE_CHARS)
+    if normalised is None:
+        return f"<text, {original_length} characters, not scanned>"
+    text = normalised
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     if len(text) > limit:
@@ -146,41 +206,70 @@ _MAX_TOTAL_CHARS = 1_000_000          # characters scanned per redact_args call,
 _MAX_SCAN_CHARS = 200_000             # a single string longer than this is not scanned at all
 _MAX_INT_BITS = 256                   # bigger ints are summarised (json cannot print huge ints)
 _MAX_NAME = 80                        # longest type name printed in "<TypeName>"
+_MAX_KEY_CHARS = 1000                 # a longer key is treated as a secret (fail closed)
+_MAX_NAME_CHARS = 256                 # longest "name"/"first item" text taken as a secret name
 
 # Words that make a key a secret when they are a whole word of the key (after splitting on
-# "_", "-", spaces, dots and camelCase boundaries). A trailing "s" is allowed (``tokens``).
+# non-letters and camelCase boundaries). A trailing "s" is allowed (``tokens``).
 _SECRET_WORDS = frozenset({
     "token", "auth", "oauth", "cookie", "session", "pwd", "pass", "passcode", "jwt",
-    "credential", "bearer",
+    "credential", "bearer", "signature", "sig", "otp", "totp", "pin", "seed", "mnemonic",
+    "privkey",
 })
 
 # Fragments that make a key a secret when they appear anywhere in the key with the separators
-# removed (``clientSecret``, ``aws_secret_access_key``, ``X-Api-Key``, ``dbpassword``).
+# removed (``clientSecret``, ``accesstoken``, ``X-Api-Key``, ``dbpassword``, ``csrftoken``).
 _SECRET_FRAGMENTS = (
     "password", "passwd", "passphrase", "secret", "credential", "authorization",
     "apikey", "accesskey", "privatekey", "signingkey", "encryptionkey", "masterkey",
-    "sshkey", "authkey", "sessionkey", "clientkey",
+    "sshkey", "authkey", "sessionkey", "clientkey", "token", "pwd", "cookie", "jwt",
+    "bearer", "signature", "mnemonic", "privkey", "privatepem", "keydata", "keymaterial",
+    "pincode",
+)
+
+# Letters of other alphabets that look like Latin ones (Cyrillic and Greek), folded to Latin
+# before a key is classified. A small explicit list, not a complete confusables table.
+_CONFUSABLES = str.maketrans(
+    "аеорсухіјѕԁԛԝһ"
+    "кмтнвӏı"
+    "АВЕКМНОРСТХУІЈ"
+    "ЅԚԜ"
+    "αεικνορτυχγω"
+    "ΑΒΕΖΗΙΚΜΝΟΡΤΥΧ",
+    "aeopcyxijsdqwh" "kmthbli"
+    "ABEKMHOPCTXYIJ" "SQW"
+    "aeikvoptuxyw"
+    "ABEZHIKMNOPTYX",
 )
 
 _CAMEL_LOWER_UPPER = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _CAMEL_ACRONYM = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
 _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
 _DIGITS = "0123456789"
 _FULL = slice(None)
+_DROPPED_CATEGORIES = frozenset({"Cf", "Cc", "Mn"})   # invisible, control and combining marks
 
 
 def _is_secret_key(name: str) -> bool:
     """True if a dict key (``name``) says that its value is a secret."""
-    if len(name) > 1000:                               # keep the work bounded
-        name = name[:500] + "_" + name[-500:]
-    name = unicodedata.normalize("NFKC", name)
+    if len(name) > _MAX_KEY_CHARS:                     # cannot classify cheaply: fail closed
+        return True
+    name = unicodedata.normalize("NFKD", name)           # also splits "o" + accent apart
+    name = "".join(c for c in name if unicodedata.category(c) not in _DROPPED_CATEGORIES)
+    name = name.translate(_CONFUSABLES)
     name = _CAMEL_ACRONYM.sub("_", _CAMEL_LOWER_UPPER.sub("_", name))
     name = _NOT_ALNUM.sub("_", name.lower())
     words = [w for w in (part.rstrip(_DIGITS) for part in name.split("_")) if w]
     if not words:
         return False
     flat = "".join(words)
-    if any(fragment in flat for fragment in _SECRET_FRAGMENTS):
+    # "tokenizer" and "tokenize" are about text, not secrets
+    if "token" in flat.replace("tokeniz", ""):
+        return True
+    if any(fragment in flat for fragment in _SECRET_FRAGMENTS if fragment != "token"):
+        return True
+    if flat.endswith("auth"):                          # xauth, proxyauth (not "author")
         return True
     for word in words:
         if word in _SECRET_WORDS or (word.endswith("s") and word[:-1] in _SECRET_WORDS):
@@ -199,12 +288,15 @@ class _Budget:
         self.chars = _MAX_TOTAL_CHARS
 
 
+_TYPE_NAME = type.__dict__["__name__"]   # reads the real name, never a metaclass property
+
+
 def _type_label(value: Any) -> str:
-    """The class name of ``value`` for markers. Uses ``type()``, never the object itself."""
+    """The class name of ``value`` for markers. Runs no code of the object or its class."""
     try:
-        name = type(value).__name__
-        if isinstance(name, str) and name:
-            return str.__getitem__(name, slice(0, _MAX_NAME))
+        name = _TYPE_NAME.__get__(type(value))
+        if type(name) is str and name:
+            return sanitize_error_text(name[:_MAX_NAME], 10 * _MAX_NAME)
     except Exception:
         pass
     return "object"
@@ -213,10 +305,16 @@ def _type_label(value: Any) -> str:
 def _clean_str(text: str, limit: int, budget: _Budget) -> str:
     """Redact and cut one string leaf (or key). ``text`` must be an exact ``str``."""
     size = len(text)
-    if size > _MAX_SCAN_CHARS or size > budget.chars:
+    if size > 2 * _MAX_SCAN_CHARS or size > budget.chars:
         return f"<string, {size} characters, not scanned>"
-    budget.chars -= size
-    return sanitize_error_text(text, limit)
+    budget.chars -= size                                   # charged even if we give up below
+    if not text.isascii() and _SURROGATES.search(text):
+        text = _SURROGATES.sub("\ufffd", text)            # lone surrogates cannot be UTF-8
+    norm = _normalise_bounded(text, min(_MAX_SCAN_CHARS, budget.chars + size))
+    if norm is None:
+        return f"<string, {size} characters, not scanned>"
+    budget.chars -= max(0, len(norm) - size)               # NFKC may have made it longer
+    return sanitize_error_text(norm, limit)
 
 
 def _scalar(value: Any) -> tuple[bool, Any]:
@@ -250,14 +348,44 @@ def _scalar(value: Any) -> tuple[bool, Any]:
     return False, None
 
 
-def _key_text(key: Any, limit: int, budget: _Budget) -> tuple[str, bool]:
-    """The output name for a dict key, and whether the key names a secret."""
-    ok, raw = _scalar(key)
+def _classify(text: str, budget: _Budget) -> bool:
+    """``_is_secret_key`` with a work charge; out of budget means secret (fail closed)."""
+    size = len(text)
+    if size > _MAX_KEY_CHARS:
+        return True
+    budget.chars -= size
+    if budget.chars < 0:
+        return True
+    return _is_secret_key(text)
+
+
+def _secret_name(text: str, budget: _Budget) -> bool:
+    """True if ``text`` (the value of a "name" entry, the first item of a pair) is a secret name."""
+    if len(text) > _MAX_NAME_CHARS:
+        return False
+    return _classify(text, budget)
+
+
+def _key_info(key: Any, limit: int, budget: _Budget) -> tuple[str, bool, Optional[str]]:
+    """
+    For one dict key: the output name, whether it names a secret, and its text if it is a
+    string. Keys that are not strings, numbers, None or bytes are treated as secret.
+    """
+    kind = type(key)
+    if issubclass(kind, str):
+        raw = str.__getitem__(key, _FULL)
+        return _clean_str(raw, limit, budget), _classify(raw, budget), raw
+    if issubclass(kind, (bytes, bytearray)):
+        size = bytes.__len__(key) if issubclass(kind, bytes) else bytearray.__len__(key)
+        if size > _MAX_KEY_CHARS:
+            return f"<bytes {size}>", True, None
+        decoded = (bytes.decode(key, "latin-1") if issubclass(kind, bytes)
+                   else bytearray.decode(key, "latin-1"))
+        return f"<bytes {size}>", _classify(decoded, budget), None
+    ok, raw_scalar = _scalar(key)
     if ok:
-        text = raw if isinstance(raw, str) else str(raw)
-    else:
-        text = f"<{_type_label(key)}>"
-    return _clean_str(text, limit, budget), _is_secret_key(text)
+        return _clean_str(str(raw_scalar), limit, budget), False, None
+    return f"<{_type_label(key)}>", True, None
 
 
 def _unique(name: str, taken: dict[str, Any], counts: dict[str, int]) -> str:
@@ -271,6 +399,9 @@ def _unique(name: str, taken: dict[str, Any], counts: dict[str, int]) -> str:
         if candidate not in taken:
             counts[name] = n
             return candidate
+
+
+_NAME_ENTRY_KEYS = frozenset({"name", "key"})
 
 
 def _redact(
@@ -306,12 +437,20 @@ def _redact(
     try:
         if is_dict:
             total = dict.__len__(value)
+            entries = list(islice(dict.items(value), max_items))
+            infos = [_key_info(key, max_string, budget) for key, _ in entries]
+            # {"name": "DB_PASSWORD", "value": "x"}: the "name" entry says "value" is a secret
+            name_says_secret = False
+            for (_, item), (_, _, raw) in zip(entries, infos):
+                if raw is not None and len(raw) <= 4 and raw.lower() in _NAME_ENTRY_KEYS:
+                    text_ok, text = _scalar(item)
+                    if text_ok and isinstance(text, str) and _secret_name(text, budget):
+                        name_says_secret = True
             result: dict[str, Any] = {}
             counts: dict[str, int] = {}
-            for key, item in islice(dict.items(value), max_items):
-                name, secret = _key_text(key, max_string, budget)
+            for (_, item), (name, secret, raw) in zip(entries, infos):
                 name = _unique(name, result, counts)
-                if secret:
+                if secret or (name_says_secret and raw is not None and raw.lower() == "value"):
                     result[name] = REDACTED         # the value is never looked at
                 else:
                     result[name] = _redact(item, depth + 1, max_depth, max_items,
@@ -328,8 +467,16 @@ def _redact(
             total, items = frozenset.__len__(value), frozenset.__iter__(value)
         else:
             total, items = set.__len__(value), set.__iter__(value)
-        out = [_redact(item, depth + 1, max_depth, max_items, max_string, path, budget)
-               for item in islice(items, max_items)]
+        snapshot = list(islice(items, max_items))
+        out = []
+        for index, item in enumerate(snapshot):
+            if index == 1 and total == 2 and issubclass(kind, (list, tuple)):
+                # ("Authorization", "Basic abc"): a secret name as first item hides the second
+                first_ok, first = _scalar(snapshot[0])
+                if first_ok and isinstance(first, str) and _secret_name(first, budget):
+                    out.append(REDACTED)            # the second item is never looked at
+                    continue
+            out.append(_redact(item, depth + 1, max_depth, max_items, max_string, path, budget))
         if total > max_items:
             out.append(f"<{total - max_items} more items omitted>")
         return out
@@ -357,33 +504,38 @@ def redact_args(
     Return a JSON-safe, redacted COPY of tool arguments, for audit records.
 
     The input is never changed and never printed. The result contains only ``dict`` (with
-    ``str`` keys), ``list``, ``str``, ``int``, finite ``float``, ``bool`` and ``None``.
+    ``str`` keys), ``list``, ``str``, ``int``, finite ``float``, ``bool`` and ``None``, and
+    every string in it can be written as UTF-8.
 
     * A dict value is replaced by ``"[REDACTED]"`` when its KEY names a secret, whatever the
-      type of the value. Keys are compared after Unicode NFKC, lower-casing and splitting on
-      ``-``, ``_``, spaces, dots and camelCase, so ``apiKey``, ``X-Api-Key`` and
-      ``api_key`` are the same. Secret keys: anything with ``password``, ``passwd``,
-      ``passphrase``, ``secret``, ``credential(s)``, ``authorization``, ``apikey``,
-      ``accesskey``, ``privatekey`` (and some other ``...key`` names), or the whole words
-      ``token``, ``auth``, ``oauth``, ``cookie``, ``session``, ``bearer``, ``pwd``,
-      ``pass``, ``passcode``, ``jwt`` (a trailing ``s`` is allowed), or ending in ``_key``
-      (``_secret`` and ``_token`` are covered by the words above).
-    * Strings go through ``sanitize_error_text`` with ``limit=max_string``.
+      type of the value. Keys are compared after Unicode NFKC, after dropping invisible,
+      control and combining characters, after folding common Cyrillic and Greek look-alike
+      letters, lower-casing and splitting on non-letters and camelCase, so ``apiKey``,
+      ``X-Api-Key`` and ``api_key`` are the same. See ``docs/redaction.md`` for the list.
+      A key longer than 1000 characters counts as secret.
+    * A key that is not a string, number, bool, None or bytes (a tuple, an object ...) counts
+      as secret. A bytes key is read as Latin-1 and classified like a string.
+    * ``{"name": "DB_PASSWORD", "value": "x"}``: when a ``name`` or ``key`` entry holds a secret
+      name, the ``value`` entry is hidden. ``("Authorization", "Basic abc")``: a list or tuple of
+      exactly two items whose first item is a secret name has its second item hidden.
+    * Strings go through ``sanitize_error_text`` with ``limit=max_string``. A lone surrogate
+      becomes U+FFFD.
     * ``int``, finite ``float``, ``bool`` and ``None`` are kept. ``nan`` and ``inf`` become
       the strings ``"nan"``, ``"inf"`` and ``"-inf"``. Ints over 256 bits become a marker.
     * ``bytes`` become ``"<bytes N>"``. Any other object becomes ``"<TypeName>"``; its
-      ``__repr__``, ``__str__`` and attributes are never used, so it cannot leak or raise.
+      ``__repr__``, ``__str__``, attributes and its class's ``__name__`` property are never
+      used, so it cannot leak or raise.
     * ``tuple``, ``set`` and ``frozenset`` become lists (a set keeps its iteration order).
     * Below ``max_depth`` levels the value becomes ``"<max depth>"``; a container with more
       than ``max_items`` items is cut and ends with ``"<N more items omitted>"``; a
       reference to a container that is already being copied becomes ``"<cycle>"``.
-    * Dict keys that are not strings are turned into text without calling the key's own
-      methods, and are redacted like strings.
 
-    Bounds that cannot be turned off: ``max_depth`` is at most 64, one call looks at no more
-    than 10,000 values and 1,000,000 characters in total, and a single string over 200,000
-    characters is replaced by a marker without being scanned. Past those, values become
-    ``"<budget exceeded>"``.
+    Bounds that cannot be turned off: ``max_depth`` is at most 64; one call looks at no more
+    than 10,000 values; the characters it scans (counted after NFKC normalisation, which can
+    turn one character into up to 18) add up to no more than 1,000,000, and one string over
+    200,000 characters is replaced by a marker without being scanned. Past those, values
+    become ``"<string, N characters, not scanned>"`` or ``"<budget exceeded>"``. Timing was
+    measured, not proven: see ``tests/test_redact.py``.
 
     It never raises for any input (``KeyboardInterrupt`` and ``SystemExit`` excepted).
     BEST EFFORT: a secret under a harmless key name and in an unknown shape is NOT detected.
@@ -404,6 +556,108 @@ def redact_args(
 
 # ─── Keyed digest of arguments ────────────────────────────────────────────────
 
+_DIGEST_MAX_NODES = 200_000          # values visited, counting every visit of a shared value
+_DIGEST_MAX_CHARS = 16_000_000       # characters of text and keys, counting every visit
+_DIGEST_MAX_DEPTH = 100              # nesting levels
+_DIGEST_MAX_INT_BITS = 4096          # bigger ints cannot be printed by json
+_PURPOSE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]{0,31}\Z")
+_TOO_BIG = "arguments are too large, too deep or too shared to digest"
+_NOT_JSON = "arguments hold a value that canonical JSON cannot represent"
+
+
+def _snapshot(obj: Any) -> Any:
+    """
+    Build a fresh copy of ``obj`` out of exact ``dict``, ``list``, ``str``, ``int``, ``float``,
+    ``bool`` and ``None`` (a tuple becomes a list), or raise ``TypeError``.
+
+    Only the exact built-in types are accepted, so no method of a user class can run and the
+    thing that is serialised is the thing that was inspected. Every visit is counted, shared
+    values included, so ``x = [x, x]`` repeated 60 times stops at the budget instead of
+    doubling the work at every level. The message never contains a value.
+    """
+    holder: list[Any] = [None]
+    stack: list[tuple[Any, Any, Any, int]] = [(obj, holder, 0, 0)]
+    nodes = 0
+    chars = 0
+    while stack:
+        src, parent, slot, depth = stack.pop()
+        nodes += 1
+        if nodes > _DIGEST_MAX_NODES or depth > _DIGEST_MAX_DEPTH:
+            raise TypeError(_TOO_BIG)
+        kind = type(src)
+        if src is None or kind is bool:
+            parent[slot] = src
+        elif kind is int:
+            bits = src.bit_length()
+            if bits > _DIGEST_MAX_INT_BITS:
+                raise TypeError(_NOT_JSON)
+            chars += bits // 3 + 1
+            parent[slot] = src
+        elif kind is float:
+            if not math.isfinite(src):
+                raise TypeError(_NOT_JSON)
+            chars += 24
+            parent[slot] = src
+        elif kind is str:
+            chars += len(src)
+            if chars > _DIGEST_MAX_CHARS:
+                raise TypeError(_TOO_BIG)
+            if not src.isascii() and _SURROGATES.search(src):
+                raise TypeError(_NOT_JSON)
+            parent[slot] = src
+        elif kind is list or kind is tuple:
+            items = list(src)
+            if nodes + len(stack) + len(items) > _DIGEST_MAX_NODES:
+                raise TypeError(_TOO_BIG)
+            copy_: list[Any] = [None] * len(items)
+            parent[slot] = copy_
+            for index, child in enumerate(items):
+                stack.append((child, copy_, index, depth + 1))
+        elif kind is dict:
+            pairs = list(src.items())
+            if nodes + len(stack) + len(pairs) > _DIGEST_MAX_NODES:
+                raise TypeError(_TOO_BIG)
+            copy_dict: dict[str, Any] = {}
+            parent[slot] = copy_dict
+            for name, child in pairs:
+                if type(name) is not str:
+                    raise TypeError(_NOT_JSON)
+                chars += len(name)
+                if chars > _DIGEST_MAX_CHARS:
+                    raise TypeError(_TOO_BIG)
+                if not name.isascii() and _SURROGATES.search(name):
+                    raise TypeError(_NOT_JSON)
+                copy_dict[name] = None
+                stack.append((child, copy_dict, name, depth + 1))
+        else:
+            raise TypeError(_NOT_JSON)
+        if chars > _DIGEST_MAX_CHARS:
+            raise TypeError(_TOO_BIG)
+    return holder[0]
+
+
+def _canonical_json(obj: Any) -> str:
+    safe = _snapshot(obj)
+    try:
+        return json.dumps(
+            safe,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except Exception:
+        raise TypeError(_NOT_JSON) from None
+
+
+def _check_purpose(purpose: Any) -> bytes:
+    if type(purpose) is not str:
+        raise TypeError("purpose must be a str")
+    if _PURPOSE.match(purpose) is None:
+        raise ValueError("purpose must be a short ASCII identifier (letters, digits, _ . -)")
+    return purpose.encode("ascii")
+
+
 class ArgsDigester:
     """
     HMAC-SHA256 digest of tool arguments, with a random key that lives only in this object.
@@ -416,8 +670,16 @@ class ArgsDigester:
 
     The input is serialised to canonical JSON first (sorted keys, no whitespace, ASCII only),
     so equal arguments give equal digests whatever the key order. Tuples and lists are the
-    same in JSON. Values that JSON cannot hold (bytes, objects, sets, nan, inf, non-string
-    keys, cycles, nesting too deep) raise ``TypeError`` and are never turned into text.
+    same in JSON. Only the exact types ``dict`` (with ``str`` keys), ``list``, ``tuple``,
+    ``str``, ``int``, ``float``, ``bool`` and ``None`` are accepted; no method of any other
+    class is ever called. Anything else (bytes, sets, objects, subclasses of the types above,
+    nan, inf, non-string keys, strings with lone surrogates, huge ints) raises ``TypeError``,
+    and so does input over the limits (200,000 values and 16,000,000 characters, every visit
+    counted, 100 levels deep). The error message never contains a value.
+
+    ``purpose`` separates uses: the same arguments digested as ``"args"`` and as ``"result"``
+    give different digests. It is added to the HMAC input with a 4 byte length in front, so
+    no purpose and payload can be mistaken for another.
     """
 
     __slots__ = ("_key",)
@@ -425,58 +687,32 @@ class ArgsDigester:
     def __init__(self) -> None:
         self._key = secrets.token_bytes(32)
 
-    def digest(self, obj: Any) -> str:
-        """The 64 hex character HMAC-SHA256 of the canonical JSON form of ``obj``."""
-        text = _canonical_json(obj)
-        return hmac.new(self._key, text.encode("ascii"), hashlib.sha256).hexdigest()
+    def digest(self, obj: Any, purpose: str = "args") -> str:
+        """The 64 hex character HMAC-SHA256 of ``purpose`` and the canonical JSON of ``obj``."""
+        label = _check_purpose(purpose)
+        payload = _canonical_json(obj).encode("ascii")
+        message = len(label).to_bytes(4, "big") + label + payload
+        return hmac.new(self._key, message, hashlib.sha256).hexdigest()
+
+    def matches(self, obj: Any, digest: Any, purpose: str = "args") -> bool:
+        """
+        True if ``digest`` is the digest of ``obj`` for ``purpose`` (constant-time compare).
+        Returns False, and never raises, for a malformed digest, a bad purpose or an ``obj``
+        that ``digest`` would reject.
+        """
+        try:
+            if type(digest) is not str or len(digest) != 64 or not digest.isascii():
+                return False
+            expected = self.digest(obj, purpose)
+            return hmac.compare_digest(expected.encode("ascii"), digest.lower().encode("ascii"))
+        except Exception:
+            return False
 
     def __repr__(self) -> str:
         return "<ArgsDigester>"
 
     def __reduce__(self) -> Any:
         raise TypeError("ArgsDigester holds a secret key and cannot be pickled or copied")
-
-
-def _check_json_keys(obj: Any) -> None:
-    """Reject non-string dict keys (json would silently turn 1 and "1" into the same key)."""
-    seen: set[int] = set()
-    stack = [obj]
-    while stack:
-        item = stack.pop()
-        kind = type(item)
-        if issubclass(kind, dict):
-            if id(item) in seen:
-                continue
-            seen.add(id(item))
-            for key, child in dict.items(item):
-                if not issubclass(type(key), str):
-                    raise TypeError(f"dict key of type {_type_label(key)} is not a string")
-                stack.append(child)
-        elif issubclass(kind, (list, tuple)):
-            if id(item) in seen:
-                continue
-            seen.add(id(item))
-            stack.extend(list.__iter__(item) if issubclass(kind, list) else tuple.__iter__(item))
-
-
-def _canonical_json(obj: Any) -> str:
-    try:
-        _check_json_keys(obj)
-        return json.dumps(
-            obj,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        )
-    except TypeError:
-        raise
-    except (ValueError, RecursionError, OverflowError) as exc:
-        # circular reference, nan/inf, too deep, int too large to print
-        raise TypeError(f"arguments cannot be serialised to canonical JSON: {exc}") from None
-    except Exception:
-        # an object whose own methods raise (the message could hold anything, so drop it)
-        raise TypeError("arguments cannot be serialised to canonical JSON") from None
 
 
 _default_digester: Optional[ArgsDigester] = None

@@ -141,7 +141,8 @@ class TestKeyNames:
         out = redact_args({1: "a", None: "b", (1, 2): "d", b"k": "e", 2.5: "f"})
         assert all(isinstance(k, str) for k in out)
         assert out["1"] == "a" and out["None"] == "b"
-        assert out["<tuple>"] == "d" and out["<bytes 1>"] == "e" and out["2.5"] == "f"
+        assert out["<tuple>"] == REDACTED          # a key we cannot read: fail closed
+        assert out["<bytes 1>"] == "e" and out["2.5"] == "f"
         jsonable(out)
 
     def test_object_key_is_never_stringified(self):
@@ -153,7 +154,7 @@ class TestKeyNames:
                 raise RuntimeError("repr")
 
         out = redact_args({Key(): "v"})
-        assert out == {"<Key>": "v"}
+        assert out == {"<Key>": REDACTED}
 
 
 # ─── Structure ────────────────────────────────────────────────────────────────
@@ -406,7 +407,7 @@ class TestHostileInputs:
                        "c": ["<RaisesEverything>"]}
 
     def test_object_as_dict_key(self):
-        assert redact_args({RaisesEverything(): 1}) == {"<RaisesEverything>": 1}
+        assert redact_args({RaisesEverything(): 1}) == {"<RaisesEverything>": REDACTED}
 
     def test_slots_object_is_not_read(self):
         out = redact_args({"x": WithSlots()})
@@ -780,7 +781,7 @@ class TestArgsDigester:
     def test_canonical_form_is_exact(self):
         d = ArgsDigester()
         expected = hmac.new(
-            d._key, b'{"a":1,"b":[1,2],"c":"\\u00e9"}', hashlib.sha256
+            d._key, b'\x00\x00\x00\x04args{"a":1,"b":[1,2],"c":"\\u00e9"}', hashlib.sha256
         ).hexdigest()
         assert d.digest({"c": "é", "b": (1, 2), "a": 1}) == expected
 
@@ -860,7 +861,6 @@ class TestArgsDigester:
         d = ArgsDigester()
         assert d.digest({"k": "é中"}) == d.digest({"k": "é中"})
         assert d.digest({"k": "é"}) != d.digest({"k": "e"})
-        d.digest({"k": "\ud800"})   # a lone surrogate is escaped, not an error
 
     def test_str_and_int_keys_are_not_confused(self):
         d = ArgsDigester()
@@ -918,3 +918,729 @@ def test_public_api():
     assert REDACTED == "[REDACTED]"
     for name in redact_module.__all__:
         assert hasattr(redact_module, name)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Review round (issue #58): gaps found by the independent security review
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ZWSP = chr(0x200B)          # zero width space (category Cf)
+SHY = chr(0xAD)             # soft hyphen (category Cf)
+CYR_O = chr(0x043E)         # Cyrillic small o, looks like Latin o
+LONE_HIGH = chr(0xD83D)     # the two halves of a surrogate pair, built with chr() on purpose
+LONE_LOW = chr(0xDE00)
+EMOJI = chr(0x1F600)
+FDFA = chr(0xFDFA)          # NFKC turns this one character into 18
+
+
+# ─── Item 1: digest work budget ───────────────────────────────────────────────
+
+class TestDigestBudget:
+    def test_exponential_sharing_stops_at_the_budget(self):
+        x: object = ["a"]
+        for _ in range(25):
+            x = [x, x]
+        start = time.perf_counter()
+        with pytest.raises(TypeError):
+            ArgsDigester().digest(x)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_dict_sharing_stops_at_the_budget(self):
+        x: object = {"a": 1}
+        for _ in range(40):
+            x = {"l": x, "r": x}
+        with pytest.raises(TypeError):
+            ArgsDigester().digest(x)
+
+    def test_moderate_sharing_still_works(self):
+        x: object = ["a"]
+        for _ in range(10):
+            x = [x, x]
+        assert len(ArgsDigester().digest(x)) == 64
+
+    def test_every_visit_is_counted(self, monkeypatch):
+        monkeypatch.setattr(redact_module, "_DIGEST_MAX_NODES", 50)
+        shared = [1, 2, 3]
+        ArgsDigester().digest([shared] * 10)             # 1 + 10 + 30 = 41 values
+        with pytest.raises(TypeError):
+            ArgsDigester().digest([shared] * 20)        # 1 + 20 + 60 = 81 values
+
+    def test_character_budget_counts_every_visit(self, monkeypatch):
+        monkeypatch.setattr(redact_module, "_DIGEST_MAX_CHARS", 1000)
+        text = "x" * 400
+        ArgsDigester().digest([text, text])
+        with pytest.raises(TypeError):
+            ArgsDigester().digest([text, text, text])
+        with pytest.raises(TypeError):
+            ArgsDigester().digest({"k" * 1001: 1})
+
+    def test_depth_limit(self):
+        ok: object = 1
+        for _ in range(redact_module._DIGEST_MAX_DEPTH):
+            ok = [ok]
+        assert len(ArgsDigester().digest(ok)) == 64
+        with pytest.raises(TypeError):
+            ArgsDigester().digest([ok])
+
+    def test_large_honest_content_is_accepted(self):
+        content = {"path": "/tmp/a.txt", "content": "line of text\n" * 400_000}   # about 5 MB
+        start = time.perf_counter()
+        assert len(ArgsDigester().digest(content)) == 64
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_a_huge_flat_list_is_rejected_quickly(self):
+        start = time.perf_counter()
+        with pytest.raises(TypeError):
+            ArgsDigester().digest([0] * 300_000)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_message_has_no_value(self):
+        x: object = ["hunter2-marker"]
+        for _ in range(25):
+            x = [x, x]
+        with pytest.raises(TypeError) as info:
+            ArgsDigester().digest(x)
+        assert "hunter2" not in str(info.value)
+
+    def test_limits_are_documented_constants(self):
+        assert redact_module._DIGEST_MAX_NODES == 200_000
+        assert redact_module._DIGEST_MAX_CHARS == 16_000_000
+        assert redact_module._DIGEST_MAX_DEPTH == 100
+        text = (Path(__file__).resolve().parent.parent / "docs" / "redaction.md").read_text(
+            encoding="utf-8")
+        for number in ("200,000", "16,000,000", "100 levels"):
+            assert number in text
+
+
+# ─── Item 2: only exact types are hashed ──────────────────────────────────────
+
+class TestDigestExactTypes:
+    def test_dict_subclass_with_its_own_items(self):
+        class D2(dict):
+            def items(self):
+                return [(1, "a")]
+
+        digester = ArgsDigester()
+        with pytest.raises(TypeError):
+            digester.digest(D2(x=1))
+
+    def test_list_subclass_with_its_own_iter(self):
+        class L2(list):
+            def __iter__(self):
+                return iter([9, 9, 9])
+
+        with pytest.raises(TypeError):
+            ArgsDigester().digest(L2([1, 2]))
+
+    @pytest.mark.parametrize("make", [
+        lambda: type("S", (str,), {})("x"),
+        lambda: type("I", (int,), {})(1),
+        lambda: type("F", (float,), {})(1.5),
+        lambda: type("T", (tuple,), {})((1,)),
+        lambda: type("D", (dict,), {})(),
+        lambda: type("L", (list,), {})(),
+        lambda: collections.OrderedDict(a=1),
+        lambda: collections.defaultdict(list),
+        lambda: __import__("enum").IntEnum("E", "A")["A"],
+    ])
+    def test_subclasses_are_rejected_everywhere(self, make):
+        digester = ArgsDigester()
+        with pytest.raises(TypeError):
+            digester.digest(make())
+        with pytest.raises(TypeError):
+            digester.digest([make()])
+        with pytest.raises(TypeError):
+            digester.digest({"k": make()})
+
+    def test_str_subclass_as_a_key_is_rejected(self):
+        class K(str):
+            pass
+
+        with pytest.raises(TypeError):
+            ArgsDigester().digest({K("a"): 1})
+
+    def test_no_user_code_runs(self):
+        calls = []
+
+        class Spy(dict):
+            def __getattribute__(self, name):
+                calls.append(name)
+                return dict.__getattribute__(self, name)
+
+            def __iter__(self):
+                calls.append("iter")
+                return dict.__iter__(self)
+
+            def __len__(self):
+                calls.append("len")
+                return 0
+
+        with pytest.raises(TypeError):
+            ArgsDigester().digest({"a": [Spy(x=1)]})
+        assert calls == []
+
+    def test_exact_types_still_work(self):
+        digester = ArgsDigester()
+        value = {"a": 1, "b": 2.5, "c": True, "d": None, "e": "x", "f": [1, (2, 3)]}
+        assert len(digester.digest(value)) == 64
+
+    def test_digest_is_of_the_inspected_copy(self):
+        class Sneaky(list):
+            pass
+
+        digester = ArgsDigester()
+        with pytest.raises(TypeError):
+            digester.digest(Sneaky([1]))
+        assert digester.digest([1]) == digester.digest((1,))
+
+
+# ─── Item 3: surrogates ───────────────────────────────────────────────────────
+
+class TestSurrogates:
+    def test_pair_and_emoji_no_longer_collide(self):
+        digester = ArgsDigester()
+        pair = LONE_HIGH + LONE_LOW
+        assert len(digester.digest(EMOJI)) == 64
+        with pytest.raises(TypeError):
+            digester.digest(pair)
+
+    @pytest.mark.parametrize("bad", [LONE_HIGH, LONE_LOW, "a" + LONE_HIGH + "b",
+                                     LONE_HIGH + LONE_LOW])
+    def test_digest_rejects_surrogates_in_text_and_keys(self, bad):
+        digester = ArgsDigester()
+        with pytest.raises(TypeError):
+            digester.digest(bad)
+        with pytest.raises(TypeError):
+            digester.digest({"k": [bad]})
+        with pytest.raises(TypeError):
+            digester.digest({bad: 1})
+
+    def test_digest_message_has_no_value(self):
+        with pytest.raises(TypeError) as info:
+            ArgsDigester().digest("secret-" + LONE_HIGH)
+        assert "secret" not in str(info.value)
+
+    def test_redact_args_replaces_lone_surrogates(self):
+        bad = "x" + LONE_HIGH + "y" + LONE_LOW
+        out = redact_args({"v": bad, bad: 1, "list": [bad]})
+        text = jsonable(out)
+        json.dumps(out, ensure_ascii=False).encode("utf-8")      # must not raise
+        assert out["v"] == "x�y�"
+        assert "x�y�" in out
+        assert LONE_HIGH not in text
+
+    def test_real_emoji_is_kept(self):
+        assert redact_args(EMOJI) == EMOJI
+
+    def test_redact_output_can_be_written_as_utf8(self):
+        value = [LONE_HIGH, {LONE_LOW: LONE_HIGH + LONE_LOW}, "ok"]
+        json.dumps(redact_args(value), ensure_ascii=False).encode("utf-8")
+
+
+# ─── Item 4: NFKC expansion ───────────────────────────────────────────────────
+
+class TestNfkcExpansion:
+    def test_redact_args_with_expanding_strings_is_fast(self):
+        start = time.perf_counter()
+        out = redact_args([FDFA * 200_000] * 5)
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert all(item.startswith("<string,") for item in out)
+        jsonable(out)
+
+    def test_expanding_string_with_a_secret_does_not_leak(self):
+        for text in (FDFA * 200_000 + "password=hunter2",
+                     "password=hunter2 " + FDFA * 200_000,
+                     FDFA * 5000 + "password=hunter2"):
+            out = redact_args({"s": text, "t": [text, text]})
+            assert "hunter2" not in jsonable(out)
+
+    def test_small_expanding_text_is_still_scanned(self):
+        out = redact_args(FDFA * 3 + " password=hunter2")
+        assert "hunter2" not in out
+
+    def test_sanitize_error_text_is_bounded_too(self):
+        for text in (FDFA * 200_000, FDFA * 1_000_000, "a" * 5_000_000):
+            start = time.perf_counter()
+            out = sanitize_error_text(text)
+            assert time.perf_counter() - start < TIME_LIMIT
+            assert out.startswith("<text,") and "not scanned" in out
+
+    def test_sanitize_error_text_normal_text_is_unchanged(self):
+        assert sanitize_error_text("plain text") == "plain text"
+        text = "café 中文 " * 1000
+        assert sanitize_error_text(text, limit=10 ** 7) == text
+        big = "x" * 900_000 + " password=hunter2"
+        assert "hunter2" not in sanitize_error_text(big)
+
+    def test_chunked_normalisation_equals_plain_normalisation(self):
+        import unicodedata
+
+        # a combining mark exactly where a slice would end must still compose
+        for prefix in (9_999, 10_000, 10_001, 19_999, 20_000):
+            text = "a" * prefix + "é" + "Ａ" * 5 + "b" * 30_000
+            assert (sanitize_error_text(text, limit=10 ** 7)
+                    == unicodedata.normalize("NFKC", text))
+
+    def test_many_expanding_strings_share_the_budget(self):
+        start = time.perf_counter()
+        out = redact_args([FDFA * 10_000 for _ in range(100)])
+        assert time.perf_counter() - start < TIME_LIMIT
+        jsonable(out)
+
+
+# ─── Item 5 and 11: key classification fails closed ──────────────────────────
+
+REVIEW_SECRET_KEYS = [
+    "accesstoken", "ACCESSTOKEN", "authtoken", "refreshtoken", "csrftoken", "idtoken",
+    "dbpwd", "setcookie", "xauth", "to" + ZWSP + "ken",
+    "to" + SHY + "ken", "t" + CYR_O + "ken", "pass" + ZWSP + "word", "api" + SHY + "_key",
+    "t\x00oken", "se‍cret", "tóken",
+    "key_data", "key_material", "keyData", "KeyMaterial", "privkey", "private_pem",
+    "privatePem", "signature", "x-amz-signature", "X-Amz-Signature", "sig", "otp", "pin",
+    "seed", "mnemonic", "totp", "x-amz-security-token", "pincode",
+    # Greek look-alikes
+    "τοken", "pαssword", "sεcret",
+    "k" * 1001, "a" * 1500 + "_x", "x" * 5000,
+]
+
+
+class TestKeyClassificationFailsClosed:
+    @pytest.mark.parametrize("key", REVIEW_SECRET_KEYS, ids=lambda k: ascii(k)[:40])
+    def test_secret_spellings_are_redacted(self, key):
+        assert list(redact_args({key: "value-123"}).values()) == [REDACTED]
+
+    @pytest.mark.parametrize("key", ["monkey", "author", "authority", "tokenizer", "bypass",
+                                     "passage", "compass", "path", "query", "keyboard",
+                                     "tokenize", "tokenizer_name", "Author", "design",
+                                     "spin", "pinned", "seeded", "signal", "single",
+                                     "été", "中文"])
+    def test_plain_keys_are_kept(self, key):
+        assert list(redact_args({key: "visible"}).values()) == ["visible"]
+
+    def test_long_key_is_secret_not_truncated(self):
+        # the old code kept the first and last 500 characters and dropped the middle
+        key = "a" * 600 + "token" + "b" * 600
+        assert list(redact_args({key: "v"}).values()) == [REDACTED]
+        key = "a" * 600 + "visible" + "b" * 600     # over 1000 characters: secret as well
+        assert list(redact_args({key: "v"}).values()) == [REDACTED]
+
+    def test_exactly_1000_chars_is_still_classified(self):
+        assert list(redact_args({"k" * 1000: "v"}).values()) == ["v"]
+        assert list(redact_args({"k" * 1001: "v"}).values()) == [REDACTED]
+
+    def test_many_long_keys_run_out_of_budget_and_fail_closed(self):
+        start = time.perf_counter()
+        out = redact_args({("k%d" % i) + "x" * 900: "visible" for i in range(2000)},
+                          max_items=2000)
+        assert time.perf_counter() - start < TIME_LIMIT
+        assert REDACTED in out.values()          # no budget left to classify: secret
+
+
+# ─── Item 6: name/value and pair shapes ───────────────────────────────────────
+
+class TestNameValueShapes:
+    def test_env_list(self):
+        out = redact_args({"env": [{"name": "DB_PASSWORD", "value": "hunter2"},
+                                   {"name": "LOG_LEVEL", "value": "debug"}]})
+        assert out == {"env": [{"name": "DB_PASSWORD", "value": REDACTED},
+                               {"name": "LOG_LEVEL", "value": "debug"}]}
+
+    @pytest.mark.parametrize("entry", [
+        {"Name": "Authorization", "Value": "Basic abc"},
+        {"NAME": "x-api-key", "VALUE": "abc"},
+        {"key": "client_secret", "value": "abc"},
+        {"Key": "session_id", "Value": "abc"},
+        {"value": "abc", "name": "PASSWORD"},
+        {"name": "ACCESSTOKEN", "value": {"nested": "abc"}},
+        {"name": "token", "value": ["abc"], "other": 1},
+    ])
+    def test_name_entry_hides_value_entry(self, entry):
+        out = redact_args(entry)
+        assert [v for k, v in out.items() if k.lower() == "value"] == [REDACTED]
+        assert "abc" not in jsonable(out)
+
+    def test_other_entries_are_kept(self):
+        out = redact_args({"name": "DB_PASSWORD", "value": "x", "description": "visible"})
+        assert out["description"] == "visible"
+
+    def test_plain_name_keeps_value(self):
+        assert redact_args({"name": "colour", "value": "blue"}) == {"name": "colour",
+                                                                    "value": "blue"}
+
+    def test_value_without_a_secret_name_is_kept(self):
+        assert redact_args({"value": "x"}) == {"value": "x"}
+        assert redact_args({"label": "password", "value": "x"}) == {"label": "password",
+                                                                    "value": "x"}
+
+    def test_value_is_never_read(self):
+        class Boom:
+            def __getattribute__(self, name):
+                raise AssertionError("touched")
+
+        out = redact_args({"name": "TOKEN", "value": Boom()})
+        assert out["value"] == REDACTED
+
+    def test_header_pairs(self):
+        out = redact_args({"headers": [("Authorization", "Basic dXNlcjpwYXNz"),
+                                       ("Cookie", "sid=abc"), ("Accept", "text/html")]})
+        assert out == {"headers": [["Authorization", REDACTED], ["Cookie", REDACTED],
+                                   ["Accept", "text/html"]]}
+
+    def test_pair_as_list_and_top_level(self):
+        assert redact_args(["password", "hunter2"]) == ["password", REDACTED]
+        assert redact_args(("X-Api-Key", {"deep": "hunter2"})) == ["X-Api-Key", REDACTED]
+        assert redact_args(["--password", "hunter2"]) == ["--password", REDACTED]
+
+    def test_pair_second_item_is_never_read(self):
+        class Boom:
+            def __getattribute__(self, name):
+                raise AssertionError("touched")
+
+        assert redact_args([("token", Boom())]) == [["token", REDACTED]]
+
+    def test_longer_lists_are_not_pairs(self):
+        # documented limit: an argv style list is not recognised
+        assert redact_args(["tool", "--password", "hunter2"]) == ["tool", "--password", "hunter2"]
+        assert redact_args(["password"]) == ["password"]
+        assert redact_args({"password", "x"}) in (["password", "x"], ["x", "password"])
+
+    def test_pair_with_non_secret_first_item(self):
+        assert redact_args([("Accept", "x"), ("a", "b")]) == [["Accept", "x"], ["a", "b"]]
+
+    def test_pair_with_long_first_item_is_not_a_name(self):
+        text = "password " * 100
+        assert redact_args([text, "visible"], max_string=2000)[1] == "visible"
+
+
+# ─── Item 7: text shapes ──────────────────────────────────────────────────────
+
+class TestTextShapes:
+    PEM = ("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7hunter2xyz\nabcdef\n"
+           "-----END RSA PRIVATE KEY-----")
+
+    @pytest.mark.parametrize("name", ["RSA ", "EC ", "OPENSSH ", "ENCRYPTED ", ""])
+    def test_pem_private_keys(self, name):
+        pem = f"-----BEGIN {name}PRIVATE KEY-----\nMIIEhunter2body\n-----END {name}PRIVATE KEY-----"
+        out = sanitize_error_text(f"key: {pem} done")
+        assert "hunter2" not in out and out.endswith("done")
+        assert "MIIE" not in out
+
+    def test_pem_without_end_goes_to_the_end(self):
+        out = sanitize_error_text("x -----BEGIN PRIVATE KEY-----\nMIIEhunter2 and more text")
+        assert "hunter2" not in out and "more text" not in out
+
+    def test_pem_in_redact_args_within_the_first_200_chars(self):
+        out = redact_args({"note": "ssh: " + self.PEM})
+        assert "hunter2" not in jsonable(out)
+
+    def test_pem_escaped_newlines(self):
+        text = "-----BEGIN PRIVATE KEY-----\\nMIIEhunter2\\n-----END PRIVATE KEY-----"
+        assert "hunter2" not in sanitize_error_text(text)
+
+    def test_public_key_is_not_touched(self):
+        text = "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+        assert sanitize_error_text(text) == text
+
+    @pytest.mark.parametrize("text, secret", [
+        ("x-amz-signature=abcdef123456&y=1", "abcdef123456"),
+        ("X-Amz-Security-Token=zzzTOKENzzz&y=1", "zzzTOKENzzz"),
+        ("https://b.s3.amazonaws.com/o?Signature=abcdef123456&Expires=1", "abcdef123456"),
+        ("?sig=abcdef123456&se=2030", "abcdef123456"),
+        ('{"signature": "abcdef 123456"}', "abcdef"),
+        ("DB_PASS=hunter2 port=1", "hunter2"),
+        ("db_pass: hunter2", "hunter2"),
+        ("pwd=hunter2&x=1", "hunter2"),
+        ("PWD: hunter2", "hunter2"),
+        ("redis://:hunter2@host:6379/0", "hunter2"),
+        ("amqp://user:hunter2@host", "hunter2"),
+    ])
+    def test_more_shapes(self, text, secret):
+        assert secret not in sanitize_error_text(text)
+
+    def test_whole_word_labels_do_not_overreach(self):
+        for text in ("bypass=1", "design=blue", "compass=north", "assign=x", "sigma=2",
+                     "http://host:8080/x", "http://user@host"):
+            assert sanitize_error_text(text) == text
+
+    @pytest.mark.parametrize("text, secret", [
+        ('password="ab\\"cd ef" tail', "cd ef"),
+        ("password='ab\\'cd ef' tail", "cd ef"),
+        (json.dumps({"password": 'p"w d'}) + " tail", "w d"),
+        (json.dumps({"api_key": 'a"b c"d e'}), "d e"),
+        ('secret="x\\\\" y="z" tail', "x"),
+        ('{\\"password\\": \\"p w\\"} tail', "p w"),
+        ('cookie: "a\\"b c"', "b c"),
+        ('Authorization: "Bearer a\\"b c"', "b c"),
+    ])
+    def test_quoted_values_with_escapes(self, text, secret):
+        out = sanitize_error_text(text)
+        assert secret not in out
+        assert "tail" in out or "tail" not in text
+
+    def test_text_after_the_quoted_value_is_kept(self):
+        assert sanitize_error_text('password="a\\"b c" next=1') == "password=[REDACTED] next=1"
+
+    def test_still_stable_when_applied_twice(self):
+        for text in (self.PEM, 'password="ab\\"cd ef" tail', "redis://:hunter2@h", "pwd=x sig=y"):
+            once = sanitize_error_text(text)
+            assert sanitize_error_text(once) == once
+
+    @pytest.mark.parametrize("unit", [
+        'token="a\\\\', "token='\\'", 'password="' + "\\a", "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN ", "pass=", 'sig="\\"', "Signature:\\", "redis://:", "cookie: \\\"",
+        "authorization: \\\"a b ", "x\\\\\\\"y",
+    ])
+    def test_token_soup_is_fast(self, unit):
+        text = unit * (200_000 // len(unit))
+        for _ in range(5):
+            start = time.perf_counter()
+            sanitize_error_text(text)
+            assert time.perf_counter() - start < TIME_LIMIT
+        start = time.perf_counter()
+        redact_args([text] * 5)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+
+# ─── Item 8: hostile metaclass ────────────────────────────────────────────────
+
+class TestHostileMetaclass:
+    def test_metaclass_name_property_is_not_run(self):
+        calls = []
+
+        class Meta(type):
+            @property
+            def __name__(cls):  # type: ignore[override]
+                calls.append("name")
+                return "ATTACKER-password=hunter2"
+
+            def __getattribute__(cls, name):
+                if name == "__name__":
+                    calls.append("getattr")
+                    raise RuntimeError("attacker code")
+                return type.__getattribute__(cls, name)
+
+            def __instancecheck__(cls, obj):
+                calls.append("instancecheck")
+                raise RuntimeError("attacker code")
+
+            def __subclasscheck__(cls, sub):
+                calls.append("subclasscheck")
+                raise RuntimeError("attacker code")
+
+        class Victim(metaclass=Meta):
+            pass
+
+        out = redact_args({"x": Victim(), "y": [Victim()], Victim(): 1})
+        assert calls == []
+        assert out["x"] == "<Victim>" and out["y"] == ["<Victim>"]
+        assert "ATTACKER" not in jsonable(out) and "hunter2" not in jsonable(out)
+
+    def test_class_with_a_secret_in_its_real_name_is_redacted(self):
+        odd = type("password=hunter2", (), {})
+        out = redact_args(odd())
+        assert "hunter2" not in out
+
+    def test_very_long_class_name_is_cut(self):
+        odd = type("N" * 5000, (), {})
+        assert len(redact_args(odd())) < 100
+
+
+# ─── Item 9: non-string keys ──────────────────────────────────────────────────
+
+class TestNonStringKeys:
+    @pytest.mark.parametrize("key", [b"password", b"API_KEY", type("B", (bytes,), {})(b"token"),
+                                     b"x-auth-token", b"pass\x00word"],
+                             ids=lambda k: type(k).__name__ + repr(bytes(k)))
+    def test_bytes_keys_are_classified(self, key):
+        out = redact_args({key: "hunter2"})
+        assert list(out.values()) == [REDACTED]
+        assert "hunter2" not in jsonable(out)
+
+    def test_plain_bytes_key_is_kept(self):
+        assert redact_args({b"name": "x"}) == {"<bytes 4>": "x"}
+
+    def test_huge_bytes_key_fails_closed(self):
+        assert list(redact_args({b"k" * 2000: "x"}).values()) == [REDACTED]
+
+    @pytest.mark.parametrize("key", [("password",), frozenset({"a"}), (1, 2), object(),
+                                     RaisesEverything(), WithSlots(), len, 1 + 2j],
+                             ids=lambda k: type(k).__name__)
+    def test_other_keys_redact_the_value(self, key):
+        out = redact_args({key: "hunter2"})
+        assert list(out.values()) == [REDACTED]
+
+    @pytest.mark.parametrize("key", [1, 2.5, True, None, 10 ** 400])
+    def test_number_and_none_keys_keep_their_value(self, key):
+        out = redact_args({key: "visible"})
+        assert list(out.values()) == ["visible"]
+
+    def test_key_object_methods_never_run(self):
+        calls = []
+
+        class K:
+            def __str__(self):
+                calls.append("str")
+                return "password"
+
+            def __repr__(self):
+                calls.append("repr")
+                return "password"
+
+            def __hash__(self):
+                return 1
+
+            def __eq__(self, other):
+                return self is other
+
+        redact_args({K(): "x"})
+        assert calls == []
+
+
+# ─── Item 12 and 13: purpose and matches ──────────────────────────────────────
+
+class TestPurposeAndMatches:
+    def test_purpose_separates_digests(self):
+        d = ArgsDigester()
+        assert d.digest({"a": 1}) == d.digest({"a": 1}, "args")
+        assert d.digest({"a": 1}, "args") != d.digest({"a": 1}, "result")
+        assert d.digest({"a": 1}, purpose="result") == d.digest({"a": 1}, "result")
+
+    def test_length_prefix_makes_the_encoding_unambiguous(self):
+        # without a length prefix "ab" + "c" and "a" + "bc" would be the same message
+        d = ArgsDigester()
+        assert d.digest("c", "ab") != d.digest("bc", "a")
+        assert d.digest(1, "a1") != d.digest(11, "a")
+
+    def test_known_answer_with_purpose(self):
+        d = ArgsDigester()
+        expected = hmac.new(d._key, b'\x00\x00\x00\x06result[1,2]', hashlib.sha256).hexdigest()
+        assert d.digest([1, 2], "result") == expected
+
+    @pytest.mark.parametrize("bad", ["", "1abc", "a b", "a" * 33, "café", "a\n", "-a", "a/b"])
+    def test_bad_purpose_values(self, bad):
+        with pytest.raises(ValueError):
+            ArgsDigester().digest({}, bad)
+
+    @pytest.mark.parametrize("bad", [None, 5, b"args", ["args"]])
+    def test_non_string_purpose(self, bad):
+        with pytest.raises(TypeError):
+            ArgsDigester().digest({}, bad)
+
+    def test_good_purposes(self):
+        d = ArgsDigester()
+        for good in ("args", "result", "a", "tool.args-v1", "A_b-c.d", "x" * 32):
+            assert len(d.digest({}, good)) == 64
+
+    def test_matches(self):
+        d = ArgsDigester()
+        value = {"a": [1, 2]}
+        digest = d.digest(value)
+        assert d.matches(value, digest) is True
+        assert d.matches(value, digest.upper()) is True
+        assert d.matches({"a": [1, 3]}, digest) is False
+        assert d.matches(value, digest, "result") is False
+        assert d.matches(value, d.digest(value, "result"), "result") is True
+        assert ArgsDigester().matches(value, digest) is False
+
+    @pytest.mark.parametrize("bad", [None, 5, b"x" * 64, "", "abc", "z" * 64, "a" * 63,
+                                     "a" * 65, "é" * 64, ["a"] * 64, 1.5, object()])
+    def test_matches_never_raises_on_malformed_digests(self, bad):
+        assert ArgsDigester().matches({"a": 1}, bad) is False
+
+    def test_matches_with_values_digest_rejects(self):
+        d = ArgsDigester()
+        for value in (b"x", {1}, object(), float("nan"), RaisesEverything()):
+            assert d.matches(value, "a" * 64) is False
+        assert d.matches({}, "a" * 64, "bad purpose!") is False
+
+    def test_matches_uses_constant_time_compare(self, monkeypatch):
+        calls = []
+        real = hmac.compare_digest
+        monkeypatch.setattr(redact_module.hmac, "compare_digest",
+                            lambda a, b: calls.append(1) or real(a, b))
+        d = ArgsDigester()
+        d.matches({}, d.digest({}))
+        assert calls == [1]
+
+
+# ─── Item 14: tests that kill surviving mutants ───────────────────────────────
+
+class TestHardLimitsAndFailureHandling:
+    def test_max_depth_is_capped_at_64(self):
+        def nest(levels):
+            value: object = "leaf"
+            for _ in range(levels):
+                value = [value]
+            return value
+
+        assert "leaf" in jsonable(redact_args(nest(64), max_depth=10 ** 9))
+        assert "leaf" not in jsonable(redact_args(nest(65), max_depth=10 ** 9))
+        assert "<max depth>" in jsonable(redact_args(nest(65), max_depth=10 ** 9))
+        assert "<max depth>" in jsonable(redact_args(nest(100), max_depth=65))
+
+    def test_max_items_is_capped(self):
+        out = redact_args(list(range(20_000)), max_items=10 ** 9)
+        assert len(out) == 10_001
+
+    def test_a_container_that_fails_becomes_unreadable(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("attacker-text")
+
+        monkeypatch.setattr(redact_module, "_key_info", boom)
+        out = redact_args({"outer": [{"a": 1}], "b": 2})
+        assert out == "<dict, unreadable>"
+        assert "attacker" not in jsonable(out)
+
+    def test_a_failing_list_becomes_unreadable_inside_a_dict(self, monkeypatch):
+        real = redact_module._clean_str
+
+        def flaky(text, limit, budget):
+            if text == "boom":
+                raise RuntimeError("x")
+            return real(text, limit, budget)
+
+        monkeypatch.setattr(redact_module, "_clean_str", flaky)
+        out = redact_args({"ok": ["fine"], "bad": ["boom"]})
+        assert out == {"ok": ["fine"], "bad": "<list, unreadable>"}
+
+    def test_top_level_failure_returns_a_marker(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("attacker-text")
+
+        monkeypatch.setattr(redact_module, "_Budget", boom)
+        assert redact_args({"a": 1}) == "<redaction failed>"
+        monkeypatch.undo()
+        assert redact_args({"a": 1}) == {"a": 1}
+
+    def test_top_level_failure_from_a_bad_parameter_path(self, monkeypatch):
+        monkeypatch.setattr(redact_module, "_redact", lambda *a, **k: 1 / 0)
+        assert redact_args([1]) == "<redaction failed>"
+
+    def test_dict_mutated_while_it_is_copied(self, monkeypatch):
+        victim: dict = {"a": "one", "b": "two", "c": "three"}
+        real = redact_module._clean_str
+        state = {"done": False}
+
+        def mutating(text, limit, budget):
+            if not state["done"] and text == "one":
+                state["done"] = True
+                victim["new-key"] = 1            # changes the size of the dict being copied
+            return real(text, limit, budget)
+
+        monkeypatch.setattr(redact_module, "_clean_str", mutating)
+        out = redact_args(victim)
+        jsonable(out)                            # no exception, JSON safe
+
+    def test_set_and_list_mutated_while_copied(self, monkeypatch):
+        items = {"one", "two", "three"}
+        real = redact_module._clean_str
+        state = {"done": False}
+
+        def mutating(text, limit, budget):
+            if not state["done"]:
+                state["done"] = True
+                items.add("added-while-iterating")
+            return real(text, limit, budget)
+
+        monkeypatch.setattr(redact_module, "_clean_str", mutating)
+        jsonable(redact_args({"s": items}))
