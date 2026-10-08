@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..core.models import MemoryRing, TaskNode
-from .base import BaseAgent
+from .base import BaseAgent, _cut
 
 # ─── Content Helpers ──────────────────────────────────────────────────────────
 
@@ -266,7 +266,7 @@ async def _search_tavily(query: str, api_key: str, max_results: int = 5) -> list
         results.append({
             "title":   r.get("title", ""),
             "url":     r.get("url", ""),
-            "content": r.get("content", "")[:500],
+            "content": r.get("content", ""),
         })
     return results
 
@@ -592,11 +592,12 @@ class WebAgent(BaseAgent):
         for i, r in enumerate(results, 1):
             url     = r.get("url", "")
             trust   = self._domain_trust.score(url) if url else 0.5
-            snippet = r.get("content", "")[:500]
+            full    = r.get("content", "")
+            snippet = _cut(full, 500)
             lines.append(f"{i}. {r.get('title', 'No title')}")
             if url:
                 lines.append(f"   {url}  [trust: {trust:.2f}]")
-                self._domain_trust.record(url, success=bool(snippet), content_length=len(snippet))
+                self._domain_trust.record(url, success=bool(full), content_length=len(full))
             lines.append(f"   {snippet}\n")
 
         formatted = "\n".join(lines)
@@ -640,7 +641,7 @@ class WebAgent(BaseAgent):
             metadata=metadata, user_id=user_id,
         )
         if len(content) > 2000:
-            summary = content[:500] + "... [see WARM memory for full content]"
+            summary = _cut(content, 500) + " [stored copy is in WARM memory]"
             self._memory.store(
                 content=summary, ring=MemoryRing.HOT,
                 tags=["web_browse", "summary", f"url:{url[:120]}"],

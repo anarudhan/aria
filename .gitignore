@@ -74,6 +74,7 @@ config.local.yaml
 # ARIA runtime data — generated at runtime, not source code
 aria/data/
 aria_data/
+aria_spill/
 improvement_data.json
 .patch_backups/
 *.aria_memory
