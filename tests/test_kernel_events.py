@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
 import inspect
+import sys
+import threading
+import time
 import warnings
+import weakref
 from typing import Any, List
 
 import pytest
@@ -1007,6 +1012,399 @@ class TestWaterfall:
 
 async def _await_it(aw: Any) -> Any:
     return await aw
+
+
+# ----------------------------------------------------------------------
+# parallel: no sibling outlives the call
+# ----------------------------------------------------------------------
+
+
+class TestParallelCleanup:
+    async def _run_and_check(self, ev: Events, bad: Any, expected: Any) -> None:
+        """Run parallel with a failing listener plus hanging siblings."""
+        loop = asyncio.get_running_loop()
+        loop_problems: List[Any] = []
+        loop.set_exception_handler(lambda _loop, ctx: loop_problems.append(ctx))
+        finished: List[str] = []
+
+        async def sibling(tag: str) -> None:
+            try:
+                await asyncio.sleep(10)
+            finally:
+                finished.append(tag)
+
+        ev.on("a", lambda: sibling("s1"))
+        ev.on("a", bad)
+        ev.on("a", lambda: sibling("s2"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(expected):
+                await ev.parallel("a")
+            # The siblings are already finished here, not merely cancelled.
+            assert sorted(finished) == ["s1", "s2"]
+            leftover = [
+                t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
+            ]
+            assert leftover == []
+            gc.collect()
+            await asyncio.sleep(0)
+            gc.collect()
+        assert loop_problems == []
+
+    async def test_listener_raising_cancelled_error_cancels_and_finishes_siblings(
+        self, ev: Events
+    ) -> None:
+        async def cancel() -> None:
+            await asyncio.sleep(0)  # let the siblings start first
+            raise asyncio.CancelledError()
+
+        await self._run_and_check(ev, cancel, asyncio.CancelledError)
+
+    async def test_listener_raising_base_exception_cancels_and_finishes_siblings(
+        self, ev: Events
+    ) -> None:
+        class Stop(BaseException):
+            pass
+
+        async def stop() -> None:
+            await asyncio.sleep(0)
+            raise Stop()
+
+        await self._run_and_check(ev, stop, Stop)
+
+    async def test_outer_cancel_waits_for_siblings(self, ev: Events) -> None:
+        finished: List[str] = []
+        started = asyncio.Event()
+
+        async def sibling(tag: str) -> None:
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0)  # slow cleanup must be waited for
+                finished.append(tag)
+
+        ev.on("a", lambda: sibling("s1"))
+        ev.on("a", lambda: sibling("s2"))
+        task = asyncio.ensure_future(ev.parallel("a"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sorted(finished) == ["s1", "s2"]
+
+    async def test_ordinary_failures_still_collected_with_siblings_complete(
+        self, ev: Events
+    ) -> None:
+        finished: List[str] = []
+
+        async def slow_ok() -> None:
+            await asyncio.sleep(0.01)
+            finished.append("ok")
+
+        ev.on("a", slow_ok)
+        ev.on("a", lambda: 1 / 0)
+        with pytest.raises(ListenerErrors):
+            await ev.parallel("a")
+        assert finished == ["ok"]
+
+
+# ----------------------------------------------------------------------
+# Concurrent next()
+# ----------------------------------------------------------------------
+
+
+class TestConcurrentNext:
+    async def test_two_tasks_calling_next_get_exactly_one_error(self, ev: Events) -> None:
+        inner_calls: List[int] = []
+
+        async def inner() -> str:
+            inner_calls.append(1)
+            await asyncio.sleep(0)
+            return "core"
+
+        async def layer(nxt: Any) -> Any:
+            async def call() -> Any:
+                await asyncio.sleep(0)
+                return await nxt()
+
+            return await asyncio.gather(call(), call(), return_exceptions=True)
+
+        ev.on("a", layer)
+        results = await ev.awaterfall("a", inner=inner)
+        errors = [r for r in results if isinstance(r, NextAlreadyCalledError)]
+        values = [r for r in results if r == "core"]
+        assert len(errors) == 1
+        assert len(values) == 1
+        assert inner_calls == [1]
+
+
+# ----------------------------------------------------------------------
+# Memory: removal releases the listener
+# ----------------------------------------------------------------------
+
+
+def _make_listener(seen: List[Any]) -> Any:
+    def listener() -> None:
+        seen.append(1)
+
+    return listener
+
+
+class TestRelease:
+    def test_disposed_listener_is_not_kept_alive_by_the_disposer(self, ev: Events) -> None:
+        fn = _make_listener([])
+        ref = weakref.ref(fn)
+        d = ev.on("a", fn)
+        del fn
+        gc.collect()
+        assert ref() is not None  # still registered
+        d()
+        gc.collect()
+        assert ref() is None
+        assert d() is False  # the disposer itself is still alive and harmless
+
+    def test_once_listener_released_after_its_call(self, ev: Events) -> None:
+        seen: List[Any] = []
+        fn = _make_listener(seen)
+        ref = weakref.ref(fn)
+        d = ev.once("a", fn)
+        del fn
+        ev.emit("a")
+        gc.collect()
+        assert seen == [1]
+        assert ref() is None
+        assert d.active is False
+
+    def test_once_function_survives_until_its_call_completes(self, ev: Events) -> None:
+        alive_during_call: List[bool] = []
+        holder: List[Any] = []
+
+        def make() -> Any:
+            def listener() -> None:
+                gc.collect()
+                alive_during_call.append(holder[0]() is not None)
+
+            return listener
+
+        fn = make()
+        holder.append(weakref.ref(fn))
+        ev.once("a", fn)
+        del fn
+        ev.emit("a")
+        assert alive_during_call == [True]
+
+
+# ----------------------------------------------------------------------
+# Scale and compaction
+# ----------------------------------------------------------------------
+
+N_SCALE = 20_000
+TIME_BOUND = 2.0
+
+
+class TestScale:
+    def test_many_listeners_register_emit_dispose(self) -> None:
+        ev = Events()
+        calls = [0]
+
+        def listener() -> None:
+            calls[0] += 1
+
+        t0 = time.perf_counter()
+        disposers = [ev.on("a", listener) for _ in range(N_SCALE)]
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert ev.listener_count("a") == N_SCALE
+        assert ev.describe()["listeners"] == {"a": N_SCALE}
+
+        t0 = time.perf_counter()
+        ev.emit("a")
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert calls[0] == N_SCALE
+
+        t0 = time.perf_counter()
+        for d in disposers:
+            assert d() is True
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert ev.listener_count("a") == 0
+        assert ev.describe()["listeners"] == {}
+        ev.emit("a")
+        assert calls[0] == N_SCALE
+
+    def test_many_once_listeners(self) -> None:
+        ev = Events()
+        calls = [0]
+
+        def listener() -> None:
+            calls[0] += 1
+
+        t0 = time.perf_counter()
+        for _ in range(N_SCALE):
+            ev.once("a", listener)
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert ev.listener_count("a") == N_SCALE
+
+        t0 = time.perf_counter()
+        ev.emit("a")
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert calls[0] == N_SCALE
+        assert ev.listener_count("a") == 0
+        ev.emit("a")
+        assert calls[0] == N_SCALE
+
+    def test_many_prepends_keep_order(self) -> None:
+        ev = Events()
+        order: List[int] = []
+        t0 = time.perf_counter()
+        for i in range(N_SCALE):
+            ev.on("a", functools.partial(order.append, i), prepend=True)
+        assert time.perf_counter() - t0 < TIME_BOUND
+        assert ev.listener_count("a") == N_SCALE
+        ev.emit("a")
+        assert order == list(range(N_SCALE - 1, -1, -1))
+
+    def test_live_count_and_order_survive_compaction(self, ev: Events) -> None:
+        order: List[str] = []
+        disposers: List[Disposer] = []
+        for i in range(200):
+            disposers.append(ev.on("a", functools.partial(order.append, f"b{i}")))
+        for i in range(200):
+            disposers.append(
+                ev.on("a", functools.partial(order.append, f"f{i}"), prepend=True)
+            )
+        # Keep every 10th registration; removing the rest compacts several times.
+        kept = [idx for idx in range(len(disposers)) if idx % 10 == 0]
+        for idx, d in enumerate(disposers):
+            if idx % 10 != 0:
+                d()
+        assert ev.listener_count("a") == len(kept) == 40
+        ev.emit("a")
+        expected_front = [f"f{i}" for i in range(199, -1, -1) if (200 + i) % 10 == 0]
+        expected_back = [f"b{i}" for i in range(200) if i % 10 == 0]
+        assert order == expected_front + expected_back
+        # Adding after compaction still works and keeps ordering.
+        order.clear()
+        ev.on("a", functools.partial(order.append, "new"))
+        ev.on("a", functools.partial(order.append, "newfront"), prepend=True)
+        ev.emit("a")
+        assert order[0] == "newfront" and order[-1] == "new"
+        assert ev.listener_count("a") == 42
+
+    def test_snapshot_taken_before_compaction_is_unaffected(self, ev: Events) -> None:
+        order: List[int] = []
+        disposers: List[Disposer] = []
+
+        def remover() -> None:
+            # Removing many listeners mid dispatch compacts storage; the running
+            # dispatch must still skip exactly the removed ones.
+            for d in disposers[:75]:
+                d()
+
+        ev.on("a", remover)
+        for i in range(100):
+            disposers.append(ev.on("a", functools.partial(order.append, i)))
+        ev.emit("a")
+        assert order == list(range(75, 100))
+        assert ev.listener_count("a") == 26
+
+
+# ----------------------------------------------------------------------
+# Threads
+# ----------------------------------------------------------------------
+
+
+def _run_threads(target: Any, count: int) -> None:
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=target, args=(k,)) for k in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+
+
+class TestThreads:
+    def test_concurrent_registration_loses_nothing(self, ev: Events) -> None:
+        threads_n, per_thread = 4, 2000
+        tokens: List[List[int]] = [[] for _ in range(threads_n)]
+        barrier = threading.Barrier(threads_n)
+        failures: List[BaseException] = []
+
+        def work(k: int) -> None:
+            try:
+                barrier.wait()
+                for _ in range(per_thread):
+                    tokens[k].append(ev.on("a", lambda: None, prepend=(k % 2 == 0)).token)
+            except BaseException as exc:  # pragma: no cover - only on failure
+                failures.append(exc)
+
+        _run_threads(work, threads_n)
+        assert failures == []
+        assert ev.listener_count("a") == 8000
+        assert ev.describe()["listeners"] == {"a": 8000}
+        all_tokens = [tok for ts in tokens for tok in ts]
+        assert len(set(all_tokens)) == 8000
+        ev.emit("a")
+        assert ev.errors == []
+
+    def test_every_registered_listener_runs(self, ev: Events) -> None:
+        threads_n, per_thread = 4, 500
+        seen: List[int] = []
+        barrier = threading.Barrier(threads_n)
+
+        def work(k: int) -> None:
+            barrier.wait()
+            for i in range(per_thread):
+                ev.on("a", functools.partial(seen.append, k * per_thread + i))
+
+        _run_threads(work, threads_n)
+        ev.emit("a")
+        assert sorted(seen) == list(range(threads_n * per_thread))
+
+    def test_no_stale_snapshot_when_emitting_while_registering(self, ev: Events) -> None:
+        registrars, per_thread = 3, 1500
+        done = threading.Event()
+        seen: List[int] = []
+
+        def work(k: int) -> None:
+            if k == registrars:  # the emitting thread
+                while not done.is_set():
+                    ev.emit("a")
+                return
+            for i in range(per_thread):
+                ev.on("a", functools.partial(seen.append, 1))
+
+        old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=work, args=(k,)) for k in range(registrars + 1)]
+            for t in threads:
+                t.start()
+            for t in threads[:registrars]:
+                t.join()
+            done.set()
+            threads[registrars].join()
+        finally:
+            sys.setswitchinterval(old)
+        seen.clear()
+        ev.emit("a")
+        assert len(seen) == registrars * per_thread == ev.listener_count("a")
+
+    def test_concurrent_register_and_dispose(self, ev: Events) -> None:
+        threads_n, per_thread = 4, 1000
+        barrier = threading.Barrier(threads_n)
+
+        def work(_k: int) -> None:
+            barrier.wait()
+            ds = [ev.on("a", lambda: None) for _ in range(per_thread)]
+            for d in ds[::2]:
+                d()
+
+        _run_threads(work, threads_n)
+        assert ev.listener_count("a") == threads_n * per_thread // 2
 
 
 # ----------------------------------------------------------------------
