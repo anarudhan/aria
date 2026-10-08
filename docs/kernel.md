@@ -56,6 +56,11 @@ Each record has `event`, `listener` (a label, or the one you pass with
 `label=`) and `exception`. The record list is bounded (default 1000, set with
 `Events(max_errors=...)`); `describe()` reports how many were dropped.
 
+Note that a record holds the exception object, and with it the traceback and
+every local variable and payload the traceback refers to. These stay alive
+until you call `take_errors()` or `clear_errors()` (or the bound pushes the
+record out), so drain the list regularly in long running programs.
+
 **Async listeners in `emit`.** `emit` cannot wait. If a listener returns an
 awaitable and an event loop is running, it is scheduled as a task and any
 later failure is recorded in `errors`. If no loop is running, the coroutine is
@@ -81,8 +86,11 @@ work. An exception propagates.
 Starts all listeners together. All of them run even if some fail. If any
 failed, one `ListenerErrors` is raised holding every error in listener order
 (`exc.errors`, `exc.exceptions`). It does not use `ExceptionGroup`, so it works
-on Python 3.10. Returns nothing on success. If the caller is cancelled, the
-running listeners are cancelled too.
+on Python 3.10. Returns nothing on success.
+
+No listener outlives the call. If the caller is cancelled, or a listener
+raises `CancelledError` (or another `BaseException`), the other listeners are
+cancelled and awaited to completion before the exception propagates.
 
 ### waterfall
 
@@ -125,6 +133,17 @@ result = await events.awaterfall("run", task, inner=do_work_async)
 An async layer should `await next()`. If it forgets and returns `next()`
 directly, `awaterfall` still resolves it.
 
+Two things the library cannot fix for you:
+
+- A sync layer that calls `next()` and then throws the result away, while
+  `inner` (or a later layer) is async, creates a coroutine that nobody awaits.
+  Python then prints "coroutine was never awaited", and the work never ran.
+  Return or await the result of `next()`.
+- `awaterfall` awaits any awaitable that the chain returns, even one that is
+  legitimately meant as data (for example a future you want to hand back
+  unawaited). If your result is an awaitable on purpose, wrap it in a plain
+  object, or use `waterfall` and handle the result yourself.
+
 ## Rules for every mode
 
 - **Snapshot.** A dispatch works on the listeners as they were when it
@@ -135,6 +154,20 @@ directly, `awaterfall` still resolves it.
 - **Fail closed.** `bail`, `serial` and `waterfall` let exceptions propagate.
   Only `emit` collects them (it is the "tell everyone" mode), and `parallel`
   gathers them into `ListenerErrors`.
+
+## Threads and scale
+
+- Registration and removal (`on`, `once`, disposers, `listener_count`,
+  `describe`) are thread safe: one internal lock protects them, and it is
+  never held while a listener runs.
+- Dispatch (`emit`, `bail`, `serial`, `parallel`, `waterfall`) is meant to run
+  on the event loop thread. `serial`, `parallel` and `awaterfall` need that
+  loop; the sync modes can be called from any single thread you choose.
+- Registration is O(1) and removal is O(1) on average: a removed listener is
+  only marked as removed, and the storage is cleaned up in batches. A removed
+  listener releases its function straight away, so a disposer you keep does not
+  keep the listener alive. Tens of thousands of listeners on one event are fine.
+  A dispatch takes its snapshot in O(n), once per change to the listener list.
 
 ## Health report
 
