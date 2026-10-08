@@ -14,6 +14,7 @@ import pytest
 
 from aria.plugins import AnthropicPlugin, OpenAIPlugin
 from aria.plugins.llm_plugins import AnthropicPlugin as DirectAnthropicPlugin
+from aria.plugins.retry import LLMError, RetryPolicy
 
 # ─── Fake SDKs ────────────────────────────────────────────────────────────────
 
@@ -208,8 +209,9 @@ class TestAnthropicComplete:
 
     async def test_api_errors_propagate(self, anthropic_sdk):
         anthropic_sdk.error = RuntimeError("rate limited")
-        with pytest.raises(RuntimeError, match="rate limited"):
+        with pytest.raises(LLMError, match="rate limited") as info:
             await AnthropicPlugin(api_key="k").complete("p")
+        assert info.value.cause is anthropic_sdk.error
 
     @pytest.mark.xfail(
         strict=True,
@@ -313,8 +315,10 @@ class TestAnthropicChat:
 
     async def test_api_errors_propagate(self, anthropic_sdk):
         anthropic_sdk.error = ConnectionError("network down")
-        with pytest.raises(ConnectionError):
-            await AnthropicPlugin(api_key="k").chat([{"role": "user", "content": "q"}])
+        plugin = AnthropicPlugin(api_key="k", retry_policy=RetryPolicy(max_retries=0))
+        with pytest.raises(LLMError, match="network down") as info:
+            await plugin.chat([{"role": "user", "content": "q"}])
+        assert info.value.cause is anthropic_sdk.error
 
     async def test_message_without_role_is_rejected(self, anthropic_sdk):
         with pytest.raises(KeyError):
@@ -386,8 +390,10 @@ class TestOpenAIComplete:
 
     async def test_api_errors_propagate(self, openai_sdk):
         openai_sdk.error = TimeoutError("slow")
-        with pytest.raises(TimeoutError):
-            await OpenAIPlugin(api_key="k").complete("p")
+        plugin = OpenAIPlugin(api_key="k", retry_policy=RetryPolicy(max_retries=0))
+        with pytest.raises(LLMError, match="slow") as info:
+            await plugin.complete("p")
+        assert info.value.cause is openai_sdk.error
 
     @pytest.mark.xfail(
         strict=True,
@@ -462,8 +468,9 @@ class TestOpenAIChat:
 
     async def test_api_errors_propagate(self, openai_sdk):
         openai_sdk.error = RuntimeError("quota exceeded")
-        with pytest.raises(RuntimeError, match="quota"):
+        with pytest.raises(LLMError, match="quota") as info:
             await OpenAIPlugin(api_key="k").chat([{"role": "user", "content": "q"}])
+        assert info.value.cause is openai_sdk.error
 
     @pytest.mark.xfail(
         strict=True,

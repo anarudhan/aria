@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -49,12 +50,29 @@ from ..core.models import (
     MessageType,
     TaskNode,
 )
-from ..core.spill import READ_TOOL_NAME, SpillError, SpillStore, get_default_store
+from ..core.spill import (
+    ESCAPE_SENTENCE,
+    READ_TOOL_NAME,
+    UNTRUSTED_NOTICE,
+    SpillError,
+    SpillStore,
+    get_default_store,
+    neutralize_markers,
+)
 
 if TYPE_CHECKING:
     from ..core.memory import TemporalMemory
 
+_log = logging.getLogger("aria.agents")
+
 # ─── Base Agent ───────────────────────────────────────────────────────────────
+
+def _cut(text: str, limit: int) -> str:
+    """Shorten ``text`` to ``limit`` characters and say so, never silently."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [{len(text) - limit} more characters not shown]"
+
 
 class BaseAgent(ABC):
     """
@@ -237,6 +255,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         self._llm = llm
         self._max_react_iterations = max_react_iterations
         self._spill_store = spill_store   # None: use the shared default on first need
+        self._warned_read_tool = False
 
     @property
     def spill_store(self) -> SpillStore:
@@ -248,15 +267,31 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
     def read_spilled(self, locator: str, offset: int = 0, length: int = 2000) -> str:
         """Read more of an output that was shortened. Pass the spill id from the omission note; offset and length count characters."""
         try:
-            page = self.spill_store.read_page(locator, offset, length)
+            page = self.spill_store.read_page(locator, offset, length, owner=self.agent_id)
         except SpillError as exc:
             return f"Error: {exc}"
         note = f"[characters {page.offset} to {page.end} of {page.total_chars}"
         if page.has_more:
-            note += f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", offset={page.end})"
+            note += (
+                f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", "
+                f"offset={page.end}, length={self.spill_store.suggested_read_chars})"
+            )
         else:
             note += "; end of text"
-        return f"{page.text}\n{note}]"
+        # Lines of the content that imitate our own notes get a "> " prefix.
+        shown = neutralize_markers(page.text)
+        if shown != page.text:
+            note += f"; {ESCAPE_SENTENCE}"
+        return f"[{UNTRUSTED_NOTICE}]\n{shown}\n{note}]"
+
+    def _owns_read_tool(self) -> bool:
+        """True when the registered ``read_spilled`` is this agent's own method."""
+        tool = self._tools.get(READ_TOOL_NAME)
+        # Identity, never ``==``: a user object could define __eq__ to say yes.
+        return (
+            getattr(tool, "__self__", None) is self
+            and getattr(tool, "__func__", None) is type(self).read_spilled
+        )
 
     def _show(self, text: str, max_chars: int) -> str:
         """Return text as-is if it fits, else an honest preview (never a silent cut).
@@ -265,12 +300,26 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         available to the model. It is not added to the advertised fingerprint,
         and agents that never meet large output are unchanged.
         """
-        result = self.spill_store.preview_or_spill(text, max_chars)
-        if result.spilled and READ_TOOL_NAME not in self._tools:
-            self._tools[READ_TOOL_NAME] = self.read_spilled
+        result = self.spill_store.preview_or_spill(text, max_chars, owner=self.agent_id)
+        if result.spilled:
+            if READ_TOOL_NAME not in self._tools:
+                self._tools[READ_TOOL_NAME] = self.read_spilled
+            elif not self._owns_read_tool() and not self._warned_read_tool:
+                # A user tool already has this name; the note would point at it.
+                self._warned_read_tool = True
+                message = (
+                    f"agent '{self.agent_id}' has its own tool named '{READ_TOOL_NAME}', so "
+                    f"the spill reader was not registered; omission notes point at that tool"
+                )
+                _log.warning(message)
+                self.spill_store.warn(message)
         return result.text
 
-    def _tool_text(self, result: Any) -> str:
+    def _tool_text(self, result: Any, tool_name: str = "") -> str:
+        # Pages read back are already bounded by the store's read limit. Shortening
+        # them again would hand the model a new preview instead of what it asked for.
+        if tool_name == READ_TOOL_NAME and self._owns_read_tool():
+            return str(result)
         return self._show(str(result), self.TOOL_RESULT_PREVIEW_CHARS)
 
     def set_llm(self, llm: Any):
@@ -381,7 +430,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                 else:
                     try:
                         result = tool_fn(**tool_args)
-                        results.append({"tool": tool_name, "result": self._tool_text(result)})
+                        results.append({"tool": tool_name, "result": self._tool_text(result, tool_name)})
                     except Exception as e:
                         results.append({"tool": tool_name, "error": str(e)})
             else:
@@ -391,7 +440,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         for tool_name, task in tasks:
             try:
                 result = await task
-                results.append({"tool": tool_name, "result": self._tool_text(result)})
+                results.append({"tool": tool_name, "result": self._tool_text(result, tool_name)})
             except Exception as e:
                 results.append({"tool": tool_name, "error": str(e)})
 
@@ -404,7 +453,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         for name, fn in self._tools.items():
             doc = inspect.getdoc(fn) or "No description available."
             sig = inspect.signature(fn)
-            lines.append(f"  {name}{sig}: {doc[:200]}")
+            lines.append(f"  {name}{sig}: {_cut(doc, 200)}")
         return "\n".join(lines)
 
     def _get_tool_schemas(self) -> list[dict]:
@@ -436,7 +485,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                     required.append(pname)
             schemas.append({
                 "name": name,
-                "description": doc[:300],
+                "description": _cut(doc, 300),
                 "parameters": {
                     "type": "object",
                     "properties": params,
@@ -481,7 +530,7 @@ def aria_agent(
     def decorator(func: Callable) -> Callable:
         _agent_id = agent_id or func.__name__
         doc = inspect.getdoc(func) or ""
-        all_capabilities = capabilities + ([doc[:100]] if doc else [])
+        all_capabilities = capabilities + ([_cut(doc, 100)] if doc else [])
 
         class FunctionalAgent(BaseAgent):
             def __init__(self):

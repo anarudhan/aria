@@ -153,9 +153,10 @@ PermissionEngine
 │   Each grant has: grant_id, user_id, capability, scope,
 │                   expires_at, max_uses, uses_so_far
 │
-├── _audit: list[AuditEvent]                    # Append-only, hash-chained
-│   Each event has: timestamp, user_id, capability, scope,
-│                   action (granted/denied/revoked), hash_chain
+├── _audit: list[AuditEntry]                    # Append-only, hash-chained, in memory
+│   Each entry has: entry_id, timestamp, user_id, capability, scope,
+│                   action, reason, agent_id, task_id, call_id, stage,
+│                   detail, args_digest, prev_hash, entry_hash
 │
 └── check(user_id, capability, scope) → bool
     Iterates active grants for user_id.
@@ -187,7 +188,43 @@ How grants keep one meaning:
 Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.
 ```
 
-The hash chain in audit events links each event to the previous one via SHA256. This makes the audit trail tamper-evident — if anyone modifies an old event, all subsequent hashes become invalid.
+Grants, checks, denials, revokes and the events added with `record_audit()` all go into one hash chain. Each entry stores the previous entry's hash (`prev_hash`; `genesis` for the first) and its own (`entry_hash`). What that gives you, and what it does not:
+
+**What is covered**
+
+- The hash is the full SHA256 digest (64 hex characters) of every field of the entry except `entry_hash` itself: `entry_id`, `timestamp`, `user_id`, `capability`, `scope`, `action`, `reason`, `agent_id`, `task_id`, `call_id`, `stage`, `detail`, `args_digest` and `prev_hash`. The fields are encoded as canonical JSON (non-ASCII text written as is) and turned into bytes with UTF-8 and `surrogatepass`, so one field cannot run into the next and two different strings never give the same bytes. That includes one emoji versus the two lone surrogates it would be made of when joined. The hash of an entry with non-ASCII text differs from the one an earlier version computed; nothing is saved to disk, so that only matters inside one process. A test goes through `dataclasses.fields(AuditEntry)` so a field added later cannot be left out of the hash.
+- `PermissionEngine.verify_chain()` walks the chain and returns a `ChainReport` (`ok`, `checked`, `first_bad_index`, `reason`). It checks that every `prev_hash` matches the entry before it, that every stored `entry_hash` matches a fresh hash of the entry, and that the last entry's hash matches the engine's own head hash. It does not trust the objects it checks: every entry must be exactly an `AuditEntry` (not a subclass, which could override `compute_hash()`), the hash is computed by `AuditEntry.compute_hash()` itself, and `entry_hash`, `prev_hash` and the head must be exactly `str` (a `str` subclass could claim to equal anything). A malformed entry gives `ok=False` with a reason that names the problem and holds no values; it does not raise.
+- That detects an edit to any field of any entry, reordering, inserting, duplicating and removing entries, and removing entries from the end (the head hash no longer matches).
+- `record_audit()` is the public way to add an event. It validates its arguments and caps `detail` at 8 KiB. It does **not** redact: the caller must remove secrets first.
+- Adding to the chain is guarded by a lock, so threads cannot fork it.
+
+**What is still not guaranteed**
+
+- The chain and the head hash live in process memory and are not anchored anywhere. Anyone who can change process memory can edit entries, recompute every hash and the head value, and `verify_chain()` will then report ok. It catches accidents and edits that leave the head alone, not a determined attacker inside the process.
+- The audit list is not saved with the grants, so it is gone after a restart. Saving it, and anchoring it, is follow-up issue #68.
+- `verify_chain()` only helps if something calls it. Nothing calls it automatically yet.
+- The chain gives integrity, not authenticity. `record_audit()` is public and does not check who calls it or what it claims. Any code in the process can write an event that looks like an engine decision (for example action `allowed` with reason `Grant x (uses=1)`), and can write into another user's trail by passing that `user_id`. Such an entry is a valid link in the chain. Nothing in `aria/` reads the audit trail to make a decision today; keep it that way, and treat the trail as a record to read, not as proof of what the engine decided.
+- Do not call the engine from signal handlers, `__del__` methods or garbage-collection callbacks. Appending to the chain holds a plain (non-re-entrant) lock. If a handler or finalizer runs on the thread that is already inside an append and calls `check()`, `grant()`, `revoke()` or `record_audit()`, that call waits for the lock forever and the thread hangs. The lock is deliberately not re-entrant: a nested append would fork the chain.
+
+### What is and is not enforced today
+
+The permission engine answers questions and denies by default. It does not stop code that never asks.
+
+| Place | Asks the permission engine? |
+|---|---|
+| Orchestrator, for `required_capabilities` passed by the caller | Yes |
+| Orchestrator, memory writes | Yes (`MEMORY_WRITE`) |
+| Web agent, search and browse | Yes (`WEB_SEARCH`, `WEB_BROWSE`, with scope `*` only) |
+| Improvement engine, spawning and loading a synthesized agent | Yes (`AGENT_SPAWN`, `CODE_EXECUTE`) |
+| Patcher, applying a patch | Yes (`SELF_MODIFY`, with the vulnerability id as scope) |
+| `LLMAgent` tool calls | **No** |
+| `@aria_agent` and `BaseAgent.execute` bodies, other than the web agent | **No** |
+| Patcher `rollback` and `rollback_all` | **No** |
+| LLM provider calls (task data leaves the machine) | **No** |
+| State files (memory, trust, permissions) | **No** |
+| Running a synthesized agent after it was loaded | **No**, and it runs inside the ARIA process |
+
+The guarded execution pipeline (issue #42, design in `docs/design/0042-guarded-pipeline.md`) is the planned fix for tool calls. Until it lands, code you write that calls tools or touches files must ask the engine itself.
 
 ---
 
@@ -276,6 +313,12 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 
 ---
 
+## LLM retry policy
+
+`AnthropicPlugin` and `OpenAIPlugin` send every call through `call_with_retry` in `aria/plugins/retry.py`. Temporary failures (rate limit, server error, timeout, dropped connection, empty answer) are retried with exponential backoff, a cap and jitter. A wrong key or a bad request is never retried. A retry-after value from the provider is respected up to the cap, and cancellation is never swallowed. When the retries run out the caller gets an `LLMError` that carries the failure code, the attempt count and the original error. Error text kept in the records is redacted for common secret shapes and cut to 500 characters, on a best-effort basis; the original exception stays on `LLMError.cause` unredacted, so log `str(err)` and `err.code`, not the traceback. Every attempt is recorded and counted, so `retry_stats()` and `describe()` on a plugin can feed the health report and no failure is hidden. The module uses only the standard library. Full details are in `docs/llm-retry.md`.
+
+---
+
 ## Security model
 
 **What ARIA cannot do by default:**
@@ -303,3 +346,9 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 - `security/patcher.py`
 
 These files are excluded from the self-patcher's auto-patch list. Any changes to them require manual human review and application. This prevents a compromised patch from disabling the permission system or falsifying scan results.
+
+---
+
+## Spill store: large output is kept, never silently cut
+
+Long tool and agent output is saved in full by `SpillStore` (`aria/core/spill.py`). The model sees the head and tail, a marker that says how many characters were left out, and an opaque id. The `read_spilled` tool returns more on request. Files are private (folder 0700, files 0600, created exclusively), ids cannot be turned into paths, and if saving fails the full text stays inline with a warning. Old files are removed after a retention period. Spill files from an earlier run are not readable after a restart, because ids are only valid in the process that issued them. Where text must be shortened and cannot be spilled (tool descriptions, web search snippets), the cut is marked with the number of characters omitted. Pages read back with `read_spilled` are never shortened again, locators are bound to the agent that spilled the item, the number and total size of spill files are bounded (oldest evicted first), and shortened previews start with an untrusted-data notice. Details are in `docs/spill.md`.

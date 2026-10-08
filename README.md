@@ -4,7 +4,7 @@
 
 ARIA is a production-grade Python framework for building multi-agent AI systems that are genuinely trustworthy. It is not a wrapper around another AI framework. It is built from scratch with four principles that most agent frameworks completely ignore.
 
-**Zero trust by default.** ARIA cannot read your email, browse the web, write files, or do anything else until you explicitly grant it permission. Every permission has an expiry time and a use limit. There are no hidden capabilities.
+**Zero trust by default.** ARIA's permission engine denies by default. Nothing is allowed until you explicitly grant it, and every grant has an expiry time and an optional use limit. The engine answers permission questions. Parts of ARIA that ask it today (the orchestrator, the web agent, self improvement and self patching) are gated. Code that never asks, such as a tool you write yourself, is not stopped by it. Enforcing the check on every tool call is the next planned piece of work (see "What is and is not enforced today" in `docs/architecture.md`).
 
 **Self-awareness.** ARIA knows what it is, what it can and cannot do, and reports its own health and vulnerabilities honestly including the unflattering ones. It hashes its own source files at startup and detects any unexpected changes.
 
@@ -20,7 +20,7 @@ Most agent frameworks give you a way to chain LLM calls. ARIA gives you a system
 
 | Feature | ARIA | Most frameworks |
 |---|---|---|
-| Zero trust permissions | Built in, default deny | Not present |
+| Zero trust permissions | Built in, default deny (enforcement at tool call time is planned) | Not present |
 | Self security scanning | Yes, reads its own code | Not present |
 | Self patching | Yes, with rollback | Not present |
 | Learning from mistakes | Yes, 3 learning layers | Not present |
@@ -139,7 +139,7 @@ asyncio.run(main())
 
 ### `aria/permissions/engine.py` — Zero Trust Permission Engine
 
-Every capability ARIA has is gated by an explicit user grant. The engine uses a default deny model. If a permission has not been granted, the action fails immediately before any LLM call is even made.
+The engine uses a default deny model: if a permission has not been granted, a check for it fails. The parts of ARIA that ask the engine (see "What is and is not enforced today" in `docs/architecture.md`) stop before the action, and for the web agent that is before any network call. The engine cannot stop code that does not ask it.
 
 ```python
 # Grant a permission with expiry and optional use limit
@@ -154,7 +154,7 @@ aria.permissions.require("user_id", Capability.WEB_BROWSE, scope="https://exampl
 # Revoke all permissions for a user
 aria.permissions.revoke_all("user_id")
 
-# See the audit trail (append-only, hash-chained)
+# See the audit trail (hash-chained and tamper evident in memory against accidental or in-process edits, not saved or anchored, see issue #68 and docs/architecture.md)
 trail = aria.permissions.get_audit_trail("user_id")
 ```
 
