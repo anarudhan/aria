@@ -303,8 +303,12 @@ def _fold_table(chars: "set[str]") -> _FoldContext:
             if folded != char:
                 context.table[ord(char)] = folded
                 context.changed.add(char)
-    context.hidden |= hidden
-    context.known |= fresh
+    if context.known:
+        context.hidden |= hidden
+        context.known |= fresh
+    else:                                           # the first text of a call: no copying
+        context.hidden = hidden
+        context.known = fresh
     return context
 
 
