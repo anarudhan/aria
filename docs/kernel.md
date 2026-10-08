@@ -320,8 +320,21 @@ effects. A `once` listener that has fired no longer takes up space in the scope.
      is the one that returns early: either at once, if it would close a ring, or
      later, when the parent's wait for a child closes the ring. For a ring through
      a child, that is the call the child's undo makes on its parent.
-   - Every undo still runs exactly once, and nothing hangs because of the
-     bookkeeping.
+   - A ring can close through more than one path (for example the child's undo
+     waits for its parent directly and also through a third scope). The parent's
+     wait for a child is therefore followed by a search that keeps cutting short
+     outside waits until no path leads from the child back to the parent. Each
+     round cuts a wait that was not cut before, and any path from a child up to
+     its parent has to contain an outside wait (a parent's wait for a child only
+     ever points down the tree), so the search ends and the ring is open.
+   - What is guaranteed: a ring made of waits that go through `dispose()` calls
+     (directly, or through helper tasks) cannot make the scopes hang, because
+     the bookkeeping always opens it at an outside wait; a parent never runs
+     its own undos before its children have finished; and every undo runs
+     exactly once. What is not guaranteed: that an outside `dispose()` call
+     waits. It can return early, also when the ring was not real (next
+     paragraph). A hang caused by something else, for example an undo that waits
+     forever on a gate of its own, is still a hang.
 
    **This can return early without a real ring.** Every task that an undo starts
    (helper tasks and also fire-and-forget background tasks) inherits the marker
