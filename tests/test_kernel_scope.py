@@ -1733,8 +1733,18 @@ async def test_failed_setup_with_a_hanging_effect_does_not_hang() -> None:
         sc.effect(hang)
         raise RuntimeError("setup failed")
 
-    await asyncio.wait_for(s.start(setup), 5)  # 5 s is only a hang guard
+    unraisable: List[Any] = []
+    old_hook = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            await asyncio.wait_for(s.start(setup), 5)  # 5 s is only a hang guard
+            gc.collect()
+    finally:
+        sys.unraisablehook = old_hook
     assert s.state is ScopeState.FAILED and len(s.errors) == 1
+    assert unraisable == []  # the never-started effect coroutine was closed, not leaked
 
 
 # ----------------------------------------------------------------------
@@ -1775,6 +1785,9 @@ async def test_unawaited_remover_of_a_resolving_effect_does_not_leak() -> None:
     d = asyncio.ensure_future(s.dispose())
     await turns()
     assert not d.done()  # dispose waits for the remover's work
+    unwind = s._task
+    await turns(20)
+    assert s._task is unwind  # it waits quietly, it does not start unwind pass after pass
     gate.set()
     await d
     assert log == ["undone"]
@@ -2167,6 +2180,34 @@ async def test_failed_setup_unwind_refuses_new_registrations() -> None:
     await s.start(setup)
     assert s.state is ScopeState.FAILED and s.effect_count == 0
     assert any(isinstance(e.exception, ScopeDisposedError) for e in s.errors)
+
+
+async def test_cancelling_the_unwind_still_waits_for_a_child_scope_to_finish() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    root = Scope(name="root")
+    root.effect(rec(log, "root-effect"))
+    kid = root.child("kid")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            log.append("kid-undo")
+
+        return undo
+
+    kid.effect(effect)
+    d = asyncio.ensure_future(root.dispose())
+    await turns()
+    assert root._task is not None
+    root._task.cancel()
+    await turns()
+    assert log == []  # the parent's own effect must not run before the child is done
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await d
+    assert log == ["kid-undo", "root-effect"]
+    assert root.disposed and kid.disposed
 
 
 async def test_dispose_requested_during_restart_wins() -> None:
