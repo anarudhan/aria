@@ -309,3 +309,9 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 - `security/patcher.py`
 
 These files are excluded from the self-patcher's auto-patch list. Any changes to them require manual human review and application. This prevents a compromised patch from disabling the permission system or falsifying scan results.
+
+---
+
+## Spill store: large output is kept, never silently cut
+
+Long tool and agent output is saved in full by `SpillStore` (`aria/core/spill.py`). The model sees the head and tail, a marker that says how many characters were left out, and an opaque id. The `read_spilled` tool returns more on request. Files are private (folder 0700, files 0600, created exclusively), ids cannot be turned into paths, and if saving fails the full text stays inline with a warning. Old files are removed after a retention period. Spill files from an earlier run are not readable after a restart, because ids are only valid in the process that issued them. Where text must be shortened and cannot be spilled (tool descriptions, web search snippets), the cut is marked with the number of characters omitted. Pages read back with `read_spilled` are never shortened again, locators are bound to the agent that spilled the item, the number and total size of spill files are bounded (oldest evicted first), and shortened previews start with an untrusted-data notice. Details are in `docs/spill.md`.
