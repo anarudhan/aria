@@ -23,10 +23,13 @@ from __future__ import annotations
 import inspect
 import math
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Union
 
 from aria.permissions.engine import RISK_LEVEL, Capability
+
+from .freeze import FrozenArgs, FrozenMap
 
 __all__ = [
     "APPROVAL_MODES",
@@ -38,9 +41,11 @@ __all__ = [
     "Need",
     "ToolSpec",
     "ToolSpecError",
+    "validate_tool_name",
 ]
 
-TOOL_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$"
+# \Z, not $: "$" also matches before a trailing newline, so "abc\n" would pass re.match.
+TOOL_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.\-]{0,63}\Z"
 _TOOL_NAME_RE = re.compile(TOOL_NAME_PATTERN)
 
 APPROVAL_MODES = ("auto", "always")
@@ -71,6 +76,37 @@ def _type_name(value: object) -> str:
     return type(value).__name__
 
 
+def validate_tool_name(name: object) -> str:
+    """Return ``name`` if it is a valid tool name, else raise ToolSpecError."""
+    if type(name) is not str:
+        raise ToolSpecError(f"tool name must be a str, got {_type_name(name)}")
+    if _TOOL_NAME_RE.fullmatch(name) is None:
+        raise ToolSpecError(
+            f"tool name {name[:70]!r} is not valid. Use 1 to 64 characters "
+            "from A-Z a-z 0-9 _ . - and start with a letter or underscore "
+            f"(pattern {TOOL_NAME_PATTERN})"
+        )
+    return name
+
+
+# Only the registry may create a spec with internal=True (see _build_spec).
+_internal_gate = threading.local()
+
+
+def _build_spec(internal: object, **fields: Any) -> ToolSpec:
+    """Registry-private constructor that can set ``internal=True``.
+
+    User code cannot declare a tool internal; ``ToolSpec(internal=True)`` raises.
+    This is a guard against mistakes, not against code in the same process."""
+    if internal is not True:
+        return ToolSpec(internal=internal, **fields)  # type: ignore[arg-type]
+    _internal_gate.on = True
+    try:
+        return ToolSpec(internal=True, **fields)
+    finally:
+        _internal_gate.on = False
+
+
 def _check_scope_text(value: str, label: str) -> None:
     if not value or not value.strip():
         raise ToolSpecError(f"{label} must not be empty")
@@ -90,7 +126,14 @@ class Need:
     other. Setting both raises ``ToolSpecError``.
 
     The resolved scope is only a string here. Whether it is a safe path, URL
-    or id is decided by ``aria.permissions.scope`` in the pipeline stage.
+    or id is decided by ``aria.permissions.scope`` in the pipeline stage (it
+    must call ``canonical_scope`` on every resolved scope; this layer only
+    checks that the text is non-empty and at most 4096 characters).
+
+    A ``scope_from`` callable must be pure, fast and deterministic. It is not
+    copied (the spec holds the same object), not timed and not sandboxed. The
+    pipeline must resolve each Need exactly once per call and pass that same
+    string through every later stage; it must never call the callable again.
     """
 
     capability: Capability
@@ -132,9 +175,11 @@ class Need:
 
     def resolve_scope(self, arguments: Mapping[str, Any]) -> str:
         """
-        Return the scope for a call with these (frozen) arguments.
+        Return the scope for a call with these frozen arguments.
 
-        Raises ``ToolSpecError`` when the named argument is missing, is not a
+        ``arguments`` must be the ``FrozenArgs`` (or ``FrozenMap``) built by
+        ``freeze_args``. A plain dict is refused, because a callable could
+        change it. Raises ``ToolSpecError`` when the named argument is missing, is not a
         str, is empty, or when the callable raises or returns a non-str or an
         empty str. THE CALLER MUST DENY THE CALL ON ToolSpecError. Messages
         carry argument names and type names, never argument values.
@@ -142,9 +187,10 @@ class Need:
         source = self.scope_from
         if source is None:
             return self.scope
-        if not isinstance(arguments, Mapping):
+        if type(arguments) is not FrozenArgs and type(arguments) is not FrozenMap:
             raise ToolSpecError(
-                f"cannot resolve scope: arguments must be a mapping, got {_type_name(arguments)}"
+                "cannot resolve scope: arguments must be the FrozenArgs from freeze_args, "
+                f"got {_type_name(arguments)}"
             )
         value: Any
         if isinstance(source, str):
@@ -193,6 +239,12 @@ class ToolSpec:
     ``internal=True``: a tool that touches the outside world must say what it
     needs. ``timeout_s`` is a finite number above 0 and at most 300.
     ``approval`` is ``"auto"`` or ``"always"`` (a human approves every call).
+
+    ``internal`` cannot be set by user code: ``ToolSpec(internal=True)`` raises.
+    The registry sets it for the names it was given in ``internal_names``.
+    INTERNAL IS NOT A PERMISSION EXEMPTION. It only says the tool is part of
+    the framework itself (for example the spill read-back). A pipeline must
+    never treat it as authority to skip a permission check.
     """
 
     name: str
@@ -207,14 +259,7 @@ class ToolSpec:
         raise TypeError("ToolSpec cannot be subclassed")
 
     def __post_init__(self) -> None:
-        if not _is_exact_str(self.name):
-            raise ToolSpecError(f"ToolSpec.name must be a str, got {_type_name(self.name)}")
-        if _TOOL_NAME_RE.fullmatch(self.name) is None:
-            raise ToolSpecError(
-                f"ToolSpec.name {self.name[:70]!r} is not valid. Use 1 to 64 characters "
-                "from A-Z a-z 0-9 _ . - and start with a letter or underscore "
-                f"(pattern {TOOL_NAME_PATTERN})"
-            )
+        validate_tool_name(self.name)
 
         if type(self.needs) is not tuple:
             raise ToolSpecError(f"ToolSpec.needs must be a tuple, got {_type_name(self.needs)}")
@@ -233,6 +278,11 @@ class ToolSpec:
         if type(self.concurrency_safe) is not bool:
             raise ToolSpecError(
                 f"ToolSpec.concurrency_safe must be a bool, got {_type_name(self.concurrency_safe)}"
+            )
+        if self.internal and not getattr(_internal_gate, "on", False):
+            raise ToolSpecError(
+                "a tool cannot declare itself internal. Internal status is granted only by "
+                "the registry (ToolRegistry(internal_names=...)) and is not a permission exemption"
             )
         if not self.needs and not self.internal:
             raise ToolSpecError(

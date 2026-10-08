@@ -78,11 +78,53 @@ class TestRegisterDeclared:
         reg.register(A().remember)
         assert reg.spec("remember").needs[0].capability is C.MEMORY_WRITE
 
-    def test_internal_tool(self):
-        reg = ToolRegistry()
-        reg.register(plain, ToolSpec(name="read_spilled", needs=(), internal=True))
-        assert reg.spec("read_spilled").internal is True
+    def test_internal_tool_is_granted_by_the_registry(self):
+        reg = ToolRegistry(internal_names=frozenset({"read_spilled"}))
+        spec = ToolSpec(name="read_spilled", needs=(Need(C.FILE_READ),))
+        stored = reg.register(plain, spec, name="read_spilled")
+        assert stored.internal is True and reg.spec("read_spilled").internal is True
+        assert spec.internal is False  # the caller's spec is untouched
         assert reg.undeclared() == []
+        assert reg.spec("read_spilled").risk == "low"  # internal does not change risk
+
+    def test_other_names_are_not_internal(self):
+        reg = ToolRegistry(internal_names=frozenset({"read_spilled"}))
+        reg.register(plain, ToolSpec(name="other", needs=(Need(C.FILE_READ),)))
+        assert reg.spec("other").internal is False
+
+    def test_internal_name_registered_without_spec_stays_undeclared(self):
+        reg = ToolRegistry(internal_names=frozenset({"plain"}))
+        assert reg.register(plain) is None
+        assert reg.undeclared() == ["plain"] and reg.spec("plain") is None
+        assert reg.describe()[0]["declared"] is False
+
+    def test_internal_spec_copies_stay_internal_and_distinct(self):
+        reg = ToolRegistry(internal_names=frozenset({"t"}))
+        reg.register(plain, ToolSpec(name="t", needs=(Need(C.FILE_READ),)))
+        a, b = reg.spec("t"), reg.spec("t")
+        assert a.internal and b.internal and a is not b
+        assert reg.describe()[0]["internal"] is True
+
+    def test_a_spec_that_claims_internal_is_refused(self):
+        spec = ToolSpec(name="t", needs=(Need(C.FILE_READ),))
+        object.__setattr__(spec, "internal", True)  # tampering
+        with pytest.raises(ToolSpecError, match="internal"):
+            ToolRegistry().register(plain, spec)
+        with pytest.raises(ToolSpecError, match="internal"):
+            ToolRegistry(internal_names=frozenset({"t"})).register(plain, spec)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [["a"], {"a"}, ("a",), "abc", {"a": 1}, 5, frozenset({"bad name"}), frozenset({1}),
+         frozenset({"a\n"}), frozenset({""})],
+    )
+    def test_internal_names_are_validated(self, bad):
+        with pytest.raises(ToolSpecError):
+            ToolRegistry(internal_names=bad)
+
+    def test_internal_names_default_empty(self):
+        assert ToolRegistry()._internal_names == frozenset()
+        assert ToolRegistry(internal_names=frozenset({"t"}))._internal_names == frozenset({"t"})
 
 
 class TestUndeclared:
@@ -171,7 +213,7 @@ class TestRejections:
 
         setattr(f, SPEC_ATTRIBUTE, {"name": "f", "needs": []})
         reg = ToolRegistry()
-        with pytest.raises(ToolSpecError, match="expected a ToolSpec"):
+        with pytest.raises(ToolSpecError, match="does not own"):
             reg.register(f)
         assert "f" not in reg
 
@@ -264,7 +306,7 @@ class TestCopySemantics:
 
 class TestDescribe:
     def test_json_safe_and_complete(self):
-        reg = ToolRegistry()
+        reg = ToolRegistry(internal_names=frozenset({"spill"}))
         reg.register(
             plain,
             ToolSpec(
@@ -277,7 +319,7 @@ class TestDescribe:
             ),
         )
         reg.register(lambda: 0, name="mystery")
-        reg.register(plain, ToolSpec(name="spill", needs=(), internal=True), name="spill")
+        reg.register(plain, ToolSpec(name="spill", needs=(Need(C.FILE_READ),)))
         out = json.loads(json.dumps(reg.describe()))
         assert [d["name"] for d in out] == ["mail", "mystery", "spill"]
         mail = out[0]
@@ -295,6 +337,7 @@ class TestDescribe:
         assert out[1]["declared"] is False and out[1]["risk"] == "unknown"
         assert out[1]["needs"] == []
         assert out[2]["internal"] is True and out[2]["risk"] == "low"
+        assert out[0]["internal"] is False
 
     def test_empty_registry(self):
         assert ToolRegistry().describe() == []
@@ -307,3 +350,220 @@ class TestDescribe:
             reg.register(plain, name=n)
         assert reg.names() == ["zeta", "alpha", "mid"]
         assert reg.undeclared() == ["zeta", "alpha", "mid"]
+
+
+class TestOwnership:
+    """A spec belongs to the object it was declared on (functools.wraps cannot copy that)."""
+
+    def test_wraps_wrapper_is_refused(self):
+        @tool(C.FILE_READ, name="narrow")
+        def inner(x):
+            return x
+
+        @functools.wraps(inner)
+        def wrapper(x):
+            return inner(x) + "!"  # may do more than inner declared
+
+        reg = ToolRegistry()
+        with pytest.raises(ToolSpecError, match="wrapper or subclass must declare its own needs"):
+            reg.register(wrapper)
+        assert len(reg) == 0
+        # the original still registers
+        reg.register(inner)
+        assert reg.names() == ["narrow"]
+
+    def test_wraps_wrapper_with_its_own_decoration_gets_its_own_needs(self):
+        @tool(C.FILE_READ, name="narrow")
+        def inner(x):
+            return x
+
+        @tool(C.NETWORK, C.FILE_WRITE, name="wide")
+        @functools.wraps(inner)
+        def wrapper(x):
+            return inner(x)
+
+        reg = ToolRegistry()
+        reg.register(wrapper)
+        assert [n.capability for n in reg.spec("wide").needs] == [C.NETWORK, C.FILE_WRITE]
+
+    def test_wraps_wrapper_with_explicit_spec_is_fine(self):
+        @tool(C.FILE_READ, name="narrow")
+        def inner(x):
+            return x
+
+        @functools.wraps(inner)
+        def wrapper(x):
+            return inner(x)
+
+        reg = ToolRegistry()
+        reg.register(wrapper, ToolSpec(name="mine", needs=(Need(C.NETWORK),)))
+        assert reg.spec("mine").needs[0].capability is C.NETWORK
+
+    def test_wrapper_registered_with_a_name_kwarg_is_still_refused(self):
+        @tool(C.FILE_READ)
+        def inner():
+            pass
+
+        @functools.wraps(inner)
+        def wrapper():
+            pass
+
+        with pytest.raises(ToolSpecError):
+            ToolRegistry().register(wrapper, name="other")
+
+    def test_class_subclass_inherits_but_does_not_own(self):
+        @tool(C.FILE_READ, name="base")
+        class Base:
+            def __call__(self):
+                return "base"
+
+        class Child(Base):
+            def __call__(self):
+                return "child does more"
+
+        reg = ToolRegistry()
+        with pytest.raises(ToolSpecError, match="its own needs"):
+            reg.register(Child())
+        with pytest.raises(ToolSpecError, match="its own needs"):
+            reg.register(Child, name="child_class")
+        assert len(reg) == 0
+
+    def test_decorated_subclass_is_fine(self):
+        @tool(C.FILE_READ, name="base")
+        class Base:
+            def __call__(self):
+                return "base"
+
+        @tool(C.NETWORK, name="child")
+        class Child(Base):
+            def __call__(self):
+                return "child"
+
+        reg = ToolRegistry()
+        reg.register(Child())
+        assert reg.spec("child").needs[0].capability is C.NETWORK
+        assert reg.get("child")() == "child"
+
+    def test_instance_of_a_decorated_class(self):
+        @tool(C.MEMORY_WRITE, name="memo")
+        class Memo:
+            def __call__(self, k):
+                return k
+
+        reg = ToolRegistry()
+        inst = Memo()
+        reg.register(inst)
+        assert reg.spec("memo").needs[0].capability is C.MEMORY_WRITE
+        assert reg.get("memo") is inst
+
+    def test_instance_of_a_decorated_class_registered_twice_needs_distinct_names(self):
+        @tool(C.MEMORY_WRITE, name="memo")
+        class Memo:
+            def __call__(self):
+                pass
+
+        reg = ToolRegistry()
+        reg.register(Memo())
+        with pytest.raises(ToolSpecError, match="already registered"):
+            reg.register(Memo())
+        reg.register(Memo(), name="memo2")
+        assert reg.spec("memo2").name == "memo2"
+
+    def test_bound_method_of_a_decorated_function(self):
+        class A:
+            @tool(C.FILE_READ, name="a.read")
+            def read(self):
+                return 1
+
+        reg = ToolRegistry()
+        reg.register(A().read)
+        assert reg.spec("a.read").needs[0].capability is C.FILE_READ
+
+    def test_bound_method_of_an_undecorated_method_is_undeclared(self):
+        class A:
+            def read(self):
+                return 1
+
+        reg = ToolRegistry()
+        reg.register(A().read)
+        assert reg.undeclared() == ["read"]
+
+    def test_overridden_method_in_subclass_is_not_declared(self):
+        class A:
+            @tool(C.FILE_READ, name="a.read")
+            def read(self):
+                return 1
+
+        class B(A):
+            def read(self):  # a new function: no attribute, not declared
+                return 2
+
+        reg = ToolRegistry()
+        reg.register(B().read)
+        assert reg.undeclared() == ["read"]
+
+    def test_classmethod_and_staticmethod(self):
+        class A:
+            @classmethod
+            @tool(C.FILE_READ, name="a.cm")
+            def cm(cls):
+                return cls
+
+            @staticmethod
+            @tool(C.NETWORK, name="a.sm")
+            def sm():
+                return 1
+
+        reg = ToolRegistry()
+        reg.register(A.cm)
+        reg.register(A.sm)
+        assert reg.spec("a.cm").needs[0].capability is C.FILE_READ
+        assert reg.spec("a.sm").needs[0].capability is C.NETWORK
+        assert reg.get("a.cm")() is A
+
+    def test_hand_set_attribute_is_refused(self):
+        def f():
+            pass
+
+        setattr(f, SPEC_ATTRIBUTE, ToolSpec(name="f", needs=(Need(C.FILE_READ),)))
+        with pytest.raises(ToolSpecError, match="does not own"):
+            ToolRegistry().register(f)
+
+    def test_attribute_replaced_after_decoration_is_refused(self):
+        @tool(C.FILE_READ)
+        def f():
+            pass
+
+        setattr(f, SPEC_ATTRIBUTE, ToolSpec(name="f", needs=(Need(C.SELF_MODIFY),)))
+        with pytest.raises(ToolSpecError, match="replaced"):
+            ToolRegistry().register(f)
+
+    def test_attribute_removed_after_decoration_is_refused(self):
+        @tool(C.FILE_READ)
+        def f():
+            pass
+
+        delattr(f, SPEC_ATTRIBUTE)
+        with pytest.raises(ToolSpecError, match="removed"):
+            ToolRegistry().register(f)
+
+    def test_copied_dict_cannot_carry_ownership(self):
+        @tool(C.FILE_READ)
+        def f():
+            pass
+
+        def g():
+            pass
+
+        g.__dict__.update(f.__dict__)
+        with pytest.raises(ToolSpecError, match="does not own"):
+            ToolRegistry().register(g)
+
+    def test_functools_partial_of_a_declared_tool_is_undeclared(self):
+        @tool(C.FILE_READ)
+        def f(x):
+            return x
+
+        reg = ToolRegistry()
+        reg.register(functools.partial(f, 1), name="p")
+        assert reg.undeclared() == ["p"]

@@ -38,14 +38,14 @@ class TestNew:
     def test_defaults_to_wildcard(self):
         n = Need(C.FILE_READ)
         assert n.scope == "*" and n.scope_from is None
-        assert n.resolve_scope({}) == "*"
+        assert n.resolve_scope(freeze_args({})) == "*"
 
     def test_fixed_scope(self):
-        assert Need(C.FILE_READ, scope="/tmp/x").resolve_scope({"a": 1}) == "/tmp/x"
+        assert Need(C.FILE_READ, scope="/tmp/x").resolve_scope(freeze_args({"a": 1})) == "/tmp/x"
 
     def test_scope_from_argument_name(self):
         n = Need(C.WEB_BROWSE, scope_from="url")
-        assert n.resolve_scope({"url": "https://example.com/a"}) == "https://example.com/a"
+        assert n.resolve_scope(freeze_args({"url": "https://example.com/a"})) == "https://example.com/a"
 
     def test_scope_from_frozen_arguments(self):
         n = Need(C.WEB_BROWSE, scope_from="url")
@@ -53,7 +53,7 @@ class TestNew:
 
     def test_scope_from_callable(self):
         n = Need(C.FILE_READ, scope_from=lambda a: a["dir"] + "/" + a["file"])
-        assert n.resolve_scope({"dir": "/d", "file": "f"}) == "/d/f"
+        assert n.resolve_scope(freeze_args({"dir": "/d", "file": "f"})) == "/d/f"
 
     def test_both_fixed_and_scope_from_rejected(self):
         with pytest.raises(ToolSpecError):
@@ -105,35 +105,35 @@ class TestNew:
 class TestResolveScopeFailsClosed:
     def test_missing_argument(self):
         with pytest.raises(ToolSpecError, match="missing"):
-            Need(C.FILE_READ, scope_from="path").resolve_scope({})
+            Need(C.FILE_READ, scope_from="path").resolve_scope(freeze_args({}))
 
-    @pytest.mark.parametrize("value", [None, 3, 1.5, b"/x", ["/x"], {"a": 1}, True, ("a",)])
+    @pytest.mark.parametrize("value", [None, 3, 1.5, ["/x"], {"a": 1}, True, ("a",)])
     def test_non_string_value(self, value):
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from="path").resolve_scope({"path": value})
+            Need(C.FILE_READ, scope_from="path").resolve_scope(freeze_args({"path": value}))
 
     @pytest.mark.parametrize("value", ["", "   ", "\n"])
     def test_empty_value(self, value):
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from="path").resolve_scope({"path": value})
+            Need(C.FILE_READ, scope_from="path").resolve_scope(freeze_args({"path": value}))
 
     def test_overlong_value(self):
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from="path").resolve_scope({"path": "x" * 5000})
+            Need(C.FILE_READ, scope_from="path").resolve_scope(freeze_args({"path": "x" * 5000}))
 
     def test_str_subclass_value_rejected(self):
         class S(str):
             pass
 
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from="path").resolve_scope({"path": S("/x")})
+            Need(C.FILE_READ, scope_from=lambda a: S("/x")).resolve_scope(freeze_args({}))
 
     def test_callable_raises(self):
         def boom(a):
             raise RuntimeError("secret-token-123")
 
         with pytest.raises(ToolSpecError) as info:
-            Need(C.FILE_READ, scope_from=boom).resolve_scope({"a": 1})
+            Need(C.FILE_READ, scope_from=boom).resolve_scope(freeze_args({"a": 1}))
         # The callable's message is not copied; only its type.
         assert "secret-token-123" not in str(info.value)
         assert "RuntimeError" in str(info.value)
@@ -141,7 +141,7 @@ class TestResolveScopeFailsClosed:
     @pytest.mark.parametrize("result", [None, 5, b"x", ["x"], ""])
     def test_callable_returns_bad_value(self, result):
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from=lambda a: result).resolve_scope({})
+            Need(C.FILE_READ, scope_from=lambda a: result).resolve_scope(freeze_args({}))
 
     def test_callable_returning_coroutine_is_closed(self):
         async def co():
@@ -149,15 +149,57 @@ class TestResolveScopeFailsClosed:
 
         n = Need(C.FILE_READ, scope_from=lambda a: co())
         with pytest.raises(ToolSpecError):
-            n.resolve_scope({})
+            n.resolve_scope(freeze_args({}))
 
-    def test_arguments_must_be_a_mapping(self):
+    @pytest.mark.parametrize("bad", [{"path": "/x"}, ["path"], None, "path", (("path", "/x"),)])
+    def test_arguments_must_be_frozen_args(self, bad):
+        # A plain dict could be changed by a scope_from callable, so it is refused,
+        # and the callable is never run on it.
+        calls = []
+        by_name = Need(C.FILE_READ, scope_from="path")
+        by_call = Need(C.FILE_READ, scope_from=lambda a: calls.append(a) or "/x")
+        with pytest.raises(ToolSpecError, match="FrozenArgs"):
+            by_name.resolve_scope(bad)
+        with pytest.raises(ToolSpecError, match="FrozenArgs"):
+            by_call.resolve_scope(bad)
+        assert calls == []
+
+    def test_mapping_lookalikes_are_refused(self):
+        from collections.abc import Mapping
+
+        class Fake(Mapping):
+            def __getitem__(self, k):
+                return "/x"
+
+            def __iter__(self):
+                return iter(("path",))
+
+            def __len__(self):
+                return 1
+
         with pytest.raises(ToolSpecError):
-            Need(C.FILE_READ, scope_from="path").resolve_scope(["path"])  # type: ignore[arg-type]
+            Need(C.FILE_READ, scope_from="path").resolve_scope(Fake())  # type: ignore[arg-type]
+
+    def test_frozen_map_is_accepted(self):
+        frozen = freeze_args({"n": {"path": "/x"}})
+        assert Need(C.FILE_READ, scope_from="path").resolve_scope(frozen["n"]) == "/x"
+
+    def test_callable_cannot_change_the_frozen_arguments(self):
+        frozen = freeze_args({"path": "/x", "l": [1]})
+
+        def evil(a):
+            a["path"] = "/etc"  # raises TypeError on a FrozenArgs
+
+        with pytest.raises(ToolSpecError):
+            Need(C.FILE_READ, scope_from=evil).resolve_scope(frozen)
+        assert frozen["path"] == "/x"
+
+    def test_fixed_scope_does_not_read_the_arguments(self):
+        assert Need(C.FILE_READ, scope="/d").resolve_scope(freeze_args({})) == "/d"
 
     def test_error_never_contains_argument_values(self):
         with pytest.raises(ToolSpecError) as info:
-            Need(C.FILE_READ, scope_from="path").resolve_scope({"path": 12345678})
+            Need(C.FILE_READ, scope_from="path").resolve_scope(freeze_args({"path": 12345678}))
         assert "12345678" not in str(info.value)
 
     def test_hostile_mapping_getitem(self):
@@ -181,7 +223,7 @@ class TestResolveScopeFailsClosed:
             raise KeyboardInterrupt
 
         with pytest.raises(KeyboardInterrupt):
-            Need(C.FILE_READ, scope_from=boom).resolve_scope({})
+            Need(C.FILE_READ, scope_from=boom).resolve_scope(freeze_args({}))
 
 
 # ─── ToolSpec ────────────────────────────────────────────────────────────────
@@ -221,6 +263,24 @@ class TestToolSpec:
         with pytest.raises(ToolSpecError):
             make(name="ok\n")
 
+    @pytest.mark.parametrize("name", ["abc\n", "abc\r\n", "a\n\n", "\nabc"])
+    def test_exported_pattern_rejects_trailing_newline_with_match_and_fullmatch(self, name):
+        import re
+
+        from aria.tools import TOOL_NAME_PATTERN
+
+        assert re.match(TOOL_NAME_PATTERN, name) is None
+        assert re.fullmatch(TOOL_NAME_PATTERN, name) is None
+        assert re.search(TOOL_NAME_PATTERN, name) is None
+
+    @pytest.mark.parametrize("name", ["abc", "_", "a.b-c", "A" * 64])
+    def test_exported_pattern_accepts_good_names(self, name):
+        import re
+
+        from aria.tools import TOOL_NAME_PATTERN
+
+        assert re.match(TOOL_NAME_PATTERN, name)
+
     def test_name_str_subclass_rejected(self):
         class S(str):
             pass
@@ -245,9 +305,28 @@ class TestToolSpec:
         with pytest.raises(ToolSpecError, match="at least one"):
             ToolSpec(name="t", needs=())
 
-    def test_internal_may_have_no_needs(self):
-        s = ToolSpec(name="t", needs=(), internal=True)
-        assert s.needs == () and s.risk == "low"
+    def test_user_code_cannot_declare_internal(self):
+        with pytest.raises(ToolSpecError, match="internal"):
+            ToolSpec(name="t", needs=(), internal=True)
+        with pytest.raises(ToolSpecError, match="internal"):
+            ToolSpec(name="t", needs=(Need(C.FILE_READ),), internal=True)
+
+    def test_replace_cannot_make_a_spec_internal(self):
+        with pytest.raises(ToolSpecError):
+            dataclasses.replace(make(), internal=True)
+
+    def test_internal_gate_is_closed_after_a_registry_style_build(self):
+        from aria.tools.spec import _build_spec
+
+        built = _build_spec(True, name="t", needs=(Need(C.FILE_READ),))
+        assert built.internal is True
+        with pytest.raises(ToolSpecError):
+            ToolSpec(name="t", needs=(Need(C.FILE_READ),), internal=True)
+        # even when the build itself fails the gate closes again
+        with pytest.raises(ToolSpecError):
+            _build_spec(True, name="bad name", needs=())
+        with pytest.raises(ToolSpecError):
+            ToolSpec(name="t", needs=(Need(C.FILE_READ),), internal=True)
 
     @pytest.mark.parametrize("t", [0, 0.0, -1, -0.5, 300.01, 301, 10**9, math.nan, math.inf, -math.inf, 10**400])
     def test_bad_timeouts_numeric(self, t):
@@ -406,12 +485,11 @@ class TestDecorator:
             "writes a file",
         )
 
-    def test_internal_without_needs(self):
-        @tool(internal=True)
-        def f():
-            pass
-
-        assert f.__aria_tool_spec__.internal and f.__aria_tool_spec__.needs == ()
+    def test_internal_cannot_be_declared_with_the_decorator(self):
+        with pytest.raises(ToolSpecError, match="internal"):
+            tool(internal=True)
+        with pytest.raises(ToolSpecError, match="internal"):
+            tool(C.FILE_READ, internal=True)
 
     def test_non_internal_without_needs_rejected_at_decoration(self):
         with pytest.raises(ToolSpecError):
@@ -439,7 +517,7 @@ class TestDecorator:
         with pytest.raises(ToolSpecError):
             tool(Need(C.FILE_READ), scope="/x")
         with pytest.raises(ToolSpecError):
-            tool(internal=True, scope_from="p")
+            tool(scope_from="p")
 
     def test_both_scope_and_scope_from_rejected(self):
         with pytest.raises(ToolSpecError):
@@ -513,3 +591,69 @@ class TestDecorator:
         assert isinstance(frozen, FrozenArgs)
         need = read.__aria_tool_spec__.needs[0]
         assert need.resolve_scope(frozen) == "/data/x.txt"
+
+
+class TestDecoratorOwnership:
+    def test_wraps_wrapper_is_not_an_owner_but_can_be_decorated(self):
+        import functools
+
+        @tool(C.FILE_READ)
+        def inner():
+            pass
+
+        @functools.wraps(inner)
+        def wrapper(*a, **k):
+            return inner(*a, **k)
+
+        # wraps copied the attribute, but the wrapper does not own it
+        assert wrapper.__aria_tool_spec__ is inner.__aria_tool_spec__
+        # applying @tool to the wrapper works (it is not "already declared")
+        tool(C.NETWORK, name="wrapped")(wrapper)
+        assert wrapper.__aria_tool_spec__.name == "wrapped"
+        assert wrapper.__aria_tool_spec__.needs[0].capability is C.NETWORK
+        assert inner.__aria_tool_spec__.name == "inner"  # the original is untouched
+
+    def test_double_decoration_of_the_same_object_still_rejected(self):
+        def f():
+            pass
+
+        tool(C.FILE_READ)(f)
+        with pytest.raises(ToolSpecError, match="twice"):
+            tool(C.FILE_READ)(f)
+
+    def test_subclass_can_be_decorated(self):
+        @tool(C.FILE_READ, name="base")
+        class Base:
+            def __call__(self):
+                pass
+
+        @tool(C.NETWORK, name="child")
+        class Child(Base):
+            pass
+
+        assert Base.__aria_tool_spec__.name == "base" and Child.__aria_tool_spec__.name == "child"
+
+    @pytest.mark.parametrize("target", ["staticmethod", "classmethod"])
+    def test_decorating_a_descriptor_object_is_refused_clearly(self, target):
+        def f(*a):
+            pass
+
+        wrapper = staticmethod(f) if target == "staticmethod" else classmethod(f)
+        with pytest.raises(ToolSpecError, match="below"):
+            tool(C.FILE_READ)(wrapper)  # type: ignore[type-var]
+
+    def test_owner_table_forgets_dead_objects(self):
+        import gc
+
+        from aria.tools import decorator
+
+        def make_one():
+            def f():
+                pass
+
+            tool(C.FILE_READ)(f)
+            return id(f)
+
+        key = make_one()
+        gc.collect()
+        assert key not in decorator._OWNERS

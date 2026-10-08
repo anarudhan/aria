@@ -17,12 +17,10 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable, Optional
 
-from .decorator import SPEC_ATTRIBUTE
-from .spec import Need, ToolSpec, ToolSpecError
+from .decorator import declared_spec
+from .spec import Need, ToolSpec, ToolSpecError, _build_spec, validate_tool_name
 
 __all__ = ["ToolRegistry"]
-
-_MISSING = object()
 
 
 def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
@@ -41,13 +39,13 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
         if type(need) is not Need:
             raise ToolSpecError(f"spec.needs holds a {type(need).__name__}, expected Need")
         copied.append(Need(need.capability, need.scope, need.scope_from))
-    return ToolSpec(
+    return _build_spec(
+        spec.internal,
         name=spec.name if name is None else name,
         needs=tuple(copied),
         timeout_s=spec.timeout_s,
         concurrency_safe=spec.concurrency_safe,
         approval=spec.approval,
-        internal=spec.internal,
         description=spec.description,
     )
 
@@ -55,7 +53,23 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
 class ToolRegistry:
     """Maps tool names to callables and to their (immutable) specs."""
 
-    def __init__(self) -> None:
+    def __init__(self, internal_names: Optional[frozenset[str]] = None) -> None:
+        """
+        ``internal_names`` is a frozenset of exact tool names that the registry
+        reports as ``internal=True`` when they are registered WITH a declared
+        spec. This is the only way a tool becomes internal. Internal means "part
+        of the framework itself"; it is NOT a permission exemption. A name in
+        the set that is registered without a spec stays undeclared.
+        """
+        if internal_names is None:
+            internal_names = frozenset()
+        if type(internal_names) is not frozenset:
+            raise ToolSpecError(
+                f"internal_names must be a frozenset, got {type(internal_names).__name__}"
+            )
+        self._internal_names: frozenset[str] = frozenset(
+            validate_tool_name(n) for n in internal_names
+        )
         self._lock = threading.Lock()
         self._tools: dict[str, Callable[..., Any]] = {}
         self._specs: dict[str, Optional[ToolSpec]] = {}
@@ -72,7 +86,10 @@ class ToolRegistry:
         when the tool is undeclared.
 
         Which spec: an explicit ``spec`` argument wins over the function's
-        ``__aria_tool_spec__``. If neither exists the tool is undeclared.
+        ``__aria_tool_spec__``. If neither exists the tool is undeclared. A spec
+        found on ``fn`` is accepted only if ``fn`` owns it (see
+        ``aria.tools.decorator``): a ``functools.wraps`` wrapper or a subclass
+        that inherited the attribute raises, and must declare its own needs.
         Which name: ``name`` if given, otherwise the spec's name, otherwise the
         function's ``__name__``. When ``name`` differs from the spec's name the
         copy is stored under ``name`` with ``spec.name`` set to match, so the
@@ -86,17 +103,8 @@ class ToolRegistry:
             raise ToolSpecError(f"a tool must be callable, got {type(fn).__name__}")
 
         if spec is None:
-            try:
-                attached = getattr(fn, SPEC_ATTRIBUTE, _MISSING)
-            except Exception:
-                raise ToolSpecError(f"reading {SPEC_ATTRIBUTE} from the tool failed") from None
-            if attached is not _MISSING:
-                if type(attached) is not ToolSpec:
-                    raise ToolSpecError(
-                        f"{SPEC_ATTRIBUTE} is a {type(attached).__name__}, expected a ToolSpec. "
-                        "Refusing to treat the tool as declared"
-                    )
-                spec = attached
+            # Raises for a wrapper or subclass that inherited a spec it does not own.
+            spec = declared_spec(fn)
 
         if name is not None and type(name) is not str:
             raise ToolSpecError(f"name must be a str, got {type(name).__name__}")
@@ -106,7 +114,22 @@ class ToolRegistry:
             key = name if name is not None else getattr(spec, "name", None)
             if type(key) is not str:
                 raise ToolSpecError("spec.name must be a str")
+            if getattr(spec, "internal", None) is not False:
+                raise ToolSpecError(
+                    "a spec cannot be internal. Internal status is granted by the registry "
+                    "(internal_names) and is not a permission exemption"
+                )
             stored = _copy_spec(spec, key)
+            if key in self._internal_names:
+                stored = _build_spec(
+                    True,
+                    name=stored.name,
+                    needs=stored.needs,
+                    timeout_s=stored.timeout_s,
+                    concurrency_safe=stored.concurrency_safe,
+                    approval=stored.approval,
+                    description=stored.description,
+                )
         else:
             if name is not None:
                 key = name
@@ -117,8 +140,7 @@ class ToolRegistry:
                     key = None
                 if type(key) is not str:
                     raise ToolSpecError("cannot work out a tool name; pass name=...")
-            # Validate the name of an undeclared tool by the same rule.
-            ToolSpec(name=key, needs=(), internal=True)
+            validate_tool_name(key)  # same rule for an undeclared tool's name
             stored = None
 
         with self._lock:
