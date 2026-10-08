@@ -49,6 +49,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from .scope import (
+    canonical_scope,
+    grant_is_stable,
+    scope_covers,
+)
+
 # ─── Capability Definitions ───────────────────────────────────────────────────
 
 class Capability(Enum):
@@ -166,10 +172,16 @@ class PermissionGrant:
         return not self.is_expired and not self.is_exhausted
 
     def matches_scope(self, requested_scope: str) -> bool:
-        if self.scope == "*":
-            return True
-        # Scope matching: granted scope must be an ancestor of requested
-        return requested_scope == self.scope or requested_scope.startswith(self.scope)
+        """
+        True if this grant covers the requested scope.
+
+        Paths and URLs match on whole parts, never on a text prefix, so a
+        grant for /home/u/project does not cover /home/u/project-secrets.
+        Other scopes (ids, names) must be equal. See aria/permissions/scope.py.
+        """
+        if not grant_is_stable(self.scope):
+            return False
+        return scope_covers(self.scope, requested_scope)
 
 
 # ─── Audit Entry ─────────────────────────────────────────────────────────────
@@ -311,6 +323,9 @@ class PermissionEngine:
         The hours parameter defaults to the capability's safe default.
         Users can override it but ARIA will warn about long-lived grants.
         """
+        # Stored in canonical form. Raises ValueError for a relative path.
+        scope = canonical_scope(scope)
+
         effective_hours = hours if hours is not None else DEFAULT_EXPIRY_HOURS[capability]
         expires_at = time.time() + (effective_hours * 3600) if effective_hours > 0 else 0
 
@@ -333,7 +348,7 @@ class PermissionEngine:
         self._grants[user_id][capability.value].append(grant)
 
         expiry_desc = f"{effective_hours}h" if expires_at else "no expiry"
-        scope_desc  = f" for scope '{scope}'" if scope != "*" else ""
+        scope_desc  = f" for scope {scope!r}" if scope != "*" else ""
         print(
             f"[Permission] ✅ Granted '{capability.value}'{scope_desc} "
             f"to user '{user_id}' (expires: {expiry_desc})"
@@ -353,11 +368,16 @@ class PermissionEngine:
         Revoke all grants for a user/capability/scope combination.
         Returns number of grants revoked.
         """
+        names = {scope}
+        try:
+            names.add(canonical_scope(scope))  # any spelling of the same path
+        except ValueError:
+            pass  # not canonical, so only an exact text match can revoke it
         grants = self._grants.get(user_id, {}).get(capability.value, [])
         before = len(grants)
         self._grants[user_id][capability.value] = [
             g for g in grants
-            if not (g.scope == scope or scope == "*")
+            if not ((isinstance(g.scope, str) and g.scope in names) or scope == "*")
         ]
         revoked = before - len(self._grants[user_id][capability.value])
         if revoked:
@@ -561,6 +581,19 @@ class PermissionEngine:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    def _warn_about_dead_grants(self):
+        """Say so when a saved grant can no longer match anything (honest reporting)."""
+        for uid, caps in self._grants.items():
+            for cap, grants in caps.items():
+                for g in grants:
+                    if g.is_valid and not grant_is_stable(g.scope):
+                        print(
+                            f"[Permission] ⚠️  Saved grant {g.grant_id} for '{cap}' "
+                            f"(user '{uid}', scope {g.scope!r}) matches nothing: the path "
+                            "or URL is not in canonical form, or changed since it was granted. "
+                            "Grant it again if it is still wanted."
+                        )
+
     def _save(self):
         if not self._persist_path:
             return
@@ -614,6 +647,7 @@ class PermissionEngine:
                         )
                         for g in grants
                     ]
+            self._warn_about_dead_grants()
             print(f"[Permission] Loaded permissions from {self._persist_path}")
         except Exception as e:
             # Auto-recover — delete the corrupted file and start clean
