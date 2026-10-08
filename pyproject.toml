@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aria-framework"
-version = "1.1.0"
+dynamic = ["version"]
 description = "ARIA — Autonomous Reasoning and Intelligence Architecture. A production grade, self improving, zero trust multi agent AI framework."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -62,6 +62,9 @@ dev = [
 Homepage = "https://github.com/anarudhan/aria"
 Documentation = "https://github.com/anarudhan/aria/blob/main/README.md"
 Issues = "https://github.com/anarudhan/aria/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "aria._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

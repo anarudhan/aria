@@ -1,5 +1,5 @@
 """
-ARIA Orchestrator — Version 1.2.0
+ARIA Orchestrator
 ------------------------------------
 The top-level coordinator that brings all components together.
 
@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .._version import __version__
 from ..agents.base import BaseAgent
 from ..permissions.engine import Capability, PermissionDeniedError, PermissionEngine
 from .decomposer import TaskDecomposer
@@ -124,7 +125,7 @@ class ARIAOrchestrator:
 
         print("=" * 62)
         print("  ARIA — Autonomous Reasoning and Intelligence Architecture")
-        print("  Version 1.3.0 | Zero-Trust | PRISM-Guided | ECHO-Aware")
+        print(f"  Version {__version__} | Zero-Trust | PRISM-Guided | ECHO-Aware")
         print("=" * 62)
 
         # Inject the permanent genesis memory — this runs at every startup

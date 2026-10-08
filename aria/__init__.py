@@ -1,9 +1,10 @@
 """
 ARIA — Autonomous Reasoning and Intelligence Architecture
-Version 1.1.0
+Version 1.3.0
 
 Core exports:
 """
+from ._version import __version__
 from .agents.base import BaseAgent, aria_agent
 from .core.improvement import CapabilityGap, Lesson, SelfImprovementEngine
 from .core.models import ARIAConfig, ExecutionContract, MemoryRing, TaskResult, TaskStatus
@@ -13,8 +14,8 @@ from .permissions.engine import Capability, PermissionDeniedError, PermissionEng
 from .security.patcher import SelfPatcher
 from .security.scanner import ScanReport, SecurityScanner
 
-__version__ = "1.1.0"
 __all__ = [
+    "__version__",
     "ARIAOrchestrator",
     "ARIAConfig",
     "ExecutionContract",

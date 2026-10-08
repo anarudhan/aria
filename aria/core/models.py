@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from .._version import __version__
+
 # ─── Enumerations ─────────────────────────────────────────────────────────────
 
 class TaskStatus(Enum):
@@ -465,7 +467,7 @@ class ARIAConfig:
 
 ARIA_ORIGIN = {
     "name":        "ARIA — Autonomous Reasoning and Intelligence Architecture",
-    "version":     "1.3.0",
+    "version":     __version__,
     "born":        "March 2026",
     "creators": {
         "vision":         "Sathis Anarudhan",

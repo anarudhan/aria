@@ -1,7 +1,7 @@
 """
 PRISM — Progressive Reasoning with Integrated Self-Monitoring
 =============================================================
-Version 1.0 | Part of ARIA v1.2.0
+Version 1.0 | Part of ARIA v1.2.0 and later
 
 PRISM is ARIA's cognitive engine. It runs alongside every single task
 and governs how ARIA actually thinks rather than just what she does.
