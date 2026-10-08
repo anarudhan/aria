@@ -377,7 +377,7 @@ class PermissionEngine:
         before = len(grants)
         self._grants[user_id][capability.value] = [
             g for g in grants
-            if not (g.scope in names or scope == "*")
+            if not ((isinstance(g.scope, str) and g.scope in names) or scope == "*")
         ]
         revoked = before - len(self._grants[user_id][capability.value])
         if revoked:
@@ -581,6 +581,19 @@ class PermissionEngine:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    def _warn_about_dead_grants(self):
+        """Say so when a saved grant can no longer match anything (honest reporting)."""
+        for uid, caps in self._grants.items():
+            for cap, grants in caps.items():
+                for g in grants:
+                    if g.is_valid and not grant_is_stable(g.scope):
+                        print(
+                            f"[Permission] ⚠️  Saved grant {g.grant_id} for '{cap}' "
+                            f"(user '{uid}', scope {g.scope!r}) matches nothing: the path "
+                            "or URL is not in canonical form, or changed since it was granted. "
+                            "Grant it again if it is still wanted."
+                        )
+
     def _save(self):
         if not self._persist_path:
             return
@@ -634,6 +647,7 @@ class PermissionEngine:
                         )
                         for g in grants
                     ]
+            self._warn_about_dead_grants()
             print(f"[Permission] Loaded permissions from {self._persist_path}")
         except Exception as e:
             # Auto-recover — delete the corrupted file and start clean

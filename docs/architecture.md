@@ -181,6 +181,7 @@ How grants keep one meaning:
 
 - A path grant is stored as an absolute real path when it is created, so `~` and symlinks are settled once. Relative path grants (`.`, `./src`, `../x`) are refused, because they would mean something different whenever the working folder changes. A saved relative grant from an older version is kept but covers nothing.
 - At check time a stored path must still resolve to itself. If a granted folder is later replaced by a symlink, the grant stops matching instead of following the link.
+- Saved grants obey the same rules as new ones. A saved path that is not in canonical form (for example one with a trailing slash, a `~` or a symlink in it), a saved URL with a query, a fragment or dot segments, and a saved relative path all cover nothing. ARIA prints a warning at load for each, and the grant has to be made again.
 - A path is checked at one moment and used at a later one. Code that writes to a path after a check should use `resolve_path()` and keep that gap short.
 
 Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.

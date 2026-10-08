@@ -326,10 +326,21 @@ def test_ambiguous_urls_are_not_covered(request_url):
     assert not scope_covers("https://example.com/api", request_url)
 
 
-def test_ambiguous_grant_urls_cover_nothing_but_themselves():
+def test_ambiguous_grant_urls_cover_nothing_not_even_themselves():
     grant = "https://example.com/api;v=1"
     assert not scope_covers(grant, "https://example.com/api;v=1/child")
-    assert scope_covers(grant, grant)
+    assert not scope_covers(grant, grant)
+
+
+@pytest.mark.parametrize("scope", ["./src", "../x", ".", ".."])
+def test_relative_path_grants_do_not_even_cover_their_own_text(scope):
+    assert not scope_covers(scope, scope)
+
+
+def test_equal_text_still_matches_for_ids_and_clean_scopes():
+    assert scope_covers("vuln-1", "vuln-1")
+    assert scope_covers("https://example.com/api", "https://example.com/api")
+    assert scope_covers("/home/u/project", "/home/u/project")
 
 
 def test_plain_urls_still_work_after_the_ambiguity_rules():
@@ -581,3 +592,84 @@ def test_grant_message_shows_the_scope_quoted_on_one_line(engine, capsys):
 def test_non_string_grant_scope_is_refused(engine):
     with pytest.raises(ValueError):
         engine.grant("u", Capability.CODE_EXECUTE, scope=None, hours=1)  # type: ignore[arg-type]
+
+
+# ─── Third review: saved grants must obey the same rules as new ones ─────────
+
+def _save_grants(path, *entries):
+    import json
+
+    base = {
+        "user_id": "u", "capability": "web_browse", "granted_at": 0,
+        "expires_at": 0, "task_context": "", "use_count": 0, "max_uses": None,
+    }
+    path.write_text(json.dumps({"grants": {"u": {"web_browse": [
+        {**base, "grant_id": f"g{i}", **entry} for i, entry in enumerate(entries)
+    ]}}}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("saved,request_url", [
+    ("https://x.com/a?key=1", "https://x.com/a/other"),
+    ("https://x.com/a#frag", "https://x.com/a/other"),
+    ("https://x.com/a/b/../..", "https://x.com/anything"),
+    ("https://x.com/a/%2e%2e", "https://x.com/anything"),
+    ("https://x.com/a;b", "https://x.com/a;b/c"),
+])
+def test_saved_url_grants_that_would_be_refused_today_cover_nothing(tmp_path, saved, request_url):
+    store = tmp_path / "perms.json"
+    _save_grants(store, {"scope": saved})
+
+    engine = PermissionEngine(persist_path=str(store))
+    assert not engine.check("u", Capability.WEB_BROWSE, scope=request_url)
+
+
+def test_saved_clean_url_grant_still_works(tmp_path):
+    store = tmp_path / "perms.json"
+    _save_grants(store, {"scope": "https://x.com/a"})
+
+    engine = PermissionEngine(persist_path=str(store))
+    assert engine.check("u", Capability.WEB_BROWSE, scope="https://x.com/a/b")
+
+
+@pytest.mark.parametrize("bad", [["a"], {"a": 1}, None, 5])
+def test_revoke_survives_malformed_saved_scopes(tmp_path, bad):
+    store = tmp_path / "perms.json"
+    _save_grants(store, {"scope": bad}, {"scope": "https://x.com/a"})
+
+    engine = PermissionEngine(persist_path=str(store))
+    assert engine.revoke("u", Capability.WEB_BROWSE, scope="https://x.com/a") == 1
+
+
+def test_loading_warns_about_saved_grants_that_can_no_longer_match(tmp_path, capsys):
+    store = tmp_path / "perms.json"
+    _save_grants(
+        store,
+        {"scope": "https://x.com/a?key=1"},   # refused today
+        {"scope": "~/not-canonical"},         # path not in canonical form
+        {"scope": "https://x.com/fine"},      # fine
+    )
+
+    PermissionEngine(persist_path=str(store))
+    warnings = [ln for ln in capsys.readouterr().out.splitlines() if "matches nothing" in ln]
+    assert len(warnings) == 2
+    assert any("Saved grant g0 " in ln for ln in warnings)
+    assert any("Saved grant g1 " in ln for ln in warnings)
+    assert not any("Saved grant g2 " in ln for ln in warnings)
+
+
+def test_old_saved_path_grants_that_are_not_canonical_cover_nothing(tmp_path):
+    store = tmp_path / "perms.json"
+    folder = tmp_path / "work"
+    folder.mkdir()
+    _save_grants(store, {"capability": "file_write", "scope": str(folder) + "/"})
+    import json
+
+    data = json.loads(store.read_text())
+    data["grants"]["u"]["file_write"] = data["grants"]["u"].pop("web_browse")
+    store.write_text(json.dumps(data), encoding="utf-8")
+
+    engine = PermissionEngine(persist_path=str(store))
+    assert not engine.check("u", Capability.FILE_WRITE, scope=str(folder / "a.txt"))
+    # Granting again in the normal way works.
+    engine.grant("u", Capability.FILE_WRITE, scope=str(folder) + "/", hours=1)
+    assert engine.check("u", Capability.FILE_WRITE, scope=str(folder / "a.txt"))

@@ -126,12 +126,22 @@ def canonical_scope(scope: str) -> str:
 
 def grant_is_stable(scope: str) -> bool:
     """
-    A stored path grant must still resolve to itself. If a granted folder was
-    later replaced by a symlink, it no longer does, and the grant stops
-    matching instead of silently following the link.
+    A stored grant must still mean what it meant when it was made.
+
+    A path grant must still resolve to itself. If a granted folder was later
+    replaced by a symlink, it no longer does, and the grant stops matching
+    instead of silently following the link. A URL grant must pass the same
+    checks as a new one. Anything else is a plain id and is always stable.
     """
     if not isinstance(scope, str):
         return False
+    if _is_url(scope):
+        # Grants saved by older versions may hold forms that are refused today.
+        try:
+            _check_grant_url(scope)
+        except ValueError:
+            return False
+        return True
     if not _is_path(scope):
         return True
     return resolve_path(scope) == os.path.normcase(scope)
@@ -238,10 +248,17 @@ def scope_covers(granted: str, requested: str) -> bool:
         return False
     if granted == WILDCARD:
         return True
-    if granted == requested:
-        return True
     if requested == WILDCARD:
         return False
+    if granted == requested:
+        # Equal text is enough for ids. A URL or path must also be one that
+        # could be granted today: an ambiguous URL or a relative path covers
+        # nothing, not even itself.
+        if _is_url(granted):
+            return _url_is_unambiguous(granted)
+        if _is_path(granted):
+            return not is_relative_path(granted)
+        return True
 
     if _is_url(granted):
         return _is_url(requested) and _url_covers(granted, requested)
