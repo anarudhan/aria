@@ -53,7 +53,7 @@ The parts that matter most to ARIA:
 ## 4. How it compares with ARIA
 
 Where ARIA is stronger today:
-- **Permissions.** ARIA has real grants with a scope, an expiry, a use limit and a hash-chained audit trail. dsh only has one-shot approvals and remembers nothing.
+- **Permissions.** ARIA has real grants with a scope, an expiry, a use limit and a hash-chained audit trail. dsh only has one-shot approvals and remembers nothing. (Correction added later: the audit trail is only an ordered log. See section 14.)
 - **Self-knowledge.** ARIA scans its own code, patches itself with rollback, grades its own health and learns from outcomes. dsh has nothing comparable.
 - **Weight.** ARIA needs no outside packages. dsh needs Node, pnpm, a plugin framework and dozens of dependencies.
 
@@ -189,3 +189,32 @@ Paths are inside the dsh clone at `/home/user/deepseek-ai/deepseek-harness`.
 - Python SDK: `python/sdk/src/deepseek_harness/`
 - ACP: `packages/acp/acp/src/index.ts`
 - Process: `docs/testing.md`, `.github/workflows/`
+
+## 14. Outcome and corrections (updated 2026-10-08)
+
+The maintainer asked the coordinator to decide what to take. This is what happened after this report was written.
+
+### What was decided
+Take the ideas, not the code. Start with the safe foundations, then execution discipline, as recommended in section 10. Cordis was also studied directly (its core is small and MIT) and its event and scope ideas were rebuilt in plain Python. Everything is tracked under the epic #37.
+
+### What is built and merged
+| Item | Issue | Pull request |
+|---|---|---|
+| Permission scope matching fix (the bug found while reading dsh) | #36 | #47 |
+| Kernel events (emit, bail, serial, parallel, waterfall) | #38 | #49 |
+| LLM retry with backoff, failure codes and secret redaction | #41 | #51 |
+| Spill large output to disk with an honest preview | #40 | #50 |
+| Correct overstated permission and audit claims, pipeline design | #54, #42 | #55 |
+
+In review when this was written: kernel scopes (#39, pull request #61).
+
+### Planned next
+The guarded execution pipeline (#42) is designed in `docs/design/0042-guarded-pipeline.md` and split into stories #56 to #60 and #62 to #65. Later stories: session log (#43), compaction (#44), skills (#45), run limits (#46). Follow-ups found on the way: #66 (patcher rollback unguarded), #67 (web agent asks for scope `*`), #68 (save the audit trail), #69 (decide how approved synthesized agents are contained).
+
+### Not taken, on purpose
+Embedding dsh as an outside agent (ACP), a kernel sandbox launcher, an MCP client, LSP tools, LLM based approval, fail-open hooks, default telemetry, and model-written code execution. The sandbox question continues as the spike #69.
+
+### Corrections to this report
+- Section 4 listed a "hash-chained audit trail" as a strength of ARIA. Checking the code later showed that the hash skips `scope`, `reason`, `agent_id` and `task_id`, is cut to 64 bits, is never verified, and the log is memory only. It is an ordered log, not tamper evidence (issue #54, fixed in the docs, hardening is pipeline story #56).
+- Section 9 said the permission engine is the place to build on. It is, but it only answers questions. Agent tool calls never asked it, which is what #42 fixes.
+- Section 9 said `CODE_EXECUTE` is gated twice and "the missing part is containment after approval". That is still true and is now the spike #69.
