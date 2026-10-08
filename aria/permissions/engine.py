@@ -52,9 +52,6 @@ from typing import Optional
 from .scope import (
     canonical_scope,
     grant_is_stable,
-    is_path_scope,
-    is_relative_path,
-    resolve_path,
     scope_covers,
 )
 
@@ -157,16 +154,6 @@ class PermissionGrant:
     task_context:   str = ""           # Why was this permission granted
     use_count:      int = 0
     max_uses:       Optional[int] = None   # None = unlimited
-
-    def __post_init__(self):
-        # Path scopes are stored as absolute real paths, so the grant keeps one
-        # meaning. This must never raise: grants are rebuilt from disk, and a
-        # failure there would discard every saved permission. Relative paths
-        # are left as they are, and they never match anything.
-        if is_path_scope(self.scope) and not is_relative_path(self.scope):
-            resolved = resolve_path(self.scope)
-            if resolved is not None:
-                self.scope = resolved
 
     @property
     def is_expired(self) -> bool:
@@ -361,7 +348,7 @@ class PermissionEngine:
         self._grants[user_id][capability.value].append(grant)
 
         expiry_desc = f"{effective_hours}h" if expires_at else "no expiry"
-        scope_desc  = f" for scope '{scope}'" if scope != "*" else ""
+        scope_desc  = f" for scope {scope!r}" if scope != "*" else ""
         print(
             f"[Permission] ✅ Granted '{capability.value}'{scope_desc} "
             f"to user '{user_id}' (expires: {expiry_desc})"
@@ -381,15 +368,16 @@ class PermissionEngine:
         Revoke all grants for a user/capability/scope combination.
         Returns number of grants revoked.
         """
+        names = {scope}
         try:
-            scope = canonical_scope(scope)
+            names.add(canonical_scope(scope))  # any spelling of the same path
         except ValueError:
-            pass  # cannot be canonical, so only an exact text match can revoke it
+            pass  # not canonical, so only an exact text match can revoke it
         grants = self._grants.get(user_id, {}).get(capability.value, [])
         before = len(grants)
         self._grants[user_id][capability.value] = [
             g for g in grants
-            if not (g.scope == scope or scope == "*")
+            if not (g.scope in names or scope == "*")
         ]
         revoked = before - len(self._grants[user_id][capability.value])
         if revoked:

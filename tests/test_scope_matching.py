@@ -447,3 +447,137 @@ def test_old_saved_relative_grant_is_kept_but_covers_nothing(tmp_path, monkeypat
     engine = PermissionEngine(persist_path=str(store))
     assert store.exists()  # not discarded as corrupt
     assert not engine.check("u", Capability.FILE_WRITE, scope=str(tmp_path / "src" / "a.py"))
+
+
+# ─── Second review: loading, odd scopes, odd URLs ────────────────────────────
+
+
+@needs_symlinks
+def test_swapping_a_granted_folder_for_a_symlink_stays_denied_after_a_restart(tmp_path):
+    store = tmp_path / "perms.json"
+    proj = tmp_path / "proj"
+    secret = tmp_path / "secret"
+    proj.mkdir()
+    secret.mkdir()
+    (secret / "pw").write_text("x")
+
+    first = PermissionEngine(persist_path=str(store))
+    first.grant("u", Capability.FILE_READ, scope=str(proj), hours=1)
+
+    proj.rmdir()
+    try:
+        os.symlink(secret, proj)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create symlinks here")
+
+    assert not first.check("u", Capability.FILE_READ, scope=str(secret / "pw"))
+    # A fresh engine must not "repair" the grant by following the new link.
+    second = PermissionEngine(persist_path=str(store))
+    assert not second.check("u", Capability.FILE_READ, scope=str(secret / "pw"))
+    assert not second.check("u", Capability.FILE_READ, scope=str(proj / "pw"))
+
+
+@pytest.mark.parametrize("scope", [
+    "~nosuchuser_zz/docs",
+    "C:/Users/x",
+    "C:\\x",
+    "\\\\server\\share",
+])
+def test_paths_that_stay_relative_on_this_system_are_refused(engine, scope):
+    with pytest.raises(ValueError):
+        engine.grant("u", Capability.FILE_WRITE, scope=scope, hours=1)
+
+
+def test_loaded_grant_with_an_unresolvable_path_covers_nothing_and_does_not_crash(monkeypatch, tmp_path):
+    from aria.permissions.engine import PermissionGrant
+
+    monkeypatch.chdir(tmp_path)
+    grant = PermissionGrant(scope="C:/a")
+    assert not grant.matches_scope(str(tmp_path / "C:" / "a" / "x"))
+    assert not grant.matches_scope("C:/a/x")
+
+
+@pytest.mark.parametrize("bad", [None, 5, ["/a"], {"p": 1}, True])
+def test_malformed_saved_scope_denies_but_does_not_break_other_grants(tmp_path, bad):
+    import json
+
+    store = tmp_path / "perms.json"
+    entry = {
+        "user_id": "u", "capability": "file_write", "granted_at": 0,
+        "expires_at": 0, "task_context": "", "use_count": 0, "max_uses": None,
+    }
+    store.write_text(json.dumps({"grants": {"u": {"file_write": [
+        {**entry, "grant_id": "bad", "scope": bad},
+        {**entry, "grant_id": "good", "scope": str(tmp_path)},
+    ]}}}), encoding="utf-8")
+
+    engine = PermissionEngine(persist_path=str(store))
+    assert engine.check("u", Capability.FILE_WRITE, scope=str(tmp_path / "a.txt"))
+    assert not engine.check("u", Capability.FILE_WRITE, scope="/etc/passwd")
+
+
+@needs_symlinks
+def test_a_grant_whose_folder_became_a_symlink_can_still_be_revoked_by_its_old_path(engine, tmp_path):
+    folder = tmp_path / "proj"
+    elsewhere = tmp_path / "elsewhere"
+    folder.mkdir()
+    elsewhere.mkdir()
+    engine.grant("u", Capability.FILE_WRITE, scope=str(folder), hours=1)
+
+    folder.rmdir()
+    try:
+        os.symlink(elsewhere, folder)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create symlinks here")
+
+    assert engine.revoke("u", Capability.FILE_WRITE, scope=str(folder)) == 1
+
+
+@pytest.mark.parametrize("request_url", [
+    "https://example.com/api/%c0%ae%c0%ae/y",
+    "https://example.com/api/%C1%9C/y",
+    "https://example.com/api/%u002e%u002e/y",
+    "https://example.com/api/\u00e9",
+    "https://example.com/api/\u2025/x",
+    "https://example.com/api/x\u0085y",
+])
+def test_more_url_forms_are_refused(request_url):
+    assert not scope_covers("https://example.com/api", request_url)
+
+
+def test_legitimate_percent_encoded_utf8_in_a_url_still_works():
+    assert scope_covers("https://example.com/api", "https://example.com/api/caf%C3%A9")
+
+
+@pytest.mark.parametrize("scope", [
+    "https://h/a/..",
+    "https://h/a/%2e%2e",
+    "https://h/a/./b",
+    "https://h/a?x=1",
+    "https://h/a#top",
+    "https://h/a;b",
+    "https://",
+    "https://h/a\\b",
+    "https://h/a b",
+])
+def test_ambiguous_grant_urls_are_refused_at_grant_time(engine, scope):
+    with pytest.raises(ValueError):
+        engine.grant("u", Capability.WEB_BROWSE, scope=scope, hours=1)
+
+
+@pytest.mark.parametrize("scope", ["id\nforged", "a\x00b", "tab\there", "x\x85y"])
+def test_scopes_with_control_characters_are_refused(engine, scope):
+    with pytest.raises(ValueError):
+        engine.grant("u", Capability.CODE_EXECUTE, scope=scope, hours=1)
+
+
+def test_grant_message_shows_the_scope_quoted_on_one_line(engine, capsys):
+    engine.grant("u", Capability.CODE_EXECUTE, scope="cap-1", hours=1)
+    out = capsys.readouterr().out
+    assert "for scope 'cap-1'" in out
+    assert "\r" not in out
+
+
+def test_non_string_grant_scope_is_refused(engine):
+    with pytest.raises(ValueError):
+        engine.grant("u", Capability.CODE_EXECUTE, scope=None, hours=1)  # type: ignore[arg-type]

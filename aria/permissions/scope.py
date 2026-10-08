@@ -22,7 +22,8 @@ ARIA uses three kinds, and each has its own rule:
               unless the grant carries the same ones. URLs that different
               software reads differently are refused: backslashes, control
               characters or spaces, ";" in the path, empty path segments, and
-              the encoded forms %2f, %5c, %25 and %00 in the path.
+              the encoded forms %2f, %5c, %25, %00, %c0, %c1 and %u in the path, and
+              non-ASCII characters in the path (percent-encode them).
 
   Anything    Ids and names, for example a vulnerability id or a capability
   else        id. These match only when equal.
@@ -68,6 +69,21 @@ def _is_path(scope: str) -> bool:
     )
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _check_grant_url(url: str) -> None:
+    if not _url_is_unambiguous(url):
+        raise ValueError(f"URL scope {url!r} is ambiguous (see aria/permissions/scope.py)")
+    parts = urlsplit(url)
+    if not parts.hostname:
+        raise ValueError(f"URL scope {url!r} has no host")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise ValueError("URL scopes cannot contain a query or a fragment")
+    if any(seg in (".", "..") for seg in unquote(parts.path).split("/")):
+        raise ValueError("URL scopes cannot contain dot segments")
+
+
 def is_relative_path(scope: str) -> bool:
     """True for path scopes that depend on the working folder, such as ./src."""
     return scope in (".", "..") or scope.startswith(("./", "../", ".\\", "..\\"))
@@ -79,24 +95,33 @@ def is_path_scope(scope: str) -> bool:
 
 def canonical_scope(scope: str) -> str:
     """
-    The form in which a scope is stored in a grant.
+    The form in which a scope is stored in a grant. Call it when a grant is
+    created and nowhere else: resolving again later, for example when a saved
+    grant is loaded, would let a swapped symlink rewrite the grant.
 
     Path scopes become absolute real paths (~ expanded, .. and symlinks
-    resolved). Other scopes are returned unchanged. Raises ValueError for a
-    relative path, which has no stable meaning, or a path that cannot be
-    resolved.
+    resolved). URL scopes are checked and kept as written. Other scopes are
+    returned unchanged. Raises ValueError for anything that has no stable
+    meaning: control characters, relative or unresolvable paths, and URLs
+    that are ambiguous or carry a query, a fragment or dot segments.
     """
-    if not isinstance(scope, str) or not _is_path(scope):
-        return scope
-    if is_relative_path(scope):
-        raise ValueError(
-            f"Relative path scope {scope!r} is not allowed. "
-            "Use an absolute path (or ~/...) so the grant means the same thing later."
-        )
-    resolved = resolve_path(scope)
-    if resolved is None:
-        raise ValueError(f"Path scope {scope!r} cannot be resolved")
-    return resolved
+    if not isinstance(scope, str):
+        raise ValueError("Scope must be a string")
+    if _CONTROL_CHARS.search(scope):
+        raise ValueError("Scope contains control characters")
+    if _is_path(scope):
+        if is_relative_path(scope):
+            raise ValueError(
+                f"Relative path scope {scope!r} is not allowed. "
+                "Use an absolute path (or ~/...) so the grant means the same thing later."
+            )
+        resolved = resolve_path(scope)
+        if resolved is None:
+            raise ValueError(f"Path scope {scope!r} cannot be resolved to an absolute path")
+        return resolved
+    if _is_url(scope):
+        _check_grant_url(scope)
+    return scope
 
 
 def grant_is_stable(scope: str) -> bool:
@@ -105,6 +130,8 @@ def grant_is_stable(scope: str) -> bool:
     later replaced by a symlink, it no longer does, and the grant stops
     matching instead of silently following the link.
     """
+    if not isinstance(scope, str):
+        return False
     if not _is_path(scope):
         return True
     return resolve_path(scope) == os.path.normcase(scope)
@@ -119,7 +146,12 @@ def resolve_path(scope: str) -> Optional[str]:
     if "\x00" in scope:
         return None
     try:
-        return os.path.normcase(os.path.realpath(os.path.expanduser(scope)))
+        expanded = os.path.expanduser(scope)
+        # "~nosuchuser/x" and "C:/x" on POSIX stay relative here. Resolving
+        # them would silently attach the working folder, so refuse them.
+        if not os.path.isabs(expanded):
+            return None
+        return os.path.normcase(os.path.realpath(expanded))
     except (ValueError, OSError, RuntimeError):
         return None
 
@@ -145,8 +177,8 @@ def _normalise_url_path(path: str) -> str:
     return normalised
 
 
-_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]")
-_ENCODED_AMBIGUOUS = re.compile(r"%(2f|5c|25|00)", re.IGNORECASE)
+_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f-\x9f]")
+_ENCODED_AMBIGUOUS = re.compile(r"%(2f|5c|25|00|c0|c1|u)", re.IGNORECASE)
 
 
 def _url_is_unambiguous(url: str) -> bool:
@@ -157,6 +189,8 @@ def _url_is_unambiguous(url: str) -> bool:
         path = urlsplit(url).path
     except ValueError:
         return False
+    if not path.isascii():
+        return False  # write non-ASCII path characters percent-encoded
     return not (";" in path or "//" in path or _ENCODED_AMBIGUOUS.search(path))
 
 
