@@ -10,11 +10,22 @@ A tool registered without any spec is stored as UNDECLARED. The registry still
 returns its callable from ``get`` (so a later stage can look it up and deny it
 by name) but ``spec`` returns ``None`` for it and ``undeclared()`` lists it.
 Nothing here denies anything; that is the job of the pipeline stories.
+
+Internal tools
+--------------
+``ToolRegistry(internal_tools={"read_spilled": the_callable})`` is how the
+framework says which callables are part of itself. A tool becomes ``internal``
+only when the object registered under that name IS (identity, ``is``) the
+callable the framework supplied. A different object that uses a reserved name
+is refused with ``ToolSpecError``, whichever is registered first. ``internal``
+is NOT a permission exemption; see ``ToolSpec``.
 """
 
 from __future__ import annotations
 
+import inspect
 import threading
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 from .decorator import declared_spec
@@ -28,7 +39,7 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
 
     The copy is made from the fields, so a spec that was tampered with after
     its creation (for example through ``object.__setattr__``) is rejected here
-    instead of being trusted."""
+    instead of being trusted. A non-internal spec with no needs is rejected."""
     if type(spec) is not ToolSpec:
         raise ToolSpecError(f"spec must be a ToolSpec, got {type(spec).__name__}")
     needs = spec.needs
@@ -50,26 +61,74 @@ def _copy_spec(spec: Any, name: Optional[str] = None) -> ToolSpec:
     )
 
 
+def _check_scope_from_parameters(fn: Callable[..., Any], spec: ToolSpec) -> None:
+    """A string ``scope_from`` must name a parameter the tool really receives.
+
+    Otherwise the scope would come from one argument while the tool uses another.
+    The tool is called by keyword, so the name must be a parameter that accepts a
+    keyword, or the tool must take ``**kwargs``. If the signature cannot be read
+    this fails closed. The check covers only the NAME; it cannot prove the tool
+    uses that argument for what the scope says."""
+    names = [n.scope_from for n in spec.needs if isinstance(n.scope_from, str)]
+    if not names:
+        return
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        raise ToolSpecError(
+            f"cannot read the signature of tool {spec.name!r}, so scope_from "
+            f"{names[0]!r} cannot be checked. Refusing to register it"
+        ) from None
+    parameters = signature.parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
+        return
+    accepted = {
+        p.name
+        for p in parameters
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    for name in names:
+        if name not in accepted:
+            raise ToolSpecError(
+                f"scope_from {name!r} is not a keyword parameter of tool {spec.name!r} "
+                f"(it has {sorted(accepted) or 'none'}). The scope would come from an "
+                "argument the tool does not use"
+            )
+
+
 class ToolRegistry:
     """Maps tool names to callables and to their (immutable) specs."""
 
-    def __init__(self, internal_names: Optional[frozenset[str]] = None) -> None:
+    def __init__(self, internal_tools: Optional[Mapping[str, Callable[..., Any]]] = None) -> None:
         """
-        ``internal_names`` is a frozenset of exact tool names that the registry
-        reports as ``internal=True`` when they are registered WITH a declared
-        spec. This is the only way a tool becomes internal. Internal means "part
-        of the framework itself"; it is NOT a permission exemption. A name in
-        the set that is registered without a spec stays undeclared.
+        ``internal_tools`` maps reserved tool names to the exact callables that
+        are part of the framework. Rules:
+
+        - A tool is ``internal`` only if the object registered under a reserved
+          name IS the callable given here (``is``). Another object using that
+          name raises ``ToolSpecError``, in either registration order.
+        - An internal tool is always declared. With no spec it gets an internal
+          spec with no needs; with a spec it keeps the needs it declares.
+          Only internal tools may have no needs.
+        - Names are validated like tool names and the values must be callable.
+          The mapping is copied.
+        - Internal is NOT a permission exemption and the registry's creator
+          decides the callables; a registry built by user code can mark its own
+          callables internal, so the pipeline must be built with the framework's
+          own registry.
         """
-        if internal_names is None:
-            internal_names = frozenset()
-        if type(internal_names) is not frozenset:
-            raise ToolSpecError(
-                f"internal_names must be a frozenset, got {type(internal_names).__name__}"
-            )
-        self._internal_names: frozenset[str] = frozenset(
-            validate_tool_name(n) for n in internal_names
-        )
+        internal: dict[str, Callable[..., Any]] = {}
+        if internal_tools is not None:
+            if not isinstance(internal_tools, Mapping):
+                raise ToolSpecError(
+                    f"internal_tools must be a mapping, got {type(internal_tools).__name__}"
+                )
+            for key, value in list(internal_tools.items()):
+                validate_tool_name(key)
+                if not callable(value):
+                    raise ToolSpecError(f"internal tool {key!r} must be callable")
+                internal[key] = value
+        self._internal_tools = internal
         self._lock = threading.Lock()
         self._tools: dict[str, Callable[..., Any]] = {}
         self._specs: dict[str, Optional[ToolSpec]] = {}
@@ -91,13 +150,16 @@ class ToolRegistry:
         ``aria.tools.decorator``): a ``functools.wraps`` wrapper or a subclass
         that inherited the attribute raises, and must declare its own needs.
         Which name: ``name`` if given, otherwise the spec's name, otherwise the
-        function's ``__name__``. When ``name`` differs from the spec's name the
-        copy is stored under ``name`` with ``spec.name`` set to match, so the
-        registry key and ``spec.name`` are always the same.
+        reserved name of an internal tool, otherwise the function's ``__name__``.
+        When ``name`` differs from the spec's name the copy is stored under
+        ``name`` with ``spec.name`` set to match.
+
+        A string ``scope_from`` must name a keyword parameter of ``fn`` (or ``fn``
+        must take ``**kwargs``), otherwise ``ToolSpecError``.
 
         Raises ``ToolSpecError`` for a non-callable, a bad or duplicate name,
-        a spec that is not a ``ToolSpec`` (or was tampered with), or a
-        malformed ``__aria_tool_spec__`` attribute.
+        a reserved internal name used by another object, a spec that is not a
+        ``ToolSpec`` (or was tampered with), or a malformed ``__aria_tool_spec__``.
         """
         if not callable(fn):
             raise ToolSpecError(f"a tool must be callable, got {type(fn).__name__}")
@@ -109,18 +171,42 @@ class ToolRegistry:
         if name is not None and type(name) is not str:
             raise ToolSpecError(f"name must be a str, got {type(name).__name__}")
 
+        reserved_for_fn = next((k for k, v in self._internal_tools.items() if v is fn), None)
+
+        key: Any
+        if name is not None:
+            key = name
+        elif spec is not None:
+            key = getattr(spec, "name", None)
+        elif reserved_for_fn is not None:
+            key = reserved_for_fn
+        else:
+            try:
+                key = getattr(fn, "__name__", None)
+            except Exception:
+                key = None
+        if type(key) is not str:
+            raise ToolSpecError("cannot work out a tool name; pass name=...")
+        validate_tool_name(key)
+
+        is_internal = False
+        if key in self._internal_tools:
+            if self._internal_tools[key] is not fn:
+                raise ToolSpecError(
+                    f"the name {key!r} is reserved for an internal tool and this is a "
+                    "different object"
+                )
+            is_internal = True
+
         stored: Optional[ToolSpec]
         if spec is not None:
-            key = name if name is not None else getattr(spec, "name", None)
-            if type(key) is not str:
-                raise ToolSpecError("spec.name must be a str")
             if getattr(spec, "internal", None) is not False:
                 raise ToolSpecError(
                     "a spec cannot be internal. Internal status is granted by the registry "
-                    "(internal_names) and is not a permission exemption"
+                    "(internal_tools) and is not a permission exemption"
                 )
             stored = _copy_spec(spec, key)
-            if key in self._internal_names:
+            if is_internal:
                 stored = _build_spec(
                     True,
                     name=stored.name,
@@ -130,18 +216,13 @@ class ToolRegistry:
                     approval=stored.approval,
                     description=stored.description,
                 )
+        elif is_internal:
+            stored = _build_spec(True, name=key, needs=())
         else:
-            if name is not None:
-                key = name
-            else:
-                try:
-                    key = getattr(fn, "__name__", None)
-                except Exception:
-                    key = None
-                if type(key) is not str:
-                    raise ToolSpecError("cannot work out a tool name; pass name=...")
-            validate_tool_name(key)  # same rule for an undeclared tool's name
             stored = None
+
+        if stored is not None:
+            _check_scope_from_parameters(fn, stored)
 
         with self._lock:
             if key in self._tools:

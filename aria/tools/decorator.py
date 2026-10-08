@@ -90,8 +90,11 @@ def declared_spec(fn: object) -> Optional[ToolSpec]:
     owned: Optional[ToolSpec] = _owned_spec(fn)
     if owned is None and type(fn) is types.MethodType:
         owned = _owned_spec(fn.__func__)
-    if owned is None:
-        owned = _owned_spec(type(fn))  # an instance of a decorated class
+    if owned is None and not issubclass(type(fn), type):
+        # An instance of a decorated class. Not for a class: a class made with a
+        # decorated class as its METACLASS is an instance of it too, and must not
+        # inherit the metaclass's declaration.
+        owned = _owned_spec(type(fn))
 
     if attached is _MISSING:
         if owned is not None:
@@ -138,7 +141,7 @@ def tool(
     declaration fails at import time, not at the first call.
 
     ``internal=True`` always raises ``ToolSpecError``: a tool cannot declare
-    itself internal. Only the registry grants that (``internal_names``), and
+    itself internal. Only the registry grants that (``internal_tools``), and
     it is not a permission exemption.
     """
     if len(needs_or_capabilities) == 1 and callable(needs_or_capabilities[0]) and not isinstance(
