@@ -2402,7 +2402,7 @@ async def test_markers_naming_a_scope_but_not_its_live_work_are_ignored() -> Non
     log: List[str] = []
     c = Scope(name="c")
     c.effect(rec(log, "undo"))
-    token = _DISPOSING.set(frozenset({id(c), c._serial, 1, 2, 3}))
+    token = _DISPOSING.set((id(c), c._serial, 1, 2, 3))
     try:
         await asyncio.wait_for(c.dispose(), 5)
     finally:
@@ -2410,7 +2410,11 @@ async def test_markers_naming_a_scope_but_not_its_live_work_are_ignored() -> Non
     assert c.disposed and log == ["undo"]
 
 
-async def test_background_task_started_by_a_disposer_adds_no_wait_edge() -> None:
+async def test_background_task_of_a_live_undo_counts_as_part_of_it() -> None:
+    # Documented trade-off: a task an undo started inherits "inside this unwind"
+    # while that unwind is live, so a dispose() it makes can be seen as a wait of
+    # the undo. Here B's wait for A would close a ring A -> B -> A, so it returns
+    # early instead of hanging. Nothing hangs and every undo still runs once.
     a_gate = asyncio.Event()
     log: List[str] = []
     a = Scope(name="a")
@@ -2420,7 +2424,7 @@ async def test_background_task_started_by_a_disposer_adds_no_wait_edge() -> None
     def a_effect() -> Callable[[], Any]:
         async def undo() -> None:
             async def bg() -> None:
-                await b.dispose()  # fire and forget: A does not wait for this
+                await b.dispose()
 
             background.append(asyncio.ensure_future(bg()))
             await a_gate.wait()
@@ -2431,7 +2435,7 @@ async def test_background_task_started_by_a_disposer_adds_no_wait_edge() -> None
     def b_effect() -> Callable[[], Any]:
         async def undo() -> None:
             await turns(5)  # let A's background task make its call first
-            await a.dispose()  # a real wait: there is no cycle, A is not waiting for B
+            await a.dispose()  # would close a ring: returns without waiting
             log.append("b-after-a")
 
         return undo
@@ -2440,31 +2444,112 @@ async def test_background_task_started_by_a_disposer_adds_no_wait_edge() -> None
     b.effect(b_effect)
     both = asyncio.gather(a.dispose(), b.dispose())
     await turns(10)
-    assert log == []  # B is waiting for A to finish
+    assert log == ["b-after-a"]  # returned early, A is still unwinding
+    assert a.state is ScopeState.PENDING
     a_gate.set()
     await asyncio.wait_for(both, 5)
     await asyncio.wait_for(asyncio.gather(*background), 5)
-    assert log == ["a-undone", "b-after-a"]
+    assert log == ["b-after-a", "a-undone"]
     assert a.disposed and b.disposed and scope_module._WAITS == {}
 
 
-async def test_randomized_dispose_rings_never_deadlock_and_undo_exactly_once() -> None:
-    for seed in range(150):
-        rng = random.Random(20_000 + seed)
+async def test_the_owner_of_a_task_stops_counting_when_its_unwind_is_over() -> None:
+    gate = asyncio.Event()
+    seen: List[Any] = []
+    leftovers: List["asyncio.Future[None]"] = []
+    a = Scope(name="a")
+
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            async def bg() -> None:
+                seen.append(scope_module._current_owner())  # during the unwind
+                await gate.wait()
+                seen.append(scope_module._current_owner())  # after it
+
+            leftovers.append(asyncio.ensure_future(bg()))
+            await turns()
+
+        return undo
+
+    a.effect(effect)
+    await a.dispose()
+    gate.set()
+    await asyncio.wait_for(leftovers[0], 5)
+    assert seen == [a._serial, None]
+    assert scope_module._current_owner() is None
+
+
+_FORMS = ["direct", "gather", "create_task", "shield", "wait_for", "ensure_future"]
+
+
+def _dispose_via(form: str, scope: Scope) -> Callable[[], Any]:
+    async def call() -> None:
+        if form == "direct":
+            await scope.dispose()
+        elif form == "gather":
+            await asyncio.gather(scope.dispose())
+        elif form == "create_task":
+            await asyncio.create_task(scope.dispose())
+        elif form == "shield":
+            await asyncio.shield(scope.dispose())
+        elif form == "wait_for":
+            await asyncio.wait_for(scope.dispose(), 5)
+        else:
+            await asyncio.ensure_future(scope.dispose())
+
+    return call
+
+
+@pytest.mark.parametrize("form", _FORMS)
+@pytest.mark.parametrize("size", [2, 3])
+async def test_rings_complete_whatever_helper_task_the_wait_goes_through(
+    form: str, size: int
+) -> None:
+    counts = [0] * size
+    scopes = [Scope(name=f"s{i}") for i in range(size)]
+
+    def make(i: int) -> Callable[[], Callable[[], Any]]:
+        def effect() -> Callable[[], Any]:
+            async def undo() -> None:
+                counts[i] += 1
+                await _dispose_via(form, scopes[(i + 1) % size])()
+
+            return undo
+
+        return effect
+
+    for i in range(size):
+        scopes[i].effect(make(i))
+    await asyncio.wait_for(asyncio.gather(*(sc.dispose() for sc in scopes)), 5)
+    assert all(sc.disposed for sc in scopes) and counts == [1] * size
+    assert scope_module._WAITS == {}
+
+
+async def _ring_fuzz(first_seed: int, last_seed: int) -> None:
+    for seed in range(first_seed, last_seed):
+        rng = random.Random(seed)
         n = rng.randint(2, 6)
-        scopes = [Scope(name=f"s{i}") for i in range(n)]
+        scopes: List[Scope] = [Scope(name="s0")]
+        for i in range(1, n):
+            if rng.random() < 0.5:
+                scopes.append(rng.choice(scopes).child(f"s{i}"))
+            else:
+                scopes.append(Scope(name=f"s{i}"))
         counts = [0] * n
+        violations: List[str] = []
         tasks: List["asyncio.Future[None]"] = []
 
-        def make(i: int, targets: List[int], spawn: bool) -> Callable[[], Callable[[], Any]]:
+        def make(i: int, targets: List[int], form: str) -> Callable[[], Callable[[], Any]]:
             def effect() -> Callable[[], Any]:
                 async def undo() -> None:
                     counts[i] += 1
+                    if scopes[i].children:
+                        violations.append(f"s{i} undone while a child is alive")
                     for j in targets:
-                        if spawn:
+                        if form == "spawn":
                             tasks.append(asyncio.ensure_future(scopes[j].dispose()))
                         else:
-                            await scopes[j].dispose()
+                            await _dispose_via(form, scopes[j])()
                     await asyncio.sleep(0)
 
                 return undo
@@ -2473,15 +2558,98 @@ async def test_randomized_dispose_rings_never_deadlock_and_undo_exactly_once() -
 
         for i in range(n):
             targets = [j for j in range(n) if rng.random() < 0.4]
-            scopes[i].effect(make(i, targets, rng.random() < 0.3))
-        chosen = [i for i in range(n) if rng.random() < 0.7] or [0]
+            scopes[i].effect(make(i, targets, rng.choice(_FORMS + ["spawn"])))
+        order = list(range(n))
+        rng.shuffle(order)
+        chosen = order[: rng.randint(1, n)]
         await asyncio.wait_for(asyncio.gather(*(scopes[i].dispose() for i in chosen)), 5)
         await asyncio.wait_for(asyncio.gather(*(sc.dispose() for sc in scopes)), 5)
         if tasks:
             await asyncio.wait_for(asyncio.gather(*tasks), 5)
         assert all(sc.disposed for sc in scopes), f"seed {seed}"
         assert counts == [1] * n, f"seed {seed}"
+        assert violations == [], f"seed {seed}: {violations}"
         assert scope_module._WAITS == {}, f"seed {seed}"
+
+
+async def test_randomized_dispose_rings_never_deadlock_and_undo_exactly_once() -> None:
+    await _ring_fuzz(20_000, 20_300)
+
+
+# Note for anyone adding checks here: under the eager task factory a finished task
+# stays in ``Scope._pending`` until its done-callback runs on the next loop turn,
+# so a check of "no pending work" right after the last await needs a short sleep.
+_EAGER = pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="asyncio.eager_task_factory needs Python 3.12"
+)
+
+
+@_EAGER
+async def test_plain_ring_completes_under_the_eager_task_factory() -> None:
+    # With eager tasks the first synchronous part of a task runs inside
+    # create_task(), before the caller could register anything about the task.
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        a, b = Scope(name="a"), Scope(name="b")
+
+        def eff_a() -> Callable[[], Any]:
+            async def undo() -> None:
+                await asyncio.sleep(0)  # A suspends first
+                await b.dispose()
+
+            return undo
+
+        def eff_b() -> Callable[[], Any]:
+            async def undo() -> None:
+                await a.dispose()  # B's very first synchronous step calls A.dispose
+
+            return undo
+
+        a.effect(eff_a)
+        b.effect(eff_b)
+        ta = asyncio.ensure_future(a.dispose())
+        tb = asyncio.ensure_future(b.dispose())
+        await asyncio.wait_for(asyncio.gather(ta, tb), 5)
+        assert a.disposed and b.disposed and scope_module._WAITS == {}
+    finally:
+        loop.set_task_factory(None)
+
+
+@_EAGER
+async def test_gather_ring_completes_under_the_eager_task_factory() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        scopes = [Scope(name=f"s{i}") for i in range(3)]
+        counts = [0, 0, 0]
+
+        def make(i: int) -> Callable[[], Callable[[], Any]]:
+            def effect() -> Callable[[], Any]:
+                async def undo() -> None:
+                    counts[i] += 1
+                    await asyncio.gather(scopes[(i + 1) % 3].dispose())
+
+                return undo
+
+            return effect
+
+        for i in range(3):
+            scopes[i].effect(make(i))
+        await asyncio.wait_for(asyncio.gather(*(sc.dispose() for sc in scopes)), 5)
+        assert all(sc.disposed for sc in scopes) and counts == [1, 1, 1]
+    finally:
+        loop.set_task_factory(None)
+
+
+@_EAGER
+async def test_ring_fuzz_under_the_eager_task_factory() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        await _ring_fuzz(30_000, 30_150)
+    finally:
+        loop.set_task_factory(None)
 
 
 async def test_dispose_completes_with_an_async_effect_that_never_resolves() -> None:
@@ -2645,3 +2813,87 @@ async def test_cancelling_a_task_that_wraps_a_remover_result_does_not_stop_the_u
     gate.set()
     await s.dispose()
     assert log == ["done"]
+
+
+# ----------------------------------------------------------------------
+# Third review round: a remover result may be used more than once
+# ----------------------------------------------------------------------
+
+
+def _slow_undo_effect(log: List[str], gate: Optional[asyncio.Event] = None) -> Any:
+    def effect() -> Callable[[], Any]:
+        async def undo() -> None:
+            if gate is not None:
+                await gate.wait()
+            else:
+                await asyncio.sleep(0)
+            log.append("undone")
+
+        return undo
+
+    return effect
+
+
+async def test_remover_result_can_be_wrapped_in_a_task_twice_in_a_row() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log))()
+    await asyncio.create_task(result)
+    await asyncio.create_task(result)  # already finished: returns at once
+    await result
+    assert log == ["undone"]
+
+
+async def test_remover_result_can_be_awaited_by_several_tasks_at_once() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log, gate))()
+    both = asyncio.gather(
+        asyncio.create_task(result), asyncio.create_task(result), _run(result)
+    )
+    await turns()
+    assert not both.done()
+    gate.set()
+    await asyncio.wait_for(both, 5)
+    assert log == ["undone"]
+
+
+async def test_remover_result_works_with_wait_for_shield_and_gather() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log))()
+    await asyncio.wait_for(result, 5)
+    await asyncio.shield(result)
+    await asyncio.gather(result, result)
+    assert log == ["undone"]
+
+
+async def test_cancelled_before_start_task_on_a_remover_result_keeps_the_undo() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log))()
+    t = asyncio.create_task(result)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    await s.dispose()  # waits for the scheduled undo
+    assert log == ["undone"]
+
+
+async def test_shared_awaitable_is_cancelled_by_dispose_unless_shielded() -> None:
+    async def work() -> None:
+        await asyncio.Event().wait()
+
+    shared = asyncio.ensure_future(work())
+    protected = asyncio.ensure_future(work())
+    s = Scope(name="s")
+    s.effect(lambda: shared)
+    s.effect(lambda: asyncio.shield(protected))
+    await turns()
+    await s.dispose()
+    assert shared.cancelled()  # the scope owns what it was handed
+    assert not protected.cancelled()  # only the scope's wait was cancelled
+    protected.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await protected
