@@ -154,7 +154,7 @@ aria.permissions.require("user_id", Capability.WEB_BROWSE, scope="https://exampl
 # Revoke all permissions for a user
 aria.permissions.revoke_all("user_id")
 
-# See the audit trail (an ordered in-memory log, not yet tamper evident: see docs/architecture.md)
+# See the audit trail (hash-chained and tamper evident in memory against accidental or in-process edits, not saved or anchored, see issue #68 and docs/architecture.md)
 trail = aria.permissions.get_audit_trail("user_id")
 ```
 

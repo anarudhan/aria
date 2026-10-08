@@ -153,9 +153,10 @@ PermissionEngine
 │   Each grant has: grant_id, user_id, capability, scope,
 │                   expires_at, max_uses, uses_so_far
 │
-├── _audit: list[AuditEvent]                    # Append-only, hash-chained
-│   Each event has: timestamp, user_id, capability, scope,
-│                   action (granted/denied/revoked), hash_chain
+├── _audit: list[AuditEntry]                    # Append-only, hash-chained, in memory
+│   Each entry has: entry_id, timestamp, user_id, capability, scope,
+│                   action, reason, agent_id, task_id, call_id, stage,
+│                   detail, args_digest, prev_hash, entry_hash
 │
 └── check(user_id, capability, scope) → bool
     Iterates active grants for user_id.
@@ -187,15 +188,23 @@ How grants keep one meaning:
 Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.
 ```
 
-Each audit event carries a hash that includes the previous event's hash, so the events form an ordered chain. Be clear about what that does and does not give you today:
+Grants, checks, denials, revokes and the events added with `record_audit()` all go into one hash chain. Each entry stores the previous entry's hash (`prev_hash`; `genesis` for the first) and its own (`entry_hash`). What that gives you, and what it does not:
 
-- The hash covers `entry_id`, `timestamp`, `user_id`, `capability`, `action` and the previous hash. It does **not** cover `scope`, `reason`, `agent_id` or `task_id`, so changing those is not detectable.
-- It is cut to 16 hex characters (64 bits) of SHA256.
-- **Nothing verifies the chain yet.** There is no function that walks it and reports a break.
-- The audit list lives in memory only. It is not saved with the grants, so it is gone after a restart.
-- Anyone who can change process memory can recompute the whole chain.
+**What is covered**
 
-So the audit trail is an ordered log, not tamper evidence. A full hash over every field, a verify function, and saving to disk are planned as part of the guarded pipeline work (issue #42).
+- The hash is the full SHA256 digest (64 hex characters) of every field of the entry except `entry_hash` itself: `entry_id`, `timestamp`, `user_id`, `capability`, `scope`, `action`, `reason`, `agent_id`, `task_id`, `call_id`, `stage`, `detail`, `args_digest` and `prev_hash`. The fields are encoded as canonical JSON (non-ASCII text written as is) and turned into bytes with UTF-8 and `surrogatepass`, so one field cannot run into the next and two different strings never give the same bytes. That includes one emoji versus the two lone surrogates it would be made of when joined. The hash of an entry with non-ASCII text differs from the one an earlier version computed; nothing is saved to disk, so that only matters inside one process. A test goes through `dataclasses.fields(AuditEntry)` so a field added later cannot be left out of the hash.
+- `PermissionEngine.verify_chain()` walks the chain and returns a `ChainReport` (`ok`, `checked`, `first_bad_index`, `reason`). It checks that every `prev_hash` matches the entry before it, that every stored `entry_hash` matches a fresh hash of the entry, and that the last entry's hash matches the engine's own head hash. It does not trust the objects it checks: every entry must be exactly an `AuditEntry` (not a subclass, which could override `compute_hash()`), the hash is computed by `AuditEntry.compute_hash()` itself, and `entry_hash`, `prev_hash` and the head must be exactly `str` (a `str` subclass could claim to equal anything). A malformed entry gives `ok=False` with a reason that names the problem and holds no values; it does not raise.
+- That detects an edit to any field of any entry, reordering, inserting, duplicating and removing entries, and removing entries from the end (the head hash no longer matches).
+- `record_audit()` is the public way to add an event. It validates its arguments and caps `detail` at 8 KiB. It does **not** redact: the caller must remove secrets first.
+- Adding to the chain is guarded by a lock, so threads cannot fork it.
+
+**What is still not guaranteed**
+
+- The chain and the head hash live in process memory and are not anchored anywhere. Anyone who can change process memory can edit entries, recompute every hash and the head value, and `verify_chain()` will then report ok. It catches accidents and edits that leave the head alone, not a determined attacker inside the process.
+- The audit list is not saved with the grants, so it is gone after a restart. Saving it, and anchoring it, is follow-up issue #68.
+- `verify_chain()` only helps if something calls it. Nothing calls it automatically yet.
+- The chain gives integrity, not authenticity. `record_audit()` is public and does not check who calls it or what it claims. Any code in the process can write an event that looks like an engine decision (for example action `allowed` with reason `Grant x (uses=1)`), and can write into another user's trail by passing that `user_id`. Such an entry is a valid link in the chain. Nothing in `aria/` reads the audit trail to make a decision today; keep it that way, and treat the trail as a record to read, not as proof of what the engine decided.
+- Do not call the engine from signal handlers, `__del__` methods or garbage-collection callbacks. Appending to the chain holds a plain (non-re-entrant) lock. If a handler or finalizer runs on the thread that is already inside an append and calls `check()`, `grant()`, `revoke()` or `record_audit()`, that call waits for the lock forever and the thread hangs. The lock is deliberately not re-entrant: a nested append would fork the chain.
 
 ### What is and is not enforced today
 
