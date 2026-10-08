@@ -23,7 +23,6 @@ from __future__ import annotations
 import inspect
 import math
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Union
 
@@ -87,24 +86,6 @@ def validate_tool_name(name: object) -> str:
             f"(pattern {TOOL_NAME_PATTERN})"
         )
     return name
-
-
-# Only the registry may create a spec with internal=True (see _build_spec).
-_internal_gate = threading.local()
-
-
-def _build_spec(internal: object, **fields: Any) -> ToolSpec:
-    """Registry-private constructor that can set ``internal=True``.
-
-    User code cannot declare a tool internal; ``ToolSpec(internal=True)`` raises.
-    This is a guard against mistakes, not against code in the same process."""
-    if internal is not True:
-        return ToolSpec(internal=internal, **fields)  # type: ignore[arg-type]
-    _internal_gate.on = True
-    try:
-        return ToolSpec(internal=True, **fields)
-    finally:
-        _internal_gate.on = False
 
 
 def _check_scope_text(value: str, label: str) -> None:
@@ -241,7 +222,7 @@ class ToolSpec:
     ``approval`` is ``"auto"`` or ``"always"`` (a human approves every call).
 
     ``internal`` cannot be set by user code: ``ToolSpec(internal=True)`` raises.
-    The registry sets it for the names it was given in ``internal_names``.
+    The registry sets it only for the exact callables it was given in ``internal_tools``.
     INTERNAL IS NOT A PERMISSION EXEMPTION. It only says the tool is part of
     the framework itself (for example the spill read-back). A pipeline must
     never treat it as authority to skip a permission check.
@@ -259,67 +240,7 @@ class ToolSpec:
         raise TypeError("ToolSpec cannot be subclassed")
 
     def __post_init__(self) -> None:
-        validate_tool_name(self.name)
-
-        if type(self.needs) is not tuple:
-            raise ToolSpecError(f"ToolSpec.needs must be a tuple, got {_type_name(self.needs)}")
-        if len(self.needs) > MAX_NEEDS:
-            raise ToolSpecError(f"ToolSpec.needs has more than {MAX_NEEDS} entries")
-        for index, need in enumerate(self.needs):
-            if type(need) is not Need:
-                raise ToolSpecError(
-                    f"ToolSpec.needs[{index}] must be a Need, got {_type_name(need)}"
-                )
-
-        if type(self.internal) is not bool:
-            raise ToolSpecError(
-                f"ToolSpec.internal must be a bool, got {_type_name(self.internal)}"
-            )
-        if type(self.concurrency_safe) is not bool:
-            raise ToolSpecError(
-                f"ToolSpec.concurrency_safe must be a bool, got {_type_name(self.concurrency_safe)}"
-            )
-        if self.internal and not getattr(_internal_gate, "on", False):
-            raise ToolSpecError(
-                "a tool cannot declare itself internal. Internal status is granted only by "
-                "the registry (ToolRegistry(internal_names=...)) and is not a permission exemption"
-            )
-        if not self.needs and not self.internal:
-            raise ToolSpecError(
-                f"tool {self.name!r} declares no needs. A tool that is not internal must "
-                "declare at least one capability it needs"
-            )
-
-        timeout = self.timeout_s
-        if type(timeout) not in (int, float):  # also rejects bool, Decimal, numpy scalars
-            raise ToolSpecError(
-                f"ToolSpec.timeout_s must be an int or float, got {_type_name(timeout)}"
-            )
-        try:
-            finite = math.isfinite(timeout)
-        except OverflowError:  # an int too large for a float
-            finite = False
-        if not finite:
-            raise ToolSpecError("ToolSpec.timeout_s must be finite")
-        if not 0 < timeout <= MAX_TIMEOUT_S:
-            raise ToolSpecError(
-                f"ToolSpec.timeout_s must be above 0 and at most {MAX_TIMEOUT_S:g}"
-            )
-        object.__setattr__(self, "timeout_s", float(timeout))
-
-        if not _is_exact_str(self.approval):
-            raise ToolSpecError(f"ToolSpec.approval must be a str, got {_type_name(self.approval)}")
-        if self.approval not in APPROVAL_MODES:
-            raise ToolSpecError(
-                f"ToolSpec.approval must be one of {APPROVAL_MODES}, got {self.approval[:20]!r}"
-            )
-
-        if not _is_exact_str(self.description):
-            raise ToolSpecError(
-                f"ToolSpec.description must be a str, got {_type_name(self.description)}"
-            )
-        if len(self.description) > MAX_DESCRIPTION_CHARS:
-            raise ToolSpecError(f"ToolSpec.description is longer than {MAX_DESCRIPTION_CHARS}")
+        _validate_spec(self, allow_internal=False)
 
     @property
     def risk(self) -> str:
@@ -334,3 +255,125 @@ class ToolSpec:
             rank = _RISK_RANK.get(level, unknown) if isinstance(level, str) else unknown
             highest = max(highest, rank)
         return RISK_ORDER[highest]
+
+
+def _validate_spec(spec: ToolSpec, allow_internal: bool) -> None:
+    """Check every field of ``spec``. ``__post_init__`` calls this with
+    allow_internal=False; only the registry's ``_build_spec`` passes True.
+
+    There is deliberately no flag or window that user code could reach while the
+    registry builds a spec: the permission to be internal is an argument, not state."""
+    validate_tool_name(spec.name)
+
+    if type(spec.needs) is not tuple:
+        raise ToolSpecError(f"ToolSpec.needs must be a tuple, got {_type_name(spec.needs)}")
+    if len(spec.needs) > MAX_NEEDS:
+        raise ToolSpecError(f"ToolSpec.needs has more than {MAX_NEEDS} entries")
+    for index, need in enumerate(spec.needs):
+        if type(need) is not Need:
+            raise ToolSpecError(
+                f"ToolSpec.needs[{index}] must be a Need, got {_type_name(need)}"
+            )
+
+    if type(spec.internal) is not bool:
+        raise ToolSpecError(
+            f"ToolSpec.internal must be a bool, got {_type_name(spec.internal)}"
+        )
+    if type(spec.concurrency_safe) is not bool:
+        raise ToolSpecError(
+            f"ToolSpec.concurrency_safe must be a bool, got {_type_name(spec.concurrency_safe)}"
+        )
+    if spec.internal and not allow_internal:
+        raise ToolSpecError(
+            "a tool cannot declare itself internal. Internal status is granted only by "
+            "the registry (ToolRegistry(internal_tools=...)) and is not a permission exemption"
+        )
+    if not spec.needs and not spec.internal:
+        raise ToolSpecError(
+            f"tool {spec.name!r} declares no needs. A tool that is not internal must "
+            "declare at least one capability it needs"
+        )
+
+    timeout = spec.timeout_s
+    if type(timeout) not in (int, float):  # also rejects bool, Decimal, numpy scalars
+        raise ToolSpecError(
+            f"ToolSpec.timeout_s must be an int or float, got {_type_name(timeout)}"
+        )
+    try:
+        finite = math.isfinite(timeout)
+    except OverflowError:  # an int too large for a float
+        finite = False
+    if not finite:
+        raise ToolSpecError("ToolSpec.timeout_s must be finite")
+    if not 0 < timeout <= MAX_TIMEOUT_S:
+        raise ToolSpecError(
+            f"ToolSpec.timeout_s must be above 0 and at most {MAX_TIMEOUT_S:g}"
+        )
+    object.__setattr__(spec, "timeout_s", float(timeout))
+
+    if not _is_exact_str(spec.approval):
+        raise ToolSpecError(f"ToolSpec.approval must be a str, got {_type_name(spec.approval)}")
+    if spec.approval not in APPROVAL_MODES:
+        raise ToolSpecError(
+            f"ToolSpec.approval must be one of {APPROVAL_MODES}, got {spec.approval[:20]!r}"
+        )
+
+    if not _is_exact_str(spec.description):
+        raise ToolSpecError(
+            f"ToolSpec.description must be a str, got {_type_name(spec.description)}"
+        )
+    if len(spec.description) > MAX_DESCRIPTION_CHARS:
+        raise ToolSpecError(f"ToolSpec.description is longer than {MAX_DESCRIPTION_CHARS}")
+
+
+def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+    raise TypeError("this object cannot be pickled or rebuilt from state; construct it normally")
+
+
+def _same(self: Any, *_args: Any) -> Any:
+    return self  # immutable, so a copy is the object itself
+
+
+def _harden(cls: type) -> None:
+    """Copying returns the same (immutable) object; pickling and __setstate__ are refused.
+
+    ``__setstate__`` and ``__getstate__`` are assigned after the class is built because
+    ``dataclass(slots=True, frozen=True)`` installs its own and would replace ones written
+    in the class body. Without this, ``copy.copy(spec).__setstate__(...)`` or a pickle
+    round trip could build a spec that skipped validation."""
+    cls.__copy__ = _same  # type: ignore[attr-defined]
+    cls.__deepcopy__ = _same  # type: ignore[attr-defined]
+    cls.__reduce__ = _refuse  # type: ignore[assignment]
+    cls.__reduce_ex__ = _refuse  # type: ignore[assignment]
+    cls.__getstate__ = _refuse  # type: ignore[attr-defined]
+    cls.__setstate__ = _refuse  # type: ignore[attr-defined]
+
+
+_harden(Need)
+_harden(ToolSpec)
+
+
+def _build_spec(internal: object, **fields: Any) -> ToolSpec:
+    """Registry-private constructor that may set ``internal=True`` (and then allows no needs).
+
+    Builds the object without ``__init__`` and validates it with ``allow_internal=True``.
+    User code cannot declare a tool internal: ``ToolSpec(internal=True)`` raises. This is a
+    guard against mistakes, not against code that calls this private function."""
+    spec = object.__new__(ToolSpec)
+    values: dict[str, Any] = {
+        "name": None,
+        "needs": (),
+        "timeout_s": 30.0,
+        "concurrency_safe": False,
+        "approval": "auto",
+        "internal": internal,
+        "description": "",
+    }
+    unknown = set(fields) - set(values)
+    if unknown:
+        raise ToolSpecError(f"unknown ToolSpec fields: {sorted(unknown)}")
+    values.update(fields)
+    for key, value in values.items():
+        object.__setattr__(spec, key, value)
+    _validate_spec(spec, allow_internal=True)
+    return spec

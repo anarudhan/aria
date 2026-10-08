@@ -657,3 +657,114 @@ class TestDecoratorOwnership:
         key = make_one()
         gc.collect()
         assert key not in decorator._OWNERS
+
+
+class TestInternalCannotBeForged:
+    def test_gc_hook_during_a_registry_build_cannot_forge_an_internal_spec(self, monkeypatch):
+        import gc
+
+        import aria.tools.spec as spec_module
+        from aria.tools import ToolRegistry
+
+        forged = []
+        attempts = []
+
+        def hook(phase, info):
+            if phase != "start":
+                return
+            attempts.append(1)
+            for needs in ((), (Need(C.FILE_READ),)):
+                try:
+                    forged.append(ToolSpec(name="forged", needs=needs, internal=True))
+                except ToolSpecError:
+                    pass
+
+        real_validate = spec_module.validate_tool_name
+
+        def validate_and_collect(name):
+            gc.collect()  # runs the hook while the registry is building a spec
+            return real_validate(name)
+
+        def real():
+            pass
+
+        monkeypatch.setattr(spec_module, "validate_tool_name", validate_and_collect)
+        gc.callbacks.append(hook)
+        try:
+            reg = ToolRegistry(internal_tools={"real": real})
+            reg.register(real)
+            reg.register(plain_fn, ToolSpec(name="other", needs=(Need(C.FILE_READ),)))
+        finally:
+            gc.callbacks.remove(hook)
+        assert attempts, "the gc hook never ran, so the test proves nothing"
+        assert forged == []
+        assert reg.spec("real").internal is True and reg.spec("other").internal is False
+
+    def test_there_is_no_module_state_that_enables_internal(self):
+        import aria.tools.spec as spec_module
+
+        assert not hasattr(spec_module, "_internal_gate")
+        # a validate call without the permission fails whatever else is going on
+        spec = spec_module._build_spec(True, name="ok", needs=())
+        with pytest.raises(ToolSpecError):
+            spec_module._validate_spec(spec, allow_internal=False)
+
+
+def plain_fn():
+    return 1
+
+
+class TestCopyAndPickleCannotBypassValidation:
+    def test_setstate_cannot_forge_a_spec(self):
+        import copy
+
+        spec = make()
+        clone = copy.copy(spec)
+        with pytest.raises(TypeError):
+            clone.__setstate__(("evil", (), 30.0, False, "auto", True, ""))
+        with pytest.raises(TypeError):
+            spec.__setstate__(("evil", (), 30.0, False, "auto", True, ""))
+        assert spec.internal is False and spec.name == "t"
+
+    def test_setstate_cannot_forge_a_need(self):
+        import copy
+
+        need = Need(C.FILE_READ)
+        with pytest.raises(TypeError):
+            copy.copy(need).__setstate__(("not a capability", "", None))
+        with pytest.raises(TypeError):
+            need.__setstate__((C.FILE_READ, "/x", None))
+
+    @pytest.mark.parametrize(
+        "obj", [make(), Need(C.NETWORK, scope="https://x.example")], ids=["spec", "need"]
+    )
+    def test_pickle_is_refused(self, obj):
+        import pickle
+
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            with pytest.raises(TypeError):
+                pickle.dumps(obj, protocol)
+
+    @pytest.mark.parametrize(
+        "obj", [make(), Need(C.NETWORK, scope="https://x.example")], ids=["spec", "need"]
+    )
+    def test_copy_and_deepcopy_return_the_same_object(self, obj):
+        import copy
+
+        assert copy.copy(obj) is obj
+        assert copy.deepcopy(obj) is obj
+        assert copy.deepcopy({"k": [obj]})["k"][0] is obj
+
+    def test_replace_still_validates(self):
+        with pytest.raises(ToolSpecError):
+            dataclasses.replace(make(), timeout_s=-1)
+        assert dataclasses.replace(make(), timeout_s=5).timeout_s == 5.0
+
+    def test_raw_reduce_protocol_is_closed(self):
+        spec = make()
+        with pytest.raises(TypeError):
+            spec.__reduce__()
+        with pytest.raises(TypeError):
+            spec.__reduce_ex__(2)
+        with pytest.raises(TypeError):
+            spec.__getstate__()
