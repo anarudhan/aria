@@ -164,9 +164,58 @@ PermissionEngine
     Checks: not exhausted (max_uses is None or uses < max_uses)
     If all pass: increment uses_so_far, log audit event, return True.
     Otherwise: log denied event, return False.
+
+### How scopes are matched
+
+A scope names the resource a grant applies to. The rules live in
+`aria/permissions/scope.py`, and every failure to parse means "not covered".
+
+| Scope kind | Example | Rule |
+|---|---|---|
+| Everything | `*` | A grant of `*` covers all. A specific grant never covers a request for `*` |
+| File path | `/home/u/project`, `~/notes` | `~`, `..` and symlinks are resolved first. A grant covers the folder and what is inside it, matched on whole path parts. `/a/b` covers `/a/b/c` and never `/a/bc` |
+| URL | `https://example.com/api` | Scheme, host and port must be equal. The path matches on whole segments after `..` and `%2e%2e` are removed. A request with embedded credentials is not covered. URLs that clients and servers read differently are refused: backslashes, spaces and control characters, `;` in the path, empty path segments (`//`), and the encoded forms `%2f`, `%5c`, `%25` and `%00` in the path |
+| Anything else | `vuln-12`, `cap-3` | Exact match only |
+
+How grants keep one meaning:
+
+- A path grant is stored as an absolute real path when it is created, so `~` and symlinks are settled once. Relative path grants (`.`, `./src`, `../x`) are refused, because they would mean something different whenever the working folder changes. A saved relative grant from an older version is kept but covers nothing.
+- At check time a stored path must still resolve to itself. If a granted folder is later replaced by a symlink, the grant stops matching instead of following the link.
+- Saved grants obey the same rules as new ones. A saved path that is not in canonical form (for example one with a trailing slash, a `~` or a symlink in it), a saved URL with a query, a fragment or dot segments, and a saved relative path all cover nothing. ARIA prints a warning at load for each, and the grant has to be made again.
+- A path is checked at one moment and used at a later one. Code that writes to a path after a check should use `resolve_path()` and keep that gap short.
+
+Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.
 ```
 
-The hash chain in audit events links each event to the previous one via SHA256. This makes the audit trail tamper-evident — if anyone modifies an old event, all subsequent hashes become invalid.
+Each audit event carries a hash that includes the previous event's hash, so the events form an ordered chain. Be clear about what that does and does not give you today:
+
+- The hash covers `entry_id`, `timestamp`, `user_id`, `capability`, `action` and the previous hash. It does **not** cover `scope`, `reason`, `agent_id` or `task_id`, so changing those is not detectable.
+- It is cut to 16 hex characters (64 bits) of SHA256.
+- **Nothing verifies the chain yet.** There is no function that walks it and reports a break.
+- The audit list lives in memory only. It is not saved with the grants, so it is gone after a restart.
+- Anyone who can change process memory can recompute the whole chain.
+
+So the audit trail is an ordered log, not tamper evidence. A full hash over every field, a verify function, and saving to disk are planned as part of the guarded pipeline work (issue #42).
+
+### What is and is not enforced today
+
+The permission engine answers questions and denies by default. It does not stop code that never asks.
+
+| Place | Asks the permission engine? |
+|---|---|
+| Orchestrator, for `required_capabilities` passed by the caller | Yes |
+| Orchestrator, memory writes | Yes (`MEMORY_WRITE`) |
+| Web agent, search and browse | Yes (`WEB_SEARCH`, `WEB_BROWSE`, with scope `*` only) |
+| Improvement engine, spawning and loading a synthesized agent | Yes (`AGENT_SPAWN`, `CODE_EXECUTE`) |
+| Patcher, applying a patch | Yes (`SELF_MODIFY`, with the vulnerability id as scope) |
+| `LLMAgent` tool calls | **No** |
+| `@aria_agent` and `BaseAgent.execute` bodies, other than the web agent | **No** |
+| Patcher `rollback` and `rollback_all` | **No** |
+| LLM provider calls (task data leaves the machine) | **No** |
+| State files (memory, trust, permissions) | **No** |
+| Running a synthesized agent after it was loaded | **No**, and it runs inside the ARIA process |
+
+The guarded execution pipeline (issue #42, design in `docs/design/0042-guarded-pipeline.md`) is the planned fix for tool calls. Until it lands, code you write that calls tools or touches files must ask the engine itself.
 
 ---
 
@@ -255,6 +304,12 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 
 ---
 
+## LLM retry policy
+
+`AnthropicPlugin` and `OpenAIPlugin` send every call through `call_with_retry` in `aria/plugins/retry.py`. Temporary failures (rate limit, server error, timeout, dropped connection, empty answer) are retried with exponential backoff, a cap and jitter. A wrong key or a bad request is never retried. A retry-after value from the provider is respected up to the cap, and cancellation is never swallowed. When the retries run out the caller gets an `LLMError` that carries the failure code, the attempt count and the original error. Error text kept in the records is redacted for common secret shapes and cut to 500 characters, on a best-effort basis; the original exception stays on `LLMError.cause` unredacted, so log `str(err)` and `err.code`, not the traceback. Every attempt is recorded and counted, so `retry_stats()` and `describe()` on a plugin can feed the health report and no failure is hidden. The module uses only the standard library. Full details are in `docs/llm-retry.md`.
+
+---
+
 ## Security model
 
 **What ARIA cannot do by default:**
@@ -282,3 +337,9 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 - `security/patcher.py`
 
 These files are excluded from the self-patcher's auto-patch list. Any changes to them require manual human review and application. This prevents a compromised patch from disabling the permission system or falsifying scan results.
+
+---
+
+## Spill store: large output is kept, never silently cut
+
+Long tool and agent output is saved in full by `SpillStore` (`aria/core/spill.py`). The model sees the head and tail, a marker that says how many characters were left out, and an opaque id. The `read_spilled` tool returns more on request. Files are private (folder 0700, files 0600, created exclusively), ids cannot be turned into paths, and if saving fails the full text stays inline with a warning. Old files are removed after a retention period. Spill files from an earlier run are not readable after a restart, because ids are only valid in the process that issued them. Where text must be shortened and cannot be spilled (tool descriptions, web search snippets), the cut is marked with the number of characters omitted. Pages read back with `read_spilled` are never shortened again, locators are bound to the agent that spilled the item, the number and total size of spill files are bounded (oldest evicted first), and shortened previews start with an untrusted-data notice. Details are in `docs/spill.md`.

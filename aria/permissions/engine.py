@@ -49,6 +49,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from .scope import (
+    canonical_scope,
+    grant_is_stable,
+    scope_covers,
+)
+
 # ─── Capability Definitions ───────────────────────────────────────────────────
 
 class Capability(Enum):
@@ -166,10 +172,16 @@ class PermissionGrant:
         return not self.is_expired and not self.is_exhausted
 
     def matches_scope(self, requested_scope: str) -> bool:
-        if self.scope == "*":
-            return True
-        # Scope matching: granted scope must be an ancestor of requested
-        return requested_scope == self.scope or requested_scope.startswith(self.scope)
+        """
+        True if this grant covers the requested scope.
+
+        Paths and URLs match on whole parts, never on a text prefix, so a
+        grant for /home/u/project does not cover /home/u/project-secrets.
+        Other scopes (ids, names) must be equal. See aria/permissions/scope.py.
+        """
+        if not grant_is_stable(self.scope):
+            return False
+        return scope_covers(self.scope, requested_scope)
 
 
 # ─── Audit Entry ─────────────────────────────────────────────────────────────
@@ -186,10 +198,17 @@ class AuditEntry:
     reason:     str = ""
     agent_id:   str = ""
     task_id:    str = ""
-    # Hash of previous entry — makes audit trail tamper-evident
+    # Hash of the previous entry. It links entries in order. It is NOT a
+    # tamper-proof seal: see compute_hash and docs/architecture.md.
     prev_hash:  str = ""
 
     def compute_hash(self) -> str:
+        """
+        Short fingerprint of this entry. Covers entry_id, timestamp, user_id,
+        capability, action and prev_hash. It does NOT cover scope, reason,
+        agent_id or task_id, it is cut to 16 hex characters (64 bits), and no
+        function verifies the chain yet. Do not treat it as tamper evidence.
+        """
         data = f"{self.entry_id}{self.timestamp}{self.user_id}{self.capability}{self.action}{self.prev_hash}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
@@ -200,17 +219,23 @@ class PermissionEngine:
     """
     ARIA's zero-trust permission guardian.
 
-    Every single capability check flows through this class.
-    If check() returns False, the action does not happen. Period.
-    No exceptions. No bypasses. No internal overrides.
+    Every capability check that is made flows through this class, and it
+    denies by default: with no valid grant, check() returns False and logs
+    the denial.
 
-    The only thing ARIA can do without user permission is:
-      - Read its own source files for self-analysis (but not modify them)
-      - Access in-memory data it created in the current session
-      - Log to the audit trail
-      - Display text responses to the user
+    What this class can and cannot do. It ANSWERS questions. It cannot stop
+    code that never asks. A tool or agent body that does not call check() or
+    require() is not blocked by it. Today these places ask: the orchestrator
+    (required_capabilities and memory writes), the web agent, the improvement
+    engine (AGENT_SPAWN, CODE_EXECUTE) and the patcher (SELF_MODIFY). Agent
+    tool calls and most agent bodies do not. Enforcing the check at tool call
+    time is tracked in issue #42. See "What is and is not enforced today" in
+    docs/architecture.md.
 
-    Everything else requires explicit user permission.
+    The intent is that ARIA does nothing with user data or resources without
+    an explicit grant, apart from: reading its own source for self-analysis,
+    using in-memory data from the current session, logging to the audit
+    trail, and showing text responses to the user.
     """
 
     def __init__(self, persist_path: Optional[str] = None):
@@ -226,7 +251,7 @@ class PermissionEngine:
         if self._persist_path and self._persist_path.exists():
             self._load()
 
-    # ── Permission Checking (called before EVERY action) ──────────────────────
+    # ── Permission Checking (callers must ask: see "What is and is not enforced") ─
 
     def check(
         self,
@@ -239,8 +264,9 @@ class PermissionEngine:
         """
         Check if a user has granted ARIA permission for a capability.
 
-        This is called before EVERY tool execution, file access,
-        network call, or any action that touches user data or resources.
+        Code that touches user data or resources is meant to call this
+        first. The engine cannot make it do so: callers that skip the check
+        are not blocked (see the class docstring and docs/architecture.md).
 
         Returns True only if a valid, non-expired, in-scope grant exists.
         Everything else returns False and logs the denial.
@@ -311,6 +337,9 @@ class PermissionEngine:
         The hours parameter defaults to the capability's safe default.
         Users can override it but ARIA will warn about long-lived grants.
         """
+        # Stored in canonical form. Raises ValueError for a relative path.
+        scope = canonical_scope(scope)
+
         effective_hours = hours if hours is not None else DEFAULT_EXPIRY_HOURS[capability]
         expires_at = time.time() + (effective_hours * 3600) if effective_hours > 0 else 0
 
@@ -333,7 +362,7 @@ class PermissionEngine:
         self._grants[user_id][capability.value].append(grant)
 
         expiry_desc = f"{effective_hours}h" if expires_at else "no expiry"
-        scope_desc  = f" for scope '{scope}'" if scope != "*" else ""
+        scope_desc  = f" for scope {scope!r}" if scope != "*" else ""
         print(
             f"[Permission] ✅ Granted '{capability.value}'{scope_desc} "
             f"to user '{user_id}' (expires: {expiry_desc})"
@@ -353,11 +382,16 @@ class PermissionEngine:
         Revoke all grants for a user/capability/scope combination.
         Returns number of grants revoked.
         """
+        names = {scope}
+        try:
+            names.add(canonical_scope(scope))  # any spelling of the same path
+        except ValueError:
+            pass  # not canonical, so only an exact text match can revoke it
         grants = self._grants.get(user_id, {}).get(capability.value, [])
         before = len(grants)
         self._grants[user_id][capability.value] = [
             g for g in grants
-            if not (g.scope == scope or scope == "*")
+            if not ((isinstance(g.scope, str) and g.scope in names) or scope == "*")
         ]
         revoked = before - len(self._grants[user_id][capability.value])
         if revoked:
@@ -561,6 +595,19 @@ class PermissionEngine:
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
+    def _warn_about_dead_grants(self):
+        """Say so when a saved grant can no longer match anything (honest reporting)."""
+        for uid, caps in self._grants.items():
+            for cap, grants in caps.items():
+                for g in grants:
+                    if g.is_valid and not grant_is_stable(g.scope):
+                        print(
+                            f"[Permission] ⚠️  Saved grant {g.grant_id} for '{cap}' "
+                            f"(user '{uid}', scope {g.scope!r}) matches nothing: the path "
+                            "or URL is not in canonical form, or changed since it was granted. "
+                            "Grant it again if it is still wanted."
+                        )
+
     def _save(self):
         if not self._persist_path:
             return
@@ -614,6 +661,7 @@ class PermissionEngine:
                         )
                         for g in grants
                     ]
+            self._warn_about_dead_grants()
             print(f"[Permission] Loaded permissions from {self._persist_path}")
         except Exception as e:
             # Auto-recover — delete the corrupted file and start clean
