@@ -5,11 +5,14 @@ Nothing here really waits: every policy gets a recording fake sleep, a fake cloc
 fixed random source. The vendor SDKs are replaced by fakes injected into sys.modules.
 """
 import asyncio
+import copy
 import errno
 import pickle
 import socket
 import ssl
 import sys
+import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -257,8 +260,19 @@ class TestClassify:
         exc = TimeoutConfigError("x")
         exc.status_code = 503
         assert classify(exc) is LLMErrorCode.SERVER
-        exc.status_code = 302      # not mapped to a code, but still counts as "has a status"
-        assert classify(exc) is LLMErrorCode.TIMEOUT
+
+    def test_an_unmapped_status_does_not_turn_name_matching_back_on(self):
+        class TimeoutConfigError(ValueError):
+            pass
+
+        exc = TimeoutConfigError("x")
+        exc.status_code = 302      # a redirect: not a provider error code
+        assert classify(exc) is LLMErrorCode.UNKNOWN
+
+    @pytest.mark.parametrize("name", ["ReadError", "ConnectionStringInvalid", "WriteError"])
+    def test_non_programming_errors_with_transport_like_names_are_transport(self, name):
+        # Documented behaviour: matching is by name, so look-alike names are caught too.
+        assert classify(type(name, (Exception,), {})("x")) is LLMErrorCode.TRANSPORT
 
     def test_classify_never_raises_on_hostile_attributes(self):
         class Hostile(Exception):
@@ -444,6 +458,31 @@ class TestBackoff:
         with pytest.raises(TypeError, match=next(iter(kwargs))):
             RetryPolicy(**kwargs)
 
+    @pytest.mark.parametrize("kwargs", [
+        {"max_retries": 101}, {"max_retries": 10 ** 30}, {"max_history": 100_001},
+        {"max_history": 10 ** 30},
+    ])
+    def test_upper_bounds_give_a_clear_value_error(self, kwargs):
+        with pytest.raises(ValueError, match=next(iter(kwargs))):
+            RetryPolicy(**kwargs)
+
+    def test_upper_bounds_themselves_are_accepted(self):
+        RetryPolicy(max_retries=100, max_history=100_000)
+
+    @pytest.mark.parametrize("kwargs", [
+        {"sleep": 5}, {"sleep": "fast"}, {"clock": 1.0}, {"clock": "now"},
+        {"rng": 0.5}, {"rng": []},
+    ])
+    def test_sleep_clock_and_rng_must_be_callable(self, kwargs):
+        with pytest.raises(TypeError, match=next(iter(kwargs))):
+            RetryPolicy(**kwargs)
+
+    def test_none_for_sleep_clock_and_rng_means_the_default(self):
+        policy = RetryPolicy(sleep=None, clock=None, rng=None)
+        assert callable(policy.clock) and callable(policy.rng)
+        assert policy.sleep is None
+        assert 0.0 <= policy.delay_for(1) <= 0.5
+
     def test_boundary_values_are_accepted(self):
         RetryPolicy(max_retries=0, base_delay=0, max_delay=0, multiplier=1, jitter=0,
                     max_history=1)
@@ -591,7 +630,7 @@ class TestCallWithRetry:
         assert original.code == "vendor_code"
         assert info.value.code is LLMErrorCode.SERVER
 
-    async def test_llm_error_can_be_pickled(self):
+    async def test_llm_error_pickles_without_its_cause(self):
         policy = make_policy()
         with pytest.raises(LLMError) as info:
             await call_with_retry(Flaky([ConnectionError("down")] * 9), policy)
@@ -599,8 +638,64 @@ class TestCallWithRetry:
         assert type(clone) is LLMError
         assert str(clone) == str(info.value)
         assert (clone.code, clone.attempts) == (LLMErrorCode.TRANSPORT, 4)
-        assert isinstance(clone.cause, ConnectionError)
+        assert clone.cause is None
+        assert clone.cause_type == "ConnectionError" and clone.cause_text == "down"
         assert [r.outcome for r in clone.history] == ["retry", "retry", "retry", "exhausted"]
+        assert clone.history == info.value.history
+
+    async def test_llm_error_wrapping_a_kw_only_exception_round_trips(self):
+        original = FakeAPIStatusError(
+            "server broke", response=SimpleNamespace(status_code=500, headers={}),
+            body={"error": "x"})
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        clone = pickle.loads(pickle.dumps(info.value))
+        assert clone.code is LLMErrorCode.SERVER and clone.attempts == 4
+        assert clone.cause is None
+        assert clone.cause_type == "FakeAPIStatusError"
+        assert clone.cause_text == "server broke"
+        assert str(clone) == str(info.value)
+
+    async def test_llm_error_wrapping_an_unpicklable_exception_round_trips(self):
+        original = ConnectionError("down")
+        original.lock = threading.Lock()                  # cannot be pickled
+        original.callback = lambda: None                  # nor can this
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        clone = pickle.loads(pickle.dumps(info.value))
+        assert clone.cause is None and clone.cause_type == "ConnectionError"
+
+    async def test_pickled_bytes_do_not_contain_secrets_from_the_cause(self):
+        original = FakeAPIStatusError(
+            "bad call api_key=BODYSECRET111 sk-ant-api03-PICKLESECRET222",
+            response=SimpleNamespace(status_code=400, headers={"x-api-key": "HEADERSECRET333"}),
+            body={"api_key": "BODYSECRET111", "password": "PICKLESECRET444"})
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original]), make_policy())
+        data = pickle.dumps(info.value)
+        for secret in (b"BODYSECRET111", b"PICKLESECRET222", b"PICKLESECRET444",
+                       b"HEADERSECRET333"):
+            assert secret not in data
+        assert b"FakeAPIStatusError" in data           # the type name is kept
+
+    async def test_copy_and_deepcopy_keep_working_and_keep_the_cause(self):
+        original = ConnectionError("down")
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original] * 9), make_policy())
+        for clone in (copy.copy(info.value), copy.deepcopy(info.value)):
+            assert type(clone) is LLMError and clone is not info.value
+            assert clone.cause is original
+            assert (clone.code, clone.attempts, str(clone)) == (
+                info.value.code, info.value.attempts, str(info.value))
+            assert clone.history == info.value.history
+
+    async def test_cause_text_is_redacted_and_cause_is_untouched(self):
+        original = AuthenticationError("bad api_key=CAUSESECRET555 " + "z" * 900)
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([original]), make_policy())
+        assert "CAUSESECRET555" not in info.value.cause_text
+        assert len(info.value.cause_text) < 700
+        assert "CAUSESECRET555" in str(original)
 
     async def test_many_different_exception_types_do_not_create_new_error_classes(self):
         before = LLMError.__subclasses__()
@@ -837,9 +932,140 @@ class TestErrorTextSafety:
         assert sanitize_error_text("y" * 500) == "y" * 500
 
     def test_a_secret_on_the_cut_boundary_is_redacted_before_cutting(self):
-        text = "a" * 495 + " sk-ant-api03-FAKEFAKEFAKEFAKE1234 " + "b" * 100
+        # An AWS key id (20 characters) starts at position 490. Only its first 10 characters
+        # are left before the cut at 500, which is too short to be recognised as a key. If
+        # cutting ran BEFORE redaction, that fragment ("AKIAABCDEF") would survive.
+        text = "f" * 489 + " AKIAABCDEFGHIJKLMNOP" + " tail" * 40
+        assert len(text) > 500 and text[490:500] == "AKIAABCDEF"
         cleaned = sanitize_error_text(text)
-        assert "FAKEFAKE" not in cleaned and "sk-ant" not in cleaned
+        assert "ABCDEF" not in cleaned and "AKIA" not in cleaned
+        assert "[REDACTED]" in cleaned
+        assert "truncated" in cleaned
+
+    def test_truncation_marker_reports_the_length_before_redaction(self):
+        text = ("password=" + "x" * 50 + " " + "y" * 40 + " ") * 20      # 2020 characters
+        assert len(text) == 2020
+        cleaned = sanitize_error_text(text)
+        assert "xxxxx" not in cleaned
+        assert "original length 2020 characters" in cleaned
+
+    @pytest.mark.parametrize("text,secret", [
+        ("password=PWSECRET1 ok", "PWSECRET1"),
+        ("passwd=PWSECRET2 ok", "PWSECRET2"),
+        ('{"password": "PWSECRET3 with spaces"}', "PWSECRET3"),
+        ("client_secret=CSSECRET4&grant=1", "CSSECRET4"),
+        ("secret=CSSECRET5 ok", "CSSECRET5"),
+        ("token=TOKSECRET6 ok", "TOKSECRET6"),
+        ("access_token=TOKSECRET7 ok", "TOKSECRET7"),
+        ('{"access_token": "TOKSECRET8"}', "TOKSECRET8"),
+        ("Cookie: session=COOKSECRET9; theme=dark", "COOKSECRET9"),
+        ("Cookie: session=COOKSECRET9; theme=dark", "theme=dark"),
+        ("Set-Cookie: sid=COOKSECRET10; HttpOnly; Secure", "COOKSECRET10"),
+        ("{'cookie': 'sid=COOKSECRET11; a=b'}", "COOKSECRET11"),
+        ("X-Auth-Token: AUTHSECRET12", "AUTHSECRET12"),
+        ("OpenAI-Organization: org-ORGSECRET13", "ORGSECRET13"),
+        ("Authorization: Basic BASICSECRET14", "BASICSECRET14"),
+        ("Authorization: Token TOKENSECRET15", "TOKENSECRET15"),
+        ("Authorization: Bearer BEARSECRET16 rejected", "BEARSECRET16"),
+        ("Authorization: CustomScheme CUSTSECRET17", "CUSTSECRET17"),
+        ("Authorization: JUSTASECRET18", "JUSTASECRET18"),
+        ('Authorization: Digest username="u", nonce="NONCESECRET19", '
+         'response="RESPSECRET20", opaque="x"', "NONCESECRET19"),
+        ('Authorization: Digest username="u", nonce="NONCESECRET19", '
+         'response="RESPSECRET20", opaque="x"', "RESPSECRET20"),
+        ("AWS id AKIAABCDEFGHIJKLMNOP end", "AKIAABCDEFGHIJKLMNOP"),
+        ("temporary ASIAABCDEFGHIJKLMNOP end", "ASIAABCDEFGHIJKLMNOP"),
+        ("aws_secret_access_key=AWSSECRET21/abc+def", "AWSSECRET21"),
+        ("key AIza" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r" + " end",
+         "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"),
+        ("gh ghp_abcdefghijklmnopqrstuvwxyz012345 end", "abcdefghijklmnopqrstuvwxyz012345"),
+        ("gh gho_abcdefghijklmnopqrstuvwxyz012345 end", "abcdefghijklmnopqrstuvwxyz012345"),
+        ("gh ghs_abcdefghijklmnopqrstuvwxyz012345 end", "abcdefghijklmnopqrstuvwxyz012345"),
+        ("gh github_pat_11ABCDEFG0abcdefghijklmnopqrstuv end",
+         "11ABCDEFG0abcdefghijklmnopqrstuv"),
+        ("slack xoxb-123456789012-ABCDEFGHIJKL end", "ABCDEFGHIJKL"),
+        ("slack xoxa-123456789012-ABCDEFGHIJKL end", "ABCDEFGHIJKL"),
+        ("slack xoxp-123456789012-ABCDEFGHIJKL end", "ABCDEFGHIJKL"),
+        ("slack xoxr-123456789012-ABCDEFGHIJKL end", "ABCDEFGHIJKL"),
+        ("slack xoxs-123456789012-ABCDEFGHIJKL end", "ABCDEFGHIJKL"),
+        ("key sk-abc.def.DOTSECRET22 end", "DOTSECRET22"),
+        ("key sk-proj-abc-def-DASHSECRET23 end", "DASHSECRET23"),
+        ('{\\"api_key\\": \\"ESCSECRET24\\"}', "ESCSECRET24"),
+        ("api%5Fkey=URLSECRET25&x=1", "URLSECRET25"),
+        ("api%5fkey=URLSECRET26&x=1", "URLSECRET26"),
+        ("?a=1&key%3DURLSECRET27", "URLSECRET27"),
+        ("?a=1&password%3DURLSECRET28", "URLSECRET28"),
+        ('api_key = "SPACEA SPACEB" after', "SPACEA"),
+        ('api_key = "SPACEA SPACEB" after', "SPACEB"),
+        ("api_key = 'SPACEC SPACED' after", "SPACED"),
+        ("\uff50\uff41\uff53\uff53\uff57\uff4f\uff52\uff44=FULLSECRET29", "FULLSECRET29"),
+        ("ｔｏｋｅｎ＝FULLSECRET30", "FULLSECRET30"),
+        ("ａｐｉ＿ｋｅｙ: FULLSECRET31", "FULLSECRET31"),
+        ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.JWTSIGNATURE32", "JWTSIGNATURE32"),
+        ('bad "password":"NOSPACESECRET33"', "NOSPACESECRET33"),
+    ])
+    def test_more_secret_shapes_are_redacted(self, text, secret):
+        cleaned = sanitize_error_text(text)
+        assert secret not in cleaned
+        assert "[REDACTED]" in cleaned
+
+    @pytest.mark.parametrize("text", [
+        "plain failure", "monkey=banana", "task-skill-1", "max_tokens=100", "tokens used 5",
+        "status 429 rate limited", "ask-me-later", "the key is missing",
+    ])
+    def test_harmless_text_survives(self, text):
+        assert sanitize_error_text(text) == text
+
+    def test_redaction_is_stable_when_applied_twice(self):
+        text = ("Authorization: Digest nonce=\"N1\" Cookie: a=b password = \"p q\" "
+                "key=K1 aws_secret_access_key=ABC sk-abcdefgh12345")
+        once = sanitize_error_text(text)
+        assert sanitize_error_text(once) == once
+
+    def test_every_pattern_is_fast_on_100k_character_inputs(self):
+        size = 100_000
+
+        def rep(unit):
+            return (unit * (size // len(unit) + 1))[:size]
+
+        inputs = {
+            "labels": rep("api_key="), "password": rep("password="),
+            "password+spaces": "password" + " " * size,
+            "password+open quote": 'password="' + "a" * size,
+            "password+quoted spaces": 'password="' + "a b " * (size // 4),
+            "password+unclosed": rep('password="a '), "escaped quotes": rep('\\"'),
+            "quotes": '"' * size, "apostrophes": "'" * size,
+            "auth+spaces": "Authorization:" + " " * size,
+            "auth words": "Authorization: " + "a " * (size // 2),
+            "auth repeat": rep("Authorization: x y "),
+            "digest": "Authorization: Digest " + "a" * size, "digest repeat": rep("authorization:digest "),
+            "cookie": "Cookie: " + "a" * size, "cookie repeat": rep("cookie:"),
+            "cookie lines": rep("cookie: a\n"),
+            "sk": "sk-" + "a" * size, "sk repeat": rep("sk-"), "sk dots": "sk-" + "a." * (size // 2),
+            "akia": rep("AKIA"), "akia long": "AKIA" + "A" * size,
+            "aiza": rep("AIza"), "aiza long": "AIza" + "a" * size,
+            "ghp": rep("ghp_"), "ghp long": "ghp_" + "a" * size, "pat": rep("github_pat_"),
+            "xox": rep("xoxb-"), "xox long": "xoxb-" + "a" * size,
+            "%5F": rep("%5F"), "%3D": rep("%3D"), "key%3D": rep("key%3D"),
+            "api%5Fkey": rep("api%5Fkey"), "token=====": "token" + "=" * size,
+            "token quote repeat": rep('token="'), "json escaped": rep('{\\"api_key\\": \\"'),
+            "bearer repeat": rep("bearer "), "bearer+spaces": "bearer" + " " * size,
+            "bearer long": "bearer " + "a" * size,
+            "jwt": "eyJ" + "a" * size, "jwt dots": rep("eyJaaaaaaaaaa."),
+            "full-width": "ａ" * size, "full-width label": rep("ｐａｓｓｗｏｒｄ＝"),
+            "combining": rep("e\u0301"), "backslashes": "\\" * size,
+            "key repeat": rep("key="), "monkey": rep("monkey"), "plain": "a" * size,
+            "partial words": "secre" * (size // 5), "token repeat": rep("token"),
+            "label with space sep": rep("token : "),
+        }
+        slowest = 0.0
+        for name, text in inputs.items():
+            started = time.perf_counter()
+            sanitize_error_text(text)
+            took = time.perf_counter() - started
+            slowest = max(slowest, took)
+            assert took < 2.0, f"{name} took {took:.2f}s"
+        assert slowest < 2.0
 
     async def test_records_stats_and_message_are_sanitised_but_cause_is_untouched(self):
         secret_text = ("401 for sk-ant-api03-FAKEFAKEFAKEFAKE1234, "
@@ -869,6 +1095,19 @@ class TestErrorTextSafety:
         await call_with_retry(Flaky([exc]), policy)
         assert "AIzaFakeQueryKey999" not in policy.history[0].error
         assert len(policy.history[0].error) < 700
+
+    async def test_error_whose_class_name_raises_is_still_handled(self):
+        class Meta(type):
+            @property
+            def __name__(cls):
+                raise RuntimeError("no name")
+
+        class Odd(Exception, metaclass=Meta):
+            pass
+
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([Odd("odd failure")]), make_policy())
+        assert "odd failure" in str(info.value)
 
     async def test_error_whose_str_raises_is_still_handled(self):
         class BadStr(Exception):
@@ -1050,6 +1289,35 @@ class TestAnthropicRetry:
         install_anthropic(monkeypatch, [a_response([a_tool()])])
         assert await AnthropicPlugin(api_key="k", retry_policy=make_policy()).complete("p") == ""
 
+    async def test_a_refusal_in_chat_is_returned_not_retried(self, monkeypatch):
+        refusal = a_response([])
+        refusal.stop_reason = "refusal"
+        sdk = install_anthropic(monkeypatch, [refusal])
+        plugin = AnthropicPlugin(api_key="k", retry_policy=make_policy())
+
+        result = await plugin.chat(USER)
+
+        assert result == {"content": "", "tool_calls": [], "tokens_used": 15}
+        assert len(sdk.requests) == 1
+        assert plugin.retry_stats()["retries"] == 0
+
+    async def test_a_refusal_in_complete_returns_an_empty_string(self, monkeypatch):
+        refusal = a_response([])
+        refusal.stop_reason = "refusal"
+        sdk = install_anthropic(monkeypatch, [refusal])
+        plugin = AnthropicPlugin(api_key="k", retry_policy=make_policy())
+        assert await plugin.complete("p") == ""
+        assert len(sdk.requests) == 1
+
+    async def test_other_stop_reasons_with_no_content_are_still_empty(self, monkeypatch):
+        cut = a_response([])
+        cut.stop_reason = "max_tokens"
+        sdk = install_anthropic(monkeypatch, [cut])
+        plugin = AnthropicPlugin(api_key="k", retry_policy=make_policy())
+        with pytest.raises(LLMError) as info:
+            await plugin.chat(USER)
+        assert info.value.code is LLMErrorCode.EMPTY and len(sdk.requests) == 4
+
     async def test_message_errors_before_the_call_are_not_retried(self, monkeypatch):
         sdk = install_anthropic(monkeypatch, [a_response([a_text("x")])])
         plugin = AnthropicPlugin(api_key="k", retry_policy=make_policy())
@@ -1194,6 +1462,35 @@ class TestOpenAIRetry:
         result = await plugin.chat(USER)
         assert result["content"] == "recovered"
         assert plugin.retry_history()[0].code is LLMErrorCode.EMPTY
+
+    async def test_a_refusal_in_chat_is_returned_not_retried(self, monkeypatch):
+        response = o_response(None)
+        response.choices[0].message.refusal = "I cannot help with that."
+        sdk = install_openai(monkeypatch, [response])
+        plugin = OpenAIPlugin(api_key="k", retry_policy=make_policy())
+
+        result = await plugin.chat(USER)
+
+        assert result == {"content": "", "tool_calls": [], "tokens_used": 42}
+        assert len(sdk.requests) == 1
+        assert plugin.retry_stats()["retries"] == 0
+
+    async def test_a_content_filter_stop_is_returned_not_retried(self, monkeypatch):
+        response = o_response(None)
+        response.choices[0].finish_reason = "content_filter"
+        sdk = install_openai(monkeypatch, [response])
+        plugin = OpenAIPlugin(api_key="k", retry_policy=make_policy())
+        assert (await plugin.chat(USER))["content"] == ""
+        assert len(sdk.requests) == 1
+
+    async def test_an_empty_refusal_field_does_not_count_as_a_refusal(self, monkeypatch):
+        response = o_response(None)
+        response.choices[0].message.refusal = None
+        sdk = install_openai(monkeypatch, [response])
+        plugin = OpenAIPlugin(api_key="k", retry_policy=make_policy(max_retries=1))
+        with pytest.raises(LLMError) as info:
+            await plugin.chat(USER)
+        assert info.value.code is LLMErrorCode.EMPTY and len(sdk.requests) == 2
 
     async def test_chat_with_only_tool_calls_is_not_empty(self, monkeypatch):
         call = SimpleNamespace(

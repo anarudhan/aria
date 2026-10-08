@@ -23,6 +23,19 @@ from .retry import AttemptRecord, EmptyResponseError, RetryPolicy, call_with_ret
 _T = TypeVar("_T")
 
 
+def _anthropic_refused(response: Any) -> bool:
+    """True when the model declined (stop_reason "refusal"). That answer is final: not retried."""
+    return getattr(response, "stop_reason", None) == "refusal"
+
+
+def _openai_declined(choice: Any) -> bool:
+    """True when the model refused or the content filter blocked the answer. Not retried."""
+    message = getattr(choice, "message", None)
+    return bool(getattr(message, "refusal", None)) or (
+        getattr(choice, "finish_reason", None) == "content_filter"
+    )
+
+
 class _RetryMixin:
     """
     Shared retry behaviour for LLM plugins.
@@ -121,6 +134,8 @@ class AnthropicPlugin(_RetryMixin):
                 messages   = [{"role": "user", "content": prompt}],
             )
             if not response.content:
+                if _anthropic_refused(response):
+                    return ""   # a refusal is final; retrying it only costs money
                 raise EmptyResponseError("Anthropic returned a response with no content blocks")
             block = response.content[0]
             if block.type == "text":
@@ -196,7 +211,7 @@ class AnthropicPlugin(_RetryMixin):
                         "id":        block.id,
                     })
 
-            if not text_content and not tool_calls:
+            if not text_content and not tool_calls and not _anthropic_refused(response):
                 raise EmptyResponseError("Anthropic returned no text and no tool calls")
 
             tokens_used = response.usage.input_tokens + response.usage.output_tokens
@@ -281,7 +296,7 @@ class OpenAIPlugin(_RetryMixin):
                         args = {}
                     tool_calls.append({"name": tc.function.name, "arguments": args, "id": tc.id})
 
-            if not msg.content and not tool_calls:
+            if not msg.content and not tool_calls and not _openai_declined(response.choices[0]):
                 raise EmptyResponseError("OpenAI returned no text and no tool calls")
 
             tokens_used = response.usage.total_tokens if response.usage else 0

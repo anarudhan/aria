@@ -33,6 +33,7 @@ import re
 import socket
 import ssl
 import time
+import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
@@ -92,13 +93,21 @@ class LLMError(Exception):
     An LLM call failed for good: retries ran out, or the error is not retryable.
 
     Attributes:
-        code:      the LLMErrorCode of the last failure
-        attempts:  how many calls were made in total
-        cause:     the original exception (also chained as ``__cause__``)
-        history:   the attempt records of this one call, oldest first
+        code:       the LLMErrorCode of the last failure
+        attempts:   how many calls were made in total
+        cause:      the original exception (also chained as ``__cause__``). It is the
+                    untouched original, so it holds the ORIGINAL, unredacted text.
+        cause_type: the class name of the cause, as text
+        cause_text: the cause's message, redacted and cut (see sanitize_error_text)
+        history:    the attempt records of this one call, oldest first
 
     It is a plain exception (not a subclass of the original one), so catch ``LLMError`` and
-    look at ``.cause`` or ``.code`` to decide what to do. The original is never modified.
+    look at ``.code`` (and ``.cause`` if you need the original) to decide what to do.
+
+    Pickling keeps ``code``, ``attempts``, the message, ``cause_type``, ``cause_text`` and
+    ``history``, and DROPS ``cause`` (it becomes None). Real SDK errors often cannot be
+    unpickled, and pickling them would copy their unredacted text. ``copy.copy`` and
+    ``copy.deepcopy`` keep the same ``cause`` object.
     """
 
     def __init__(
@@ -116,9 +125,41 @@ class LLMError(Exception):
         self.attempts = attempts
         self.cause    = cause
         self.history  = history
+        self.cause_type = "" if cause is None else _type_name(cause)
+        self.cause_text = "" if cause is None else sanitize_error_text(_safe_str(cause))
 
     def __str__(self) -> str:
         return self.message
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (
+            _rebuild_llm_error,
+            (self.message, self.code.value, self.attempts, self.cause_type,
+             self.cause_text, tuple(self.history)),
+        )
+
+    def __copy__(self) -> "LLMError":
+        clone = LLMError(self.message, code=self.code, attempts=self.attempts,
+                         cause=self.cause, history=tuple(self.history))
+        clone.cause_type, clone.cause_text = self.cause_type, self.cause_text
+        return clone
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "LLMError":
+        return self.__copy__()
+
+
+def _rebuild_llm_error(
+    message: str,
+    code_value: str,
+    attempts: int,
+    cause_type: str,
+    cause_text: str,
+    history: tuple[AttemptRecord, ...],
+) -> LLMError:
+    err = LLMError(message, code=LLMErrorCode(code_value), attempts=attempts,
+                   cause=None, history=history)
+    err.cause_type, err.cause_text = cause_type, cause_text
+    return err
 
 
 def _build_error(
@@ -155,8 +196,8 @@ _EXACT_NAMES: dict[str, LLMErrorCode] = {
 }
 
 # Plain programming errors are never classified by their class NAME (a "TimeoutConfigError"
-# that is a ValueError is a bug in the caller, not a provider timeout). A real HTTP status on
-# them is still honoured.
+# that is a ValueError is a bug in the caller, not a provider timeout). A mapped HTTP status
+# on them is still honoured, because the status check runs first.
 _PROGRAMMING_ERRORS = (
     ValueError, TypeError, KeyError, IndexError, AttributeError, AssertionError, LookupError,
 )
@@ -220,7 +261,7 @@ def classify(exc: BaseException) -> LLMErrorCode:
 
     Order: our own errors, then an HTTP status, then exception class names (the whole
     class hierarchy, most specific class first; skipped for plain programming errors such
-    as ValueError unless they carry an HTTP status), then builtin timeout, TLS and network
+    as ValueError), then builtin timeout, TLS and network
     errors.
     """
     try:
@@ -241,7 +282,7 @@ def _classify(exc: BaseException) -> LLMErrorCode:
         if code is not None:
             return code
 
-    if status is not None or not isinstance(exc, _PROGRAMMING_ERRORS):
+    if not isinstance(exc, _PROGRAMMING_ERRORS):
         for klass in type(exc).__mro__:
             name = klass.__name__.lower()
             if name in _EXACT_NAMES:
@@ -344,11 +385,16 @@ class AttemptRecord:
         return data
 
 
-def _check_int(name: str, value: Any, *, minimum: int) -> None:
+MAX_RETRIES_LIMIT = 100
+MAX_HISTORY_LIMIT = 100_000
+
+
+def _check_int(name: str, value: Any, *, minimum: int, maximum: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer, got {value!r}")
-    if value < minimum:
-        raise ValueError(f"{name} must be {minimum} or more, got {value!r}")
+    if value < minimum or value > maximum:
+        shown = repr(value) if abs(value) < 10 ** 12 else "a very large number"
+        raise ValueError(f"{name} must be between {minimum} and {maximum}, got {shown}")
 
 
 def _check_number(
@@ -395,6 +441,7 @@ class RetryPolicy:
     sleep: Optional[Callable[[float], Awaitable[Any]]] = field(default=None, repr=False)
     clock: Callable[[], float]               = field(default=time.time, repr=False)
     rng:   Callable[[], float]               = field(default=random.random, repr=False)
+    # clock and rng may also be passed as None, which means the default.
 
     history: deque[AttemptRecord] = field(init=False, repr=False, compare=False)
     _counters: dict[str, int] = field(init=False, repr=False, compare=False)
@@ -402,12 +449,20 @@ class RetryPolicy:
     _last_error: Optional[dict[str, Any]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _check_int("max_retries", self.max_retries, minimum=0)
+        _check_int("max_retries", self.max_retries, minimum=0, maximum=MAX_RETRIES_LIMIT)
         _check_number("base_delay", self.base_delay, minimum=0)
         _check_number("max_delay", self.max_delay, minimum=0)
         _check_number("multiplier", self.multiplier, minimum=1)
         _check_number("jitter", self.jitter, minimum=0, maximum=1)
-        _check_int("max_history", self.max_history, minimum=1)
+        _check_int("max_history", self.max_history, minimum=1, maximum=MAX_HISTORY_LIMIT)
+        if self.sleep is not None and not callable(self.sleep):
+            raise TypeError(f"sleep must be callable or None, got {self.sleep!r}")
+        for name, default in (("clock", time.time), ("rng", random.random)):
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, default)
+            elif not callable(value):
+                raise TypeError(f"{name} must be callable or None, got {value!r}")
         self.history = deque(maxlen=self.max_history)
         self.reset()
 
@@ -515,52 +570,114 @@ MAX_ERROR_TEXT = 500
 
 _REDACTED = "[REDACTED]"
 
-# Applied in order. Each keeps the label and hides only the secret value.
+# Building blocks. Every repetition is bounded or applies to a character class that cannot
+# overlap with the next part, and no pattern starts with an open-ended prefix, so matching
+# stays linear in the input size (see the 100k-character timing test).
+_S = r"(?:[-_]|%5[Ff]|%2[Dd])?"                      # optional "_" or "-" inside a label
+_SEP = r"""(?:\\?["'])?\s{0,5}(?:[:=]|%3[AaDd])\s{0,5}"""   # [closing quote] : or = [spaces]
+_QUOTED = r"""\\?"[^"\\]{0,1000}\\?"|\\?'[^'\\]{0,1000}\\?'"""   # also JSON-escaped \"..\"
+_BARE_CHARS = r"""[^\s,;'"&}\])\\]"""
+_BARE = rf"""\\?["']?{_BARE_CHARS}+"""                # also an unterminated opening quote
+_NOT_DONE = r"(?!\s*\[REDACTED\])"                      # never re-redact our own marker
+_VALUE = rf"{_NOT_DONE}(?:{_QUOTED}|{_BARE})"
+
+
+def _label(words: str) -> "re.Pattern[str]":
+    return re.compile(rf"(?i)((?:{words}){_SEP})" + _VALUE)
+
+
+# Applied in order after NFKC normalisation. Each keeps the label and hides only the value.
 _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
-    # Header or field style: Authorization: Bearer abc / 'x-api-key': 'abc' / api_key="abc"
-    (re.compile(
-        r"""(?ix)
-        ((?:proxy-)?authorization|x-api-key|api[-_]?key)   # label
-        (["']?\s*[:=]\s*["']?)                              # separator
-        (?:(?:bearer|basic)\s+)?                            # optional scheme
-        [^\s,;'"&}\])]+                                     # the secret
-        """), r"\1\2" + _REDACTED),
-    # Bearer tokens anywhere
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+"), "Bearer " + _REDACTED),
-    # sk-... style keys (sk-ant-api03-..., sk-proj-..., sk-live-...)
-    (re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"), "sk-" + _REDACTED),
-    # URL query values: ?key=abc&other=1
-    (re.compile(r"(?i)([?&](?:key|api[-_]?key|access[-_]?token|token)=)[^&\s'\"]+"),
+    # Authorization: Digest username="x", nonce="y", response="z"  -> the whole header value
+    (re.compile(r"(?i)(authorization" + _SEP + r")digest\b[^\n\r]{0,2000}"),
      r"\1" + _REDACTED),
+    # Authorization: <any scheme> <value>  (one or two words, so the value is always hidden)
+    (re.compile(
+        rf"(?i)(authorization{_SEP}){_NOT_DONE}"
+        rf"(?:{_QUOTED}|{_BARE}(?:[ \t]{{1,10}}(?!\s*\[REDACTED\]){_BARE_CHARS}+)?)"),
+     r"\1" + _REDACTED),
+    # Cookie: / Set-Cookie: the rest of the header line (or the quoted value)
+    (re.compile(rf"(?i)(cookie{_SEP}){_NOT_DONE}(?:{_QUOTED}|[^\n\r]{{1,2000}})"),
+     r"\1" + _REDACTED),
+    # password=, passwd=, secret=, token=, api_key=, access_key=, openai-organization= ...
+    # (in plain text, JSON, escaped JSON, URL-encoded and with quoted values that hold spaces)
+    (_label(rf"pass(?:word|wd|phrase)|secret|token|api{_S}key|access{_S}key|private{_S}key"
+            rf"|openai{_S}organization"), r"\1" + _REDACTED),
+    # a bare key=value, such as a URL query ?key=abc (not "monkey=")
+    (re.compile(rf"(?i)((?<![A-Za-z0-9])key(?:=|%3[Dd])){_VALUE}"), r"\1" + _REDACTED),
+    # Bearer tokens anywhere
+    (re.compile(r"(?i)\bbearer\s{1,100}[A-Za-z0-9._~+/=\-]+"), "Bearer " + _REDACTED),
+    # sk-... keys, also with dots (sk-ant-api03-..., sk-proj-..., sk-abc.def.ghi)
+    (re.compile(r"\bsk-[A-Za-z0-9_.\-]{8,}"), "sk-" + _REDACTED),
+    # JSON web tokens
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
+     _REDACTED),
+    # AWS access key ids
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _REDACTED),
+    # Google API keys
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"), _REDACTED),
+    # GitHub tokens
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), _REDACTED),
+    # Slack tokens
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{8,}"), _REDACTED),
 )
 
 
 def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
     """
-    Make error text safe to store and print: hide obvious secrets, then cut it to ``limit``
+    Make error text safer to store and print: hide common secrets, then cut it to ``limit``
     characters (an ellipsis and the original length are added when it is cut).
 
-    Redacted: ``sk-...`` keys, ``Bearer`` tokens, ``Authorization`` / ``x-api-key`` /
-    ``api_key`` values and ``key=`` / ``token=`` URL query values. This is a best-effort
-    filter for common shapes, not a guarantee: other secrets or personal data inside an
-    error message are not detected.
+    BEST EFFORT, NOT A GUARANTEE. The text is first normalised with NFKC (so full-width
+    look-alike letters become plain ones), then these shapes are hidden:
+
+    * values after ``password``, ``passwd``, ``passphrase``, ``secret`` (so also
+      ``client_secret``), ``token`` (``access_token``, ``x-auth-token``), ``api_key``
+      (``x-api-key``), ``access_key`` (``aws_secret_access_key``), ``private_key``,
+      ``openai-organization`` and a bare ``key=``, written with ``=`` or ``:``, in plain
+      text, JSON (also backslash-escaped) and URL-encoded (``api%5Fkey=``, ``key%3D``);
+      quoted values may contain spaces
+    * ``Authorization`` / ``Proxy-Authorization`` values with any scheme (Basic, Bearer,
+      Token, Digest ...); for Digest the whole header value
+    * ``Cookie`` / ``Set-Cookie`` header values
+    * ``Bearer`` tokens, ``sk-`` keys (also with dots), JSON web tokens, AWS key ids
+      (``AKIA``/``ASIA``), Google keys (``AIza``), GitHub tokens (``ghp_`` ``gho_``
+      ``ghu_`` ``ghs_`` ``ghr_`` ``github_pat_``), Slack tokens (``xox[abprs]-``)
+
+    Anything else (other secret formats, secrets with no label, personal data, a secret
+    split by markup) is NOT detected. Redaction runs before cutting, and the marker
+    reports the length of the text as it was given.
     """
+    original_length = len(text)
+    text = unicodedata.normalize("NFKC", text)
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     if len(text) > limit:
-        text = f"{text[:limit]}... [truncated, original length {len(text)} characters]"
+        text = f"{text[:limit]}... [truncated, original length {original_length} characters]"
     return text
 
 
 # ─── The retry loop ───────────────────────────────────────────────────────────
 
+def _type_name(exc: BaseException) -> str:
+    try:
+        name = type(exc).__name__
+        return name if isinstance(name, str) and name else "Exception"
+    except Exception:
+        return "Exception"
+
+
+def _safe_str(exc: BaseException) -> str:
+    try:
+        return str(exc).strip()
+    except Exception:
+        return "<error text unavailable>"
+
+
 def _error_text(exc: BaseException) -> str:
     """Redacted and truncated ``ExceptionType: message`` for records and messages."""
-    try:
-        text = str(exc).strip()
-    except Exception:
-        text = "<error text unavailable>"
-    name = type(exc).__name__
+    text = _safe_str(exc)
+    name = _type_name(exc)
     return sanitize_error_text(f"{name}: {text}" if text else name)
 
 

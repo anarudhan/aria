@@ -26,6 +26,7 @@ Notes on how errors are recognised:
 - An HTTP status (on the error, or on its `response`) wins over the error's class name.
 - Both vendor SDKs retry a 409 conflict, so it is retried here too. There is no "conflict" code, so it is filed under `SERVER`, the closest one.
 - Class names are only used for errors that look like they come from a provider. Plain programming errors (`ValueError`, `TypeError`, `KeyError`, `IndexError`, `AttributeError`, `AssertionError`, `LookupError`) are never sorted by name, so a `TimeoutConfigError(ValueError)` is `UNKNOWN`, not a timeout. If such an error carries an HTTP status, the name is used as before.
+- Names are matched as fragments on errors that are not plain programming errors, so a class named like `ReadError` or `ConnectionStringInvalid` is treated as `TRANSPORT`. A rare false match costs a few retries, nothing more.
 - Looking at an error never raises. If reading an attribute fails, the error is `UNKNOWN`.
 
 An answer counts as `EMPTY` when:
@@ -48,7 +49,7 @@ By default a call is tried once, then retried up to 3 times (4 attempts in total
 
 The wait never goes above 30 seconds. A little random jitter makes each wait up to 25 percent shorter, so many callers that fail together do not all retry at the same moment. Jitter only ever shortens a wait, so it can never push it past the cap.
 
-If the provider says how long to wait (a `retry_after` value on the error, or a `retry-after` or `retry-after-ms` header), ARIA waits that long instead, up to the 30 second cap. Only plain numbers of seconds are understood. A date in the header is ignored and the normal backoff is used.
+If the provider says how long to wait (a `retry_after` value on the error, or a `retry-after` or `retry-after-ms` header), ARIA waits that long instead, up to the 30 second cap. Only plain numbers of seconds are understood. A date in the header is ignored and the normal backoff is used. A value of `0` means "retry at once": the retry happens immediately, and still stops after `max_retries`.
 
 ## When it gives up
 
@@ -61,7 +62,9 @@ If the retries run out, or the error is one that is never retried, the plugin ra
 
 The message says what happened, for example `LLM call failed after 4 attempt(s) [rate_limit]: RateLimitError: slow down`.
 
-`LLMError` is a plain exception. It is not a subclass of the original error, so code that used to catch `ConnectionError` or `TimeoutError` around a plugin call must now catch `LLMError` and look at `.cause` or `.code`. The original exception is never changed. `LLMError` can be pickled as long as its `cause` can be.
+`LLMError` is a plain exception. It is not a subclass of the original error, so code that used to catch `ConnectionError` or `TimeoutError` around a plugin call must now catch `LLMError` and look at `.code` (and `.cause` if you need the original). The original exception is never changed.
+
+`LLMError` can be pickled and copied, but pickling drops the cause. Real SDK errors often cannot be loaded back, and pickling them would copy their unredacted text. After pickling, `err.cause` is `None`, and what is kept is `code`, `attempts`, the message, `cause_type` (the original class name), `cause_text` (the original message, redacted) and `history`. `copy.copy` and `copy.deepcopy` keep the same `cause` object.
 
 Cancelling is always respected. If the task is cancelled during a wait, `asyncio.CancelledError` goes straight up and nothing is retried.
 
@@ -80,13 +83,26 @@ plugin.describe()        # settings, counters and the last few attempts as plain
 
 Each `AttemptRecord` has: `operation` (for example `anthropic.chat`), `attempt` (1, 2, 3 ...), `outcome`, `code`, `delay` (seconds waited before the next try), `error` (the error text), `timestamp` and `retry_after`. The outcome is one of `success`, `retry`, `exhausted` (retries ran out, or the wait between attempts failed), `not_retryable`, or `cancelled` (the task was cancelled, while the call was running or while waiting).
 
-The list keeps the last 200 records so it cannot grow without limit. The counters (`calls`, `succeeded`, `failed`, `cancelled`, `attempts`, `retries`, `failures_by_code`, `last_error`) are never trimmed. ### What is and is not stored
+The list keeps the last 200 records so it cannot grow without limit. The counters (`calls`, `succeeded`, `failed`, `cancelled`, `attempts`, `retries`, `failures_by_code`, `last_error`) are never trimmed. The counters are plain integers and are not thread safe. That is fine inside one asyncio event loop, which is how the plugins run. Do not share one policy between threads.
 
-Stored in the records, the counters' `last_error`, and the `LLMError` message: the error type name and the error text, with obvious secrets hidden and cut to 500 characters (when cut, an ellipsis and the original length are added). The secrets that are hidden are `sk-...` style keys, `Bearer` tokens, `Authorization` and `Proxy-Authorization` values, `x-api-key` and `api_key` values, and `key=`, `api_key=` and `token=` values in a URL. They are replaced with `[REDACTED]`.
+### What is and is not stored
 
-Not stored by this code: prompts, responses and request bodies. But error text is written by the provider and can quote part of a request, and the filter only knows the shapes listed above. It does not find other secrets or personal data. Treat the records as possibly sensitive and do not publish them without looking.
+Stored in the records, the counters' `last_error`, `cause_text` and the `LLMError` message: the error type name and the error text, with common secrets hidden and cut to 500 characters. When cut, an ellipsis is added with the length of the text as it was before any redaction or cutting.
 
-`LLMError.cause` is the original exception, untouched, with its full text. If you log the traceback, Python prints the original message too, unfiltered.
+**Redaction is best effort. It is a list of known shapes, not a guarantee.** Anything not on the list below goes through unchanged, and error text written by a provider can quote part of your request. Treat the records as possibly sensitive and look before you publish them.
+
+The text is first normalised with NFKC (so full-width look-alike letters become normal ones), then these shapes are replaced with `[REDACTED]`:
+
+- Values after `password`, `passwd`, `passphrase`, `secret` (so `client_secret` too), `token` (so `access_token` and `x-auth-token` too), `api_key` (and `x-api-key`), `access_key` (so `aws_secret_access_key` too), `private_key` and `openai-organization`, written with `=` or `:`. This covers plain text, JSON, backslash-escaped JSON (`{\"api_key\": \"X\"}`), URL-encoded labels (`api%5Fkey=X`, `key%3DX`), and quoted values that contain spaces. A bare `key=` (for example in a URL query) is covered too.
+- `Authorization` and `Proxy-Authorization` values with any scheme (Basic, Bearer, Token, Digest and others). For Digest the whole header value, including `nonce` and `response`, is hidden.
+- `Cookie` and `Set-Cookie` header values.
+- `Bearer` tokens anywhere, `sk-` keys (also ones with dots or dashes), JSON web tokens (`eyJ...`), AWS key ids (`AKIA...`, `ASIA...`), Google keys (`AIza...`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`) and Slack tokens (`xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-`).
+
+Not covered: secrets with no label and no known prefix, secrets split across lines or by markup, an opening quote that is never closed (only the first word after it is hidden), personal data, and anything not listed above.
+
+Not stored by this code: prompts, responses and request bodies.
+
+**Tracebacks and `cause` still hold the original text.** `LLMError.cause` and `LLMError.__cause__` are the original exception, untouched, with its full unredacted message and attributes (for an SDK error that can include the response body and headers). Python prints that chained exception when it prints a traceback, so `logger.exception(...)` or `traceback.print_exc()` on an `LLMError` can leak a secret into your logs. To log a failure safely, log `str(err)` together with `err.code` (and `err.attempts`). Do not log `err.cause` or the traceback unless you know the destination is safe.
 
 To send each attempt to the audit trail as it happens, pass a function:
 
@@ -107,7 +123,7 @@ plugin = OpenAIPlugin(retry_policy=RetryPolicy(max_retries=0))   # no retries
 
 Other settings: `multiplier` (default 2.0), `jitter` (0 to 1, default 0.25) and `max_history` (default 200).
 
-Settings are checked when the policy is created. `max_retries` and `max_history` must be whole numbers (`True`, `2.0` and `nan` are rejected), with `max_retries` 0 or more and `max_history` 1 or more. `base_delay` and `max_delay` must be finite numbers 0 or more, `multiplier` 1 or more, and `jitter` between 0 and 1. A wrong type raises `TypeError`, a wrong value raises `ValueError`, and the message names the setting.
+Settings are checked when the policy is created. `max_retries` and `max_history` must be whole numbers (`True`, `2.0` and `nan` are rejected), with `max_retries` 0 or more and `max_history` 1 or more. `base_delay` and `max_delay` must be finite numbers 0 or more, `multiplier` 1 or more, and `jitter` between 0 and 1. `max_retries` may be at most 100 and `max_history` at most 100000. `sleep`, `clock` and `rng` must be callables (`clock` and `rng` may also be `None`, meaning the default). A wrong type raises `TypeError`, a wrong value raises `ValueError`, and the message names the setting.
 
 For tests you can replace the waiting and the randomness: `RetryPolicy(sleep=fake_sleep, clock=fake_clock, rng=lambda: 0.0)`, so a test never really waits. If you do not pass `sleep`, `asyncio.sleep` is looked up at the moment of waiting.
 
@@ -126,10 +142,11 @@ If your call can come back empty, raise `EmptyResponseError` inside the function
 
 Things that behave differently from before this change:
 
-- `chat` can now raise `LLMError(EMPTY)` after the retries where it used to return an empty answer. This happens when the reply has no text and no tool calls: for example a reply with only a "thinking" block, a refusal with no content, or an answer cut off by the length limit before any text.
+- `chat` can now raise `LLMError(EMPTY)` after the retries where it used to return an empty answer. This happens when the reply has no text and no tool calls: for example a reply with only a "thinking" block, or an answer cut off by the length limit before any text. (A refusal is not one of these, see below.)
 - `complete` still returns an empty string when the first block is not text (Anthropic) or the content is `None` (OpenAI). Only a response with no content blocks or no choices at all counts as `EMPTY`.
 - Errors that used to escape as the provider's own exception (or `IndexError`) now arrive as `LLMError`. See "When it gives up" for how to read the original.
 - Tokens spent on attempts that were discarded as empty (or that failed) are not counted in the `tokens_used` that `chat` returns. Only the successful attempt is counted, so the contract does not charge for them.
+- Refusals are the exception to the `EMPTY` rule. A refusal is a final answer and retrying it only costs money, so it is not retried and does not become an error. OpenAI `chat` returns what it always returned (empty content, no tool calls) when the message has a `refusal`, or when the finish reason is `content_filter`. Anthropic `chat` and `complete` do the same when the `stop_reason` is `refusal`. An empty reply for any other reason (for example `max_tokens`) is still `EMPTY`.
 - An OpenAI 429 with `insufficient_quota` is retried like any other 429, even though waiting will not add credit. It fails after the retries run out (about 3.5 seconds with the defaults) with `code=RATE_LIMIT`.
 
 ## Not covered here
