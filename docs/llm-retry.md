@@ -96,6 +96,7 @@ The text is first normalised with NFKC (so full-width look-alike letters become 
 - Values after `password`, `passwd`, `passphrase`, `secret` (so `client_secret` too), `token` (so `access_token` and `x-auth-token` too), `api_key` (and `x-api-key`), `access_key` (so `aws_secret_access_key` too), `private_key` and `openai-organization`, written with `=` or `:`. This covers plain text, JSON, backslash-escaped JSON (`{\"api_key\": \"X\"}`), URL-encoded labels (`api%5Fkey=X`, `key%3DX`), and quoted values that contain spaces. A bare `key=` (for example in a URL query) is covered too.
 - `Authorization` and `Proxy-Authorization` values with any scheme (Basic, Bearer, Token, Digest and others). For Digest the whole header value, including `nonce` and `response`, is hidden.
 - `Cookie` and `Set-Cookie` header values.
+- The password in `scheme://user:password@host` URLs (proxy and connection errors often print these). A URL with only a user name, or only a port, is left alone.
 - `Bearer` tokens anywhere, `sk-` keys (also ones with dots or dashes), JSON web tokens (`eyJ...`), AWS key ids (`AKIA...`, `ASIA...`), Google keys (`AIza...`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`) and Slack tokens (`xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-`).
 
 Not covered: secrets with no label and no known prefix, secrets split across lines or by markup, an opening quote that is never closed (only the first word after it is hidden), personal data, and anything not listed above.

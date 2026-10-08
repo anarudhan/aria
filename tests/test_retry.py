@@ -1539,3 +1539,44 @@ class TestOpenAIRetry:
         await plugin.chat(USER)
         assert plugin.temperature == 0.9
         assert all("temperature" not in request for request in sdk.requests)
+
+
+# ─── Passwords inside URLs (found by an independent check of the redaction filter) ─
+
+
+@pytest.mark.parametrize("text,secret", [
+    ("https://user:hunter2@api.example.com/v1", "hunter2"),
+    ("proxy error via http://svc:S3cr3tPass@proxy.internal:8080", "S3cr3tPass"),
+    ("postgres://admin:p%40ss@db.internal/app failed", "p%40ss"),
+    ("HTTPS://User:TopSecret@Host/", "TopSecret"),
+    ("connect to socks5://u:pw-with-dashes_123@10.0.0.1:1080", "pw-with-dashes_123"),
+])
+def test_passwords_inside_urls_are_redacted(text, secret):
+    out = sanitize_error_text(text)
+    assert secret not in out
+    assert "[REDACTED]" in out
+    assert "@" in out  # the rest of the URL is kept so the error is still useful
+
+
+@pytest.mark.parametrize("text", [
+    "https://example.com:8080/path",
+    "mailto:someone@example.com",
+    "contact user@example.com about https://example.com/a:b",
+    "http://host/path?x=a:b@c",
+    "ssh://git@github.com/org/repo.git",
+    "plain text with a colon: and an at @ sign",
+])
+def test_urls_without_a_password_are_left_alone(text):
+    assert sanitize_error_text(text) == text
+
+
+def test_url_password_redaction_is_stable_and_fast():
+    once = sanitize_error_text("https://user:hunter2@api.example.com/v1")
+    assert sanitize_error_text(once) == once
+    import time
+
+    for nasty in ["a://" * 25000, "http://" + "u" * 100000 + ":" + "p" * 100000,
+                  "http://" + "u:" * 50000 + "@", "x://:" * 25000]:
+        started = time.perf_counter()
+        sanitize_error_text(nasty)
+        assert time.perf_counter() - started < 2.0

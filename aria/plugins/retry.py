@@ -588,6 +588,9 @@ def _label(words: str) -> "re.Pattern[str]":
 
 # Applied in order after NFKC normalisation. Each keeps the label and hides only the value.
 _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # scheme://user:password@host  -> hide the password (proxy and connection errors print these)
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,30}://[^\s/:@?#]{1,200}:)[^\s/@?#]{1,500}(?=@)"),
+     r"\1" + _REDACTED),
     # Authorization: Digest username="x", nonce="y", response="z"  -> the whole header value
     (re.compile(r"(?i)(authorization" + _SEP + r")digest\b[^\n\r]{0,2000}"),
      r"\1" + _REDACTED),
@@ -637,6 +640,7 @@ def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
       ``openai-organization`` and a bare ``key=``, written with ``=`` or ``:``, in plain
       text, JSON (also backslash-escaped) and URL-encoded (``api%5Fkey=``, ``key%3D``);
       quoted values may contain spaces
+    * the password in ``scheme://user:password@host`` URLs
     * ``Authorization`` / ``Proxy-Authorization`` values with any scheme (Basic, Bearer,
       Token, Digest ...); for Digest the whole header value
     * ``Cookie`` / ``Set-Cookie`` header values
