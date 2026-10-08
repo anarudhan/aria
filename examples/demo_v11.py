@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ARIA v1.1.0 — Full Demonstration
+ARIA — Full Demonstration
 ===================================
 Run with:  python demo_v11.py
 
@@ -32,6 +32,7 @@ from aria import (
     ExecutionContract,
     TaskResult,
     TaskStatus,
+    __version__,
     aria_agent,
 )
 from aria.core.improvement import SelfImprovementEngine
@@ -182,7 +183,7 @@ async def main():
     # Register agents
     aria.register_agents([researcher, writer, email_agent, teams_agent])
 
-    print("\n✅ ARIA v1.1.0 initialized with 4 agents\n")
+    print(f"\n✅ ARIA v{__version__} initialized with 4 agents\n")
 
 
     # ═══════════════════════════════════════════════════════════════════
@@ -413,7 +414,7 @@ async def main():
     print(f"  Open vuln count:   {health['open_vulnerabilities']}")
 
     print("\n" + "═" * 62)
-    print("  ARIA v1.1.0 Demo Complete")
+    print(f"  ARIA v{__version__} Demo Complete")
     print("  Capabilities demonstrated:")
     print("    ✅ Zero-trust permission engine")
     print("    ✅ Self-awareness and health monitoring")

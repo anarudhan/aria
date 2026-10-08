@@ -41,7 +41,7 @@ import asyncio
 import functools
 import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..core.models import (
     AgentMessage,
@@ -49,6 +49,9 @@ from ..core.models import (
     MessageType,
     TaskNode,
 )
+
+if TYPE_CHECKING:
+    from ..core.memory import TemporalMemory
 
 # ─── Base Agent ───────────────────────────────────────────────────────────────
 
@@ -93,7 +96,7 @@ class BaseAgent(ABC):
         self,
         node: TaskNode,
         context: dict[str, Any],   # Results from completed dependency nodes
-        memory: object,            # TemporalMemory instance
+        memory: Optional[TemporalMemory],  # ARIA's memory (may be None)
     ) -> Any:
         """
         Execute the task described in the node.
@@ -196,7 +199,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         capabilities: list[str],
         domains: list[str],
         tools: Optional[list[Callable]] = None,
-        llm: Optional[object] = None,    # LLM plugin instance
+        llm: Optional[Any] = None,       # LLM plugin instance (duck-typed: needs chat())
         tools_available: Optional[list[str]] = None,
         input_types: Optional[list[str]] = None,
         output_types: Optional[list[str]] = None,
@@ -225,7 +228,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         self._llm = llm
         self._max_react_iterations = max_react_iterations
 
-    def set_llm(self, llm: object):
+    def set_llm(self, llm: Any):
         """Attach an LLM plugin after construction (common pattern)."""
         self._llm = llm
 
@@ -240,7 +243,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         self,
         node: TaskNode,
         context: dict[str, Any],
-        memory: object,
+        memory: Optional[TemporalMemory],
     ) -> Any:
         """
         Execute using a ReAct loop with tool use.
@@ -453,17 +456,19 @@ def aria_agent(
                     return func(node, context, memory)
 
         # Attach the agent instance to the function for easy access
-        func._aria_agent = FunctionalAgent()
-        func._is_aria_agent = True
-        func._agent_id = _agent_id
+        # setattr: arbitrary callables are not typed to carry these marker attributes.
+        agent_instance = FunctionalAgent()
+        setattr(func, "_aria_agent", agent_instance)
+        setattr(func, "_is_aria_agent", True)
+        setattr(func, "_agent_id", _agent_id)
 
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             return await func(*args, **kwargs)
 
-        wrapper._aria_agent = func._aria_agent
-        wrapper._is_aria_agent = True
-        wrapper._agent_id = _agent_id
+        setattr(wrapper, "_aria_agent", agent_instance)
+        setattr(wrapper, "_is_aria_agent", True)
+        setattr(wrapper, "_agent_id", _agent_id)
         return wrapper
 
     return decorator

@@ -1,7 +1,7 @@
 """
 PRISM — Progressive Reasoning with Integrated Self-Monitoring
 =============================================================
-Version 1.0 | Part of ARIA v1.2.0
+Version 1.0 | Part of ARIA v1.2.0 and later
 
 PRISM is ARIA's cognitive engine. It runs alongside every single task
 and governs how ARIA actually thinks rather than just what she does.
@@ -56,7 +56,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 # ── Data Structures ────────────────────────────────────────────────────────────
 
@@ -303,7 +303,7 @@ class PRISMEngine:
         past_memories: list,
         user_id:      str = "default",
         past_lessons:  Optional[list] = None,
-        trust_summaries: Optional[dict] = None,
+        trust_summaries: Optional[Union[list, dict]] = None,
     ) -> PRISMState:
         """
         Ask the four honest questions before any execution begins.
@@ -388,7 +388,7 @@ class PRISMEngine:
                 domain_hits[domain] = hits
 
         if domain_hits:
-            top_domain = max(domain_hits, key=domain_hits.get)
+            top_domain = max(domain_hits, key=lambda d: domain_hits[d])
             score += min(0.15, domain_hits[top_domain] * 0.05)
             notes.append(f"recognised as {top_domain} task")
 
@@ -462,7 +462,7 @@ class PRISMEngine:
         self,
         task: str,
         past_lessons: Optional[list],
-        trust_summaries: Optional[dict],
+        trust_summaries: Optional[Union[list, dict]],
     ) -> tuple[float, int]:
         """
         Question 3: What does my actual track record say about tasks like this?
@@ -799,7 +799,7 @@ class PRISMEngine:
         if max(scores.values(), default=0) == 0:
             return "general"
 
-        return max(scores, key=scores.get)
+        return max(scores, key=lambda d: scores[d])
 
     def _generate_insight(self, state: PRISMState) -> str:
         """Generate one honest sentence summarising what PRISM learned from this task."""

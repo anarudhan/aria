@@ -1,0 +1,34 @@
+name: Epic
+description: A large goal that needs several user stories
+title: "Epic: "
+type: Feature
+labels: ["epic", "needs-triage"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome do we want and why does it matter
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in, and what is explicitly out
+    validations:
+      required: true
+  - type: textarea
+    id: stories
+    attributes:
+      label: Planned user stories
+      description: List the stories. Create them as sub-issues of this epic
+      placeholder: "- [ ] Story one\n- [ ] Story two"
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of done
+      description: How do we know the whole epic is finished
+      placeholder: "- [ ] All child issues closed\n- [ ] Documentation updated"
+    validations:
+      required: true

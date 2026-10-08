@@ -1,6 +1,6 @@
 # ARIA — Autonomous Reasoning and Intelligence Architecture
 
-> Version 1.2.0 | Zero Trust | Self Aware | Self Healing | Self Improving | Web Native
+> Version 1.3.0 | Zero Trust | Self Aware | Self Healing | Self Improving | Web Native
 
 ARIA is a production-grade Python framework for building multi-agent AI systems that are genuinely trustworthy. It is not a wrapper around another AI framework. It is built from scratch with four principles that most agent frameworks completely ignore.
 
@@ -471,6 +471,10 @@ aria/
 ---
 
 ## Version history
+
+**v1.3.0** (March 2026)
+
+PRISM, the progressive reasoning and self-monitoring engine, now runs alongside every task, with pre-reasoning, execution monitoring and calibration reflection. ECHO, the identity engine, keeps a relationship profile per person and a persistent sense of who ARIA is across sessions. A permanent genesis memory is injected at every startup so ARIA always knows where it came from. Memory fixes found during execution and web search fixes are included. The version number now lives in one file, `aria/_version.py`, and the package metadata, startup banner, self description and demo all read from it. Continuous integration now tests Python 3.10 to 3.13 and a single CI Gate check summarises every required job. 209 tests passing.
 
 **v1.2.0** (March 2026)
 

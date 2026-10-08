@@ -8,6 +8,8 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+    # "edited" re-runs the issue link check when someone adds the link to the description.
+    types: [ opened, synchronize, reopened, edited ]
   merge_group:
   workflow_dispatch:
 
@@ -109,12 +111,7 @@ jobs:
           twine check dist/*
 
   typecheck:
-    # Informational only. The codebase has existing mypy errors, so this job is
-    # not part of the gate yet. The mypy step is allowed to fail so the job
-    # shows green, and its output stays visible in the log. Remove
-    # continue-on-error and add this job to the gate's needs list once the
-    # errors are cleaned up.
-    name: Type check (informational)
+    name: Type check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -131,8 +128,43 @@ jobs:
         run: pip install "mypy>=1.10.0"
 
       - name: Run mypy
-        continue-on-error: true
         run: mypy aria/
+
+  issue-link:
+    # Enforces the SDLC rule that every pull request is tracked by an issue.
+    # On pushes and merge queue runs there is nothing to check, so it passes.
+    name: Issue link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a linked issue in the pull request description
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Not a pull request, nothing to check."
+            exit 0
+          fi
+          case "$PR_AUTHOR" in
+            *"[bot]")
+              echo "Bot pull request, link check skipped."
+              exit 0
+              ;;
+          esac
+          # Ignore HTML comments (the template hint text lives in one), then look for
+          # a closing keyword followed by an issue in THIS repository.
+          BODY=$(printf '%s' "$PR_BODY" | perl -0pe 's/<!--.*?-->//gs')
+          REPO=$(printf '%s' "$GITHUB_REPOSITORY" | sed 's/[.]/[.]/g')
+          KEYWORD='(^|[^[:alnum:]_])(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?|part of)[[:space:]:]+'
+          ISSUE="(#|${REPO}#|https://github[.]com/${REPO}/issues/)[0-9]+"
+          if printf '%s' "$BODY" | grep -Eiq "${KEYWORD}${ISSUE}"; then
+            echo "Linked issue found."
+          else
+            echo "::error::This pull request must link an issue in this repository. Add 'Closes #N' or 'Refs #N' (outside HTML comments) to the description. See docs/SDLC.md."
+            exit 1
+          fi
 
   ci-gate:
     # The one check to require in branch protection or the ruleset.
@@ -140,7 +172,7 @@ jobs:
     # unless every blocking job finished with "success".
     name: CI Gate
     if: always()
-    needs: [lint, test, demo, build]
+    needs: [lint, test, demo, build, typecheck, issue-link]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

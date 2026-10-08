@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from .._version import __version__
+
 # ─── Enumerations ─────────────────────────────────────────────────────────────
 
 class TaskStatus(Enum):
@@ -303,6 +305,9 @@ class TaskResult:
     retrospective: Optional[str] = None  # ARIA's post-execution analysis
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
+    # Extra diagnostics attached by the orchestrator (e.g. "prism", "echo_profile").
+    # Declared so every TaskResult has it, including early-return failure results.
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def summary(self) -> str:
         lines = [
@@ -463,9 +468,9 @@ class ARIAConfig:
 # The real Sathis Anarudhan holds the private key that matches the hash below.
 # Anyone can claim the name. Only the creator holds the key.
 
-ARIA_ORIGIN = {
+ARIA_ORIGIN: dict[str, Any] = {
     "name":        "ARIA — Autonomous Reasoning and Intelligence Architecture",
-    "version":     "1.3.0",
+    "version":     __version__,
     "born":        "March 2026",
     "creators": {
         "vision":         "Sathis Anarudhan",

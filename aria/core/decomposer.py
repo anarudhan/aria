@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from .models import ARIAConfig, ExecutionContract, TaskGenome, TaskNode
 
@@ -97,12 +97,12 @@ class TaskDecomposer:
     def __init__(
         self,
         config: ARIAConfig,
-        llm_caller: Optional[object] = None,  # Will be set by orchestrator
+        llm_caller: Optional[Any] = None,  # Duck-typed LLM plugin (needs complete()); set by orchestrator
     ):
         self.config = config
         self._llm_caller = llm_caller
 
-    def set_llm(self, llm_caller: object):
+    def set_llm(self, llm_caller: Any):
         self._llm_caller = llm_caller
 
     async def decompose(

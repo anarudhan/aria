@@ -48,7 +48,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from ..permissions.engine import PermissionEngine
+    from .orchestrator import ARIAOrchestrator
 
 # ─── Lesson ──────────────────────────────────────────────────────────────────
 
@@ -207,7 +211,7 @@ class SelfImprovementEngine:
     def __init__(
         self,
         persist_path: Optional[str] = None,
-        llm_plugin: Optional[object] = None,
+        llm_plugin: Optional[Any] = None,
         autonomous_synthesis: bool = False,   # Must be explicitly enabled
     ):
         self._lessons: list[Lesson] = []
@@ -235,7 +239,7 @@ class SelfImprovementEngine:
         result,        # TaskResult
         coalition:     dict[str, str],
         genome,        # TaskGenome
-        llm_plugin:    Optional[object] = None,
+        llm_plugin:    Optional[Any] = None,
     ) -> list[Lesson]:
         """
         The primary learning function. Called after every task finishes.
@@ -390,8 +394,8 @@ class SelfImprovementEngine:
         self,
         gap_id:   str,
         user_id:  str,
-        permission_engine: object,
-        llm_plugin: Optional[object] = None,
+        permission_engine: PermissionEngine,
+        llm_plugin: Optional[Any] = None,
     ) -> Optional[SynthesizedCapability]:
         """
         Generate a new agent/tool to fill a capability gap.
@@ -509,8 +513,8 @@ class SelfImprovementEngine:
     async def load_approved_capability(
         self,
         cap_id:         str,
-        orchestrator:   object,
-        permission_engine: object,
+        orchestrator:   ARIAOrchestrator,
+        permission_engine: PermissionEngine,
         user_id:        str,
     ) -> bool:
         """
@@ -534,7 +538,7 @@ class SelfImprovementEngine:
         print(f"[Learning] 🔌 Loading capability '{cap.name}'...")
 
         try:
-            namespace = {
+            namespace: dict[str, Any] = {
                 "__builtins__": {
                     "print": print,
                     "len": len,
@@ -672,7 +676,7 @@ class SelfImprovementEngine:
         genome,
         coalition: dict,
         outcome: str,
-        llm: Optional[object],
+        llm: Optional[Any],
     ) -> tuple[str, str]:
         """
         Determine WHY a task failed or underperformed.
@@ -739,7 +743,7 @@ class SelfImprovementEngine:
         task_category: str,
         root_cause:    str,
         outcome:       str,
-        llm:           Optional[object],
+        llm:           Optional[Any],
     ):
         """Identify and record a capability gap from repeated failures."""
         gap_key = f"{task_category}_{root_cause}"

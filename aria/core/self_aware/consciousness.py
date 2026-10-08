@@ -32,10 +32,15 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
+from ..._version import __version__
 from ...security.patcher import SelfPatcher
 from ...security.scanner import ScanReport, SecurityScanner
+
+if TYPE_CHECKING:
+    from ...permissions.engine import PermissionEngine
+    from ..orchestrator import ARIAOrchestrator
 
 # ─── Health Snapshot ─────────────────────────────────────────────────────────
 
@@ -61,7 +66,7 @@ class HealthSnapshot:
     low_vulns:            int = 0
     patch_count:          int = 0
     python_version:       str = ""
-    aria_version:         str = "1.1.0"
+    aria_version:         str = __version__
 
     @property
     def is_healthy(self) -> bool:
@@ -193,11 +198,11 @@ class SelfConsciousness:
         self._error_log:    list[dict] = []
 
         # Reference to orchestrator (set during initialize)
-        self._orchestrator: Optional[object] = None
+        self._orchestrator: Optional[ARIAOrchestrator] = None
 
         print("[Self] 🧠 ARIA Self Consciousness module initializing...")
 
-    def initialize(self, orchestrator: object):
+    def initialize(self, orchestrator: ARIAOrchestrator):
         """
         Record baseline source integrity hashes.
         Call this once at startup — before any user interactions.
@@ -236,7 +241,7 @@ class SelfConsciousness:
         self,
         user_id:           str,
         report:            ScanReport,
-        permission_engine: object,
+        permission_engine: PermissionEngine,
     ) -> list[str]:
         """
         For each auto-patchable vulnerability, request user approval.
@@ -261,7 +266,7 @@ class SelfConsciousness:
         self,
         vuln_id:           str,
         user_id:           str,
-        permission_engine: object,
+        permission_engine: PermissionEngine,
     ) -> bool:
         """
         Apply a specific patch after user approval.
@@ -429,7 +434,7 @@ class SelfConsciousness:
         """ARIA's honest self-description."""
         return (
             "I am ARIA — Autonomous Reasoning and Intelligence Architecture.\n"
-            "Version 1.1.0\n\n"
+            f"Version {__version__}\n\n"
             "What I can do:\n"
             "  • Decompose complex tasks into parallel execution plans automatically\n"
             "  • Route subtasks to the most capable agent using semantic fingerprinting\n"
