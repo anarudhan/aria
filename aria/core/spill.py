@@ -41,6 +41,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -83,10 +84,18 @@ DEFAULT_READ_CHARS = 2000                  # default page size for read()
 DEFAULT_MAX_READ_CHARS = 20_000            # largest page one read() returns
 DEFAULT_MAX_ITEM_BYTES = 64 * 1024 * 1024  # larger items stay inline
 DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024  # oldest items are evicted beyond this
+DEFAULT_MAX_ITEMS = 10_000                 # oldest items are evicted beyond this too
+DEFAULT_SUGGESTED_READ_CHARS = 2000        # length the omission note suggests
 _MAX_WARNINGS = 100                        # warnings list is bounded
 _MAX_EXPIRED_MEMORY = 1000                 # remembered expired ids (for a clear message)
 _ID_RETRIES = 5                            # tries if a random id ever collides
 _SWEEP_EVERY = 50                          # opportunistic cleanup every N-th spill
+
+_log = logging.getLogger("aria.spill")
+
+# Lines of spilled content that start like our own notes get a visible "> " prefix.
+_FORGEABLE_PREFIXES = ("[Untrusted data", "[characters ", "[... ")
+_ESCAPE_PREFIX = "> "
 
 _MSG_UNKNOWN = "unknown spill locator"
 _MSG_EXPIRED = "spilled output has expired and was removed"
@@ -146,12 +155,37 @@ def _uid_suffix() -> str:
     return str(getuid()) if getuid is not None else "user"
 
 
-def _marker(omitted: int, head_n: int, tail_n: int, total: int, locator: str) -> str:
+def neutralize_markers(text: str) -> str:
+    """Prefix lines that imitate ARIA's own notes with ``> `` so they stand out.
+
+    A line of untrusted content that starts with ``[Untrusted data``,
+    ``[characters `` or ``[... `` (after optional spaces) could be mistaken for
+    a note written by ARIA, such as a forged "end of text". This only reduces
+    that confusion. It cannot make a model immune to prompt injection.
+    """
+    if "[" not in text:
+        return text
+    out = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip(" \t").startswith(_FORGEABLE_PREFIXES):
+            line = _ESCAPE_PREFIX + line
+        out.append(line)
+    return "".join(out)
+
+
+def _leading_notice() -> str:
+    return f"[{UNTRUSTED_NOTICE}]\n"
+
+
+def _marker(
+    omitted: int, head_n: int, tail_n: int, total: int, locator: str,
+    read_length: int = DEFAULT_SUGGESTED_READ_CHARS,
+) -> str:
     return (
         f"[{UNTRUSTED_NOTICE} ... {omitted} characters omitted. This output was SHORTENED: "
         f"showing the first {head_n} and last {tail_n} of {total} characters. "
         f"The full text is saved under spill id {locator}. To read the omitted part, "
-        f'call {READ_TOOL_NAME}(locator="{locator}", offset={head_n}, length=2000); '
+        f'call {READ_TOOL_NAME}(locator="{locator}", offset={head_n}, length={read_length}); '
         f"offset and length count characters. ...]"
     )
 
@@ -172,13 +206,14 @@ class SpillStore:
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
         enabled: bool = True,
+        max_items: int = DEFAULT_MAX_ITEMS,
     ) -> None:
         if retention_seconds < 0:
             raise ValueError("retention_seconds must be >= 0")
         if max_read_chars < 1:
             raise ValueError("max_read_chars must be >= 1")
-        if max_item_bytes < 1 or max_total_bytes < 1:
-            raise ValueError("max_item_bytes and max_total_bytes must be >= 1")
+        if max_item_bytes < 1 or max_total_bytes < 1 or max_items < 1:
+            raise ValueError("max_item_bytes, max_total_bytes and max_items must be >= 1")
         try:
             parent = Path(os.path.abspath(base_dir))   # so os.chdir cannot break reads
         except OSError:
@@ -189,6 +224,7 @@ class SpillStore:
         self.max_read_chars = int(max_read_chars)
         self.max_item_bytes = int(max_item_bytes)
         self.max_total_bytes = int(max_total_bytes)
+        self.max_items = int(max_items)
         self.enabled = bool(enabled)                # False: inline-only, never touches disk
         self.warnings: list[str] = []               # newest last, bounded
         self.warnings_total = 0                     # includes dropped old ones
@@ -196,31 +232,51 @@ class SpillStore:
         self.omitted_total = 0                      # characters omitted from previews
         self._issued: dict[str, str] = {}           # locator -> owner
         self._expired: OrderedDict[str, str] = OrderedDict()   # locator -> owner
+        # Running accounting, oldest first: file name -> size in bytes. It is
+        # rebuilt from the folder at startup, every _SWEEP_EVERY-th spill, and
+        # whenever it is found to disagree with the disk.
+        self._index: OrderedDict[str, int] = OrderedDict()
+        self._total_bytes = 0
         self._save_calls = 0
         self._lock = threading.Lock()
         self._io_lock = threading.RLock()
         self._ready = False
         self._base_resolved = self.base_dir
-        if self.enabled:
-            self._ensure_dir()
+        if self.enabled and self._ensure_dir():
+            with self._io_lock:
+                self._rescan()
 
     # ── public API ────────────────────────────────────────────────────────────
 
     @property
     def usable(self) -> bool:
-        """False when the folder could not be created or is not safe to use."""
-        if not self.enabled:
-            return False
-        return self._ready or self._ensure_dir()
+        """False when the folder could not be created or is not safe to use.
+
+        Read-only: it reports the state from the last setup attempt.
+        """
+        return self.enabled and self._ready
+
+    @property
+    def suggested_read_chars(self) -> int:
+        """Page length the omission note suggests; always within the read limit."""
+        return min(DEFAULT_SUGGESTED_READ_CHARS, self.max_read_chars)
+
+    def warn(self, message: str) -> None:
+        """Record a warning for the health report (bounded list)."""
+        self._warn(message)
 
     def preview_or_spill(self, text: str, max_chars: int, owner: str = "") -> SpillResult:
         """Return ``text`` unchanged if it fits in ``max_chars``, else a preview.
 
-        The preview shows about two thirds of ``max_chars`` from the start and
-        the rest from the end of the text, then a marker. The marker is extra,
-        so the result is longer than ``max_chars`` by the marker's length.
-        When the preview would not be shorter than the text itself, nothing is
-        spilled and the text comes back unchanged.
+        The preview starts with a one-line untrusted-data notice, then shows
+        about two thirds of ``max_chars`` from the start and the rest from the
+        end of the text, with a marker in between. The notice and marker are
+        extra, so the result is longer than ``max_chars``. Lines of the shown
+        content that imitate our notes get a ``> `` prefix (see
+        ``neutralize_markers``); this does not change the counts or offsets,
+        which always refer to the original text. When the preview would not be
+        shorter than the text itself, nothing is spilled and the text comes
+        back unchanged.
 
         ``owner`` binds the locator to whoever spilled the item; only the same
         owner can read it back.
@@ -240,9 +296,11 @@ class SpillStore:
         head_n = (max_chars * 2 + 2) // 3
         tail_n = max_chars - head_n
         omitted = total - head_n - tail_n
+        read_length = self.suggested_read_chars
 
         # Not worth spilling when the preview would be as long as the text.
-        preview_len = head_n + tail_n + len(_marker(omitted, head_n, tail_n, total, "0" * 32)) + 2
+        note = _marker(omitted, head_n, tail_n, total, "0" * 32, read_length)
+        preview_len = len(_leading_notice()) + head_n + tail_n + len(note) + 2
         if preview_len >= total:
             return SpillResult(text=text, total_chars=total, omitted_chars=0, spilled=False)
 
@@ -258,14 +316,14 @@ class SpillStore:
                 text=text, total_chars=total, omitted_chars=0, spilled=False, warning=warning
             )
 
-        head = text[:head_n]
-        tail = text[total - tail_n:] if tail_n else ""
-        marker = _marker(omitted, head_n, tail_n, total, locator)
+        head = neutralize_markers(text[:head_n])
+        tail = neutralize_markers(text[total - tail_n:] if tail_n else "")
+        marker = _marker(omitted, head_n, tail_n, total, locator, read_length)
         with self._lock:
             self.spills_total += 1
             self.omitted_total += omitted
         return SpillResult(
-            text=f"{head}\n{marker}\n{tail}",
+            text=f"{_leading_notice()}{head}\n{marker}\n{tail}",
             total_chars=total,
             omitted_chars=omitted,
             spilled=True,
@@ -282,7 +340,9 @@ class SpillStore:
         bad locator or bad numbers and ``SpillNotFound`` for an id that is
         unknown to ``owner`` (including ids another owner spilled) or expired.
         The whole item is read and decoded for each page (linear in its size,
-        which is bounded by ``max_item_bytes``).
+        which is bounded by ``max_item_bytes``). The page text is the raw
+        content; ``neutralize_markers`` is for display and is applied by the
+        caller that shows it to a model.
         """
         if isinstance(offset, bool) or isinstance(length, bool):
             raise SpillError("offset and length must be integers")
@@ -324,7 +384,8 @@ class SpillStore:
 
     def cleanup(self, max_age_seconds: Optional[float] = None) -> int:
         """Delete spill files older than ``max_age_seconds`` (default: the
-        store's ``retention_seconds``). Returns how many files were removed."""
+        store's ``retention_seconds``). Returns how many files were removed.
+        Also re-syncs the running accounting with the folder."""
         age = self.retention_seconds if max_age_seconds is None else float(max_age_seconds)
         if age < 0:
             raise ValueError("max_age_seconds must be >= 0")
@@ -334,6 +395,7 @@ class SpillStore:
             for path, st in self._spill_files():
                 if st.st_mtime <= cutoff and self._remove(path):
                     removed += 1
+            self._rescan()
         return removed
 
     def clear_all(self) -> int:
@@ -343,18 +405,20 @@ class SpillStore:
             for path, _ in self._spill_files():
                 if self._remove(path):
                     removed += 1
+            self._rescan()
         return removed
 
     def describe(self) -> dict[str, Any]:
-        """Counts and sizes for the health report."""
+        """Counts and sizes for the health report (taken from the folder itself)."""
         files = self._spill_files()
         return {
             "base_dir": str(self.base_dir),
-            "usable": self._ready,
+            "usable": self.usable,
             "item_count": len(files),
             "total_bytes": sum(st.st_size for _, st in files),
             "max_item_bytes": self.max_item_bytes,
             "max_total_bytes": self.max_total_bytes,
+            "max_items": self.max_items,
             "spills_this_session": self.spills_total,
             "characters_omitted_from_previews": self.omitted_total,
             "retention_seconds": self.retention_seconds,
@@ -401,6 +465,12 @@ class SpillStore:
             self._warn(f"spill folder unusable ({type(exc).__name__}: {exc})")
             return False
 
+    def _rescan(self) -> None:
+        """Rebuild the running accounting from the folder (oldest first)."""
+        files = sorted(self._spill_files(), key=lambda item: (item[1].st_mtime, item[0].name))
+        self._index = OrderedDict((path.name, st.st_size) for path, st in files)
+        self._total_bytes = sum(self._index.values())
+
     def _save(self, text: str, owner: str) -> str:
         """Write text to a new exclusive 0600 file and return its locator."""
         data = text.encode("utf-8", errors="surrogatepass")
@@ -411,59 +481,95 @@ class SpillStore:
             raise SpillTooLarge(f"item is {size} bytes, over max_total_bytes={self.max_total_bytes}")
         if not self._ready and not self._ensure_dir():
             raise OSError("spill folder is not usable")
+        with self._io_lock:
+            self._save_calls += 1
+            if self._save_calls % _SWEEP_EVERY == 0:
+                self.cleanup()                       # long-lived processes sweep and re-sync
+            try:
+                return self._write_new(data, size, owner)
+            except FileNotFoundError:
+                # The folder vanished mid-process (for example a temp cleaner):
+                # set it up again once, re-sync, and retry once.
+                self._ready = False
+                if not self._ensure_dir():
+                    raise
+                self._rescan()
+                return self._write_new(data, size, owner)
+
+    def _write_new(self, data: bytes, size: int, owner: str) -> str:
         flags = (
             os.O_WRONLY | os.O_CREAT | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         )
-        with self._io_lock:
-            self._save_calls += 1
-            if self._save_calls % _SWEEP_EVERY == 0:
-                self.cleanup()                       # long-lived processes sweep
-            self._make_room(size)
-            for _ in range(_ID_RETRIES):
-                locator = secrets.token_hex(16)
-                path = self.base_dir / (locator + _FILE_SUFFIX)
-                try:
-                    fd = os.open(path, flags, 0o600)
-                except FileExistsError:
-                    continue  # never overwrite; pick another random id
-                try:
-                    if hasattr(os, "fchmod"):
-                        os.fchmod(fd, 0o600)
-                    with os.fdopen(fd, "wb") as fh:
-                        fd = -1  # fdopen owns it now
-                        fh.write(data)
-                except BaseException:
-                    if fd != -1:
-                        os.close(fd)
-                    self._remove(path)  # no half-written file left behind
-                    raise
-                with self._lock:
-                    self._issued[locator] = owner
-                return locator
+        self._make_room(size)
+        for _ in range(_ID_RETRIES):
+            locator = secrets.token_hex(16)
+            name = locator + _FILE_SUFFIX
+            path = self.base_dir / name
+            try:
+                fd = os.open(path, flags, 0o600)
+            except FileExistsError:
+                continue  # never overwrite; pick another random id
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    fd = -1  # fdopen owns it now
+                    fh.write(data)
+            except BaseException:
+                if fd != -1:
+                    os.close(fd)
+                self._remove(path)  # no half-written file left behind
+                raise
+            if not os.path.lexists(path):
+                # Another process swept it between our write and now.
+                self._rescan()
+                raise OSError("spill file vanished right after it was written")
+            with self._lock:
+                self._issued[locator] = owner
+            self._index[name] = size
+            self._total_bytes += size
+            return locator
         raise OSError("could not create a unique spill file")
 
     def _make_room(self, incoming: int) -> None:
-        """Evict the OLDEST spill files until ``incoming`` bytes fit in the total bound."""
-        files = self._spill_files()
-        excess = sum(st.st_size for _, st in files) + incoming - self.max_total_bytes
-        if excess <= 0:
+        """Evict the OLDEST spill files until the new item fits every bound.
+
+        Uses the running accounting, so a spill does not list the folder.
+        """
+        def over() -> bool:
+            return (
+                self._total_bytes + incoming > self.max_total_bytes
+                or len(self._index) + 1 > self.max_items
+            )
+
+        if not over():
             return
-        files.sort(key=lambda item: (item[1].st_mtime, item[0].name))
         removed = 0
-        for path, st in files:
-            if excess <= 0:
-                break
-            if self._remove(path):
-                excess -= st.st_size
+        while over() and self._index:
+            name = next(iter(self._index))
+            try:
+                os.unlink(self.base_dir / name)
                 removed += 1
+            except FileNotFoundError:
+                pass                 # someone else already removed it: just drop our record
+            except OSError:
+                self._rescan()       # cannot delete it: re-sync and stop evicting
+                break
+            self._drop_from_index(name)
         if removed:
             self._warn(
                 f"removed {removed} older spilled item(s) to stay within "
-                f"max_total_bytes={self.max_total_bytes}"
+                f"max_total_bytes={self.max_total_bytes} and max_items={self.max_items}"
             )
-        if excess > 0:
-            raise SpillTooLarge("could not free enough space within max_total_bytes")
+        if over():
+            raise SpillTooLarge("could not free enough space within the size bounds")
+
+    def _drop_from_index(self, name: str) -> None:
+        size = self._index.pop(name, None)
+        if size is not None:
+            self._total_bytes -= size
+        self._mark_expired(name[: -len(_FILE_SUFFIX)])
 
     def _mark_expired(self, locator: str) -> None:
         with self._lock:
@@ -524,7 +630,7 @@ class SpillStore:
             os.unlink(path)
         except OSError:
             return False
-        self._mark_expired(path.name[: -len(_FILE_SUFFIX)])
+        self._drop_from_index(path.name)
         return True
 
 

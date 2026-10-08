@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -55,10 +56,13 @@ from ..core.spill import (
     SpillError,
     SpillStore,
     get_default_store,
+    neutralize_markers,
 )
 
 if TYPE_CHECKING:
     from ..core.memory import TemporalMemory
+
+_log = logging.getLogger("aria.agents")
 
 # ─── Base Agent ───────────────────────────────────────────────────────────────
 
@@ -250,6 +254,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         self._llm = llm
         self._max_react_iterations = max_react_iterations
         self._spill_store = spill_store   # None: use the shared default on first need
+        self._warned_read_tool = False
 
     @property
     def spill_store(self) -> SpillStore:
@@ -266,10 +271,18 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
             return f"Error: {exc}"
         note = f"[characters {page.offset} to {page.end} of {page.total_chars}"
         if page.has_more:
-            note += f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", offset={page.end})"
+            note += (
+                f"; to continue call {READ_TOOL_NAME}(locator=\"{locator}\", "
+                f"offset={page.end}, length={self.spill_store.suggested_read_chars})"
+            )
         else:
             note += "; end of text"
-        return f"[{UNTRUSTED_NOTICE}]\n{page.text}\n{note}]"
+        # Lines of the content that imitate our own notes get a "> " prefix.
+        return f"[{UNTRUSTED_NOTICE}]\n{neutralize_markers(page.text)}\n{note}]"
+
+    def _owns_read_tool(self) -> bool:
+        """True when the registered ``read_spilled`` is this agent's own method."""
+        return self._tools.get(READ_TOOL_NAME) == self.read_spilled
 
     def _show(self, text: str, max_chars: int) -> str:
         """Return text as-is if it fits, else an honest preview (never a silent cut).
@@ -279,11 +292,25 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         and agents that never meet large output are unchanged.
         """
         result = self.spill_store.preview_or_spill(text, max_chars, owner=self.agent_id)
-        if result.spilled and READ_TOOL_NAME not in self._tools:
-            self._tools[READ_TOOL_NAME] = self.read_spilled
+        if result.spilled:
+            if READ_TOOL_NAME not in self._tools:
+                self._tools[READ_TOOL_NAME] = self.read_spilled
+            elif not self._owns_read_tool() and not self._warned_read_tool:
+                # A user tool already has this name; the note would point at it.
+                self._warned_read_tool = True
+                message = (
+                    f"agent '{self.agent_id}' has its own tool named '{READ_TOOL_NAME}', so "
+                    f"the spill reader was not registered; omission notes point at that tool"
+                )
+                _log.warning(message)
+                self.spill_store.warn(message)
         return result.text
 
-    def _tool_text(self, result: Any) -> str:
+    def _tool_text(self, result: Any, tool_name: str = "") -> str:
+        # Pages read back are already bounded by the store's read limit. Shortening
+        # them again would hand the model a new preview instead of what it asked for.
+        if tool_name == READ_TOOL_NAME and self._owns_read_tool():
+            return str(result)
         return self._show(str(result), self.TOOL_RESULT_PREVIEW_CHARS)
 
     def set_llm(self, llm: Any):
@@ -394,7 +421,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
                 else:
                     try:
                         result = tool_fn(**tool_args)
-                        results.append({"tool": tool_name, "result": self._tool_text(result)})
+                        results.append({"tool": tool_name, "result": self._tool_text(result, tool_name)})
                     except Exception as e:
                         results.append({"tool": tool_name, "error": str(e)})
             else:
@@ -404,7 +431,7 @@ Prefix your final answer with FINAL_ANSWER: on its own line."""
         for tool_name, task in tasks:
             try:
                 result = await task
-                results.append({"tool": tool_name, "result": self._tool_text(result)})
+                results.append({"tool": tool_name, "result": self._tool_text(result, tool_name)})
             except Exception as e:
                 results.append({"tool": tool_name, "error": str(e)})
 
