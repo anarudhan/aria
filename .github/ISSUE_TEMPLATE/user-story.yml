@@ -1,0 +1,44 @@
+name: User story
+description: New or changed behaviour described from the user's point of view
+title: "Story: "
+type: Feature
+labels: ["user-story", "needs-triage"]
+body:
+  - type: textarea
+    id: story
+    attributes:
+      label: User story
+      description: As a ..., I want ..., so that ...
+      placeholder: "As a framework user, I want ..., so that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Acceptance criteria
+      description: Checkable statements. Given, When, Then works well
+      placeholder: "- Given ..., when ..., then ..."
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Design notes and risks
+      description: Affected modules, security impact, open questions
+  - type: input
+    id: epic
+    attributes:
+      label: Parent epic
+      description: Issue number of the epic, if any
+      placeholder: "#18"
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Suggested priority
+      options:
+        - priority-p0 (drop everything)
+        - priority-p1 (this iteration)
+        - priority-p2 (soon)
+        - priority-p3 (whenever)
+    validations:
+      required: true

@@ -1,0 +1,100 @@
+# Source of truth for repository labels.
+# Synced to GitHub by .github/workflows/labels.yml when this file changes on main.
+# The sync creates and updates labels. It never deletes labels.
+
+# Kind
+- name: epic
+  color: "6f42c1"
+  description: A large goal made of several user stories
+- name: user-story
+  color: "1d76db"
+  description: Value for a user, written as a user story
+- name: bug
+  color: "d73a4a"
+  description: Something is broken
+- name: task
+  color: "0e8a16"
+  description: A small piece of engineering work for one pull request
+- name: tech-debt
+  color: "fbca04"
+  description: Cleanup or improvement with no new user facing behaviour
+- name: spike
+  color: "c5def5"
+  description: Time boxed research to answer a question
+- name: security
+  color: "b60205"
+  description: Security related work or finding
+- name: documentation
+  color: "0075ca"
+  description: Documentation only
+- name: tests
+  color: "bfd4f2"
+  description: Test coverage and test tooling
+- name: process
+  color: "5319e7"
+  description: Development process, workflow and tooling
+
+# Priority
+- name: priority-p0
+  color: "b60205"
+  description: Drop everything
+- name: priority-p1
+  color: "d93f0b"
+  description: This iteration
+- name: priority-p2
+  color: "fbca04"
+  description: Soon
+- name: priority-p3
+  color: "0e8a16"
+  description: Whenever there is time
+
+# Area
+- name: area-core
+  color: "ededed"
+  description: aria/core (orchestrator, memory, executor, models)
+- name: area-agents
+  color: "ededed"
+  description: aria/agents
+- name: area-permissions
+  color: "ededed"
+  description: aria/permissions (zero trust engine)
+- name: area-security
+  color: "ededed"
+  description: aria/security (scanner and patcher)
+- name: area-plugins
+  color: "ededed"
+  description: aria/plugins (LLM plugins)
+- name: area-ci
+  color: "ededed"
+  description: CI, workflows and repository tooling
+- name: area-docs
+  color: "ededed"
+  description: README and docs
+
+# Size
+- name: size-xs
+  color: "d4c5f9"
+  description: Under an hour
+- name: size-s
+  color: "d4c5f9"
+  description: About half a day
+- name: size-m
+  color: "d4c5f9"
+  description: About a day
+- name: size-l
+  color: "d4c5f9"
+  description: A few days
+- name: size-xl
+  color: "d4c5f9"
+  description: Too big, needs splitting
+
+# State
+- name: needs-triage
+  color: "e99695"
+  description: New and not yet reviewed
+- name: ready
+  color: "0e8a16"
+  description: Meets the Definition of Ready
+- name: blocked
+  color: "000000"
+  description: Cannot continue until something else happens

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the SDLC process first
+    url: https://github.com/anarudhan/aria/blob/main/docs/SDLC.md
+    about: How issues, branches, pull requests and releases work in this repository
