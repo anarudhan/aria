@@ -457,6 +457,26 @@ class TestCallWithRetry:
             await call_with_retry(fn, policy)
         assert fn.calls == 1
         assert policy.sleeper.delays == []
+        # a cancelled call is counted, so calls always equal succeeded + failed + cancelled
+        stats = policy.stats()
+        assert stats["calls"] == 1 and stats["cancelled"] == 1
+        assert stats["succeeded"] + stats["failed"] + stats["cancelled"] == stats["calls"]
+        assert [r.outcome for r in policy.history] == ["cancelled"]
+
+    async def test_long_error_text_is_cut_and_says_by_how_much(self):
+        policy = make_policy()
+        with pytest.raises(LLMError) as info:
+            await call_with_retry(Flaky([BadRequestError("x" * 5000)]), policy)
+        record = policy.history[-1]
+        assert len(record.error) < 700
+        assert "4500 more characters omitted" in record.error
+        assert len(str(info.value)) < 800
+
+    async def test_short_error_text_is_not_changed(self):
+        policy = make_policy()
+        with pytest.raises(LLMError):
+            await call_with_retry(Flaky([BadRequestError("short")]), policy)
+        assert policy.history[-1].error == "BadRequestError: short"
 
     async def test_cancellation_during_the_wait_stops_everything(self):
         started = asyncio.Event()

@@ -466,8 +466,14 @@ class RetryPolicy:
 
 # ─── The retry loop ───────────────────────────────────────────────────────────
 
+_MAX_ERROR_CHARS = 500
+
+
 def _error_text(exc: BaseException) -> str:
+    """Short error text for records. A long message is cut and says by how much."""
     text = str(exc).strip()
+    if len(text) > _MAX_ERROR_CHARS:
+        text = f"{text[:_MAX_ERROR_CHARS]}... [{len(text) - _MAX_ERROR_CHARS} more characters omitted]"
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
@@ -513,6 +519,8 @@ async def call_with_retry(
         try:
             result = await fn()
         except asyncio.CancelledError:
+            pol._record(operation, attempt, "cancelled", None, 0.0,
+                        "cancelled during the call")
             raise
         except Exception as exc:
             code = classify(exc)
@@ -528,8 +536,8 @@ async def call_with_retry(
                     message = (f"LLM call failed after {attempt} attempt(s) "
                                f"[{code.value}]: {text}")
                 else:
-                    message = (f"LLM call failed with a {code.value} error that is not "
-                               f"retried (attempt {attempt}): {text}")
+                    message = (f"LLM call failed with an error of kind [{code.value}] that is "
+                               f"not retried (attempt {attempt}): {text}")
                 raise _build_error(message, code, attempt, exc, tuple(own)) from exc
 
             delay = pol.delay_for(attempt, retry_after)
