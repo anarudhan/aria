@@ -2014,12 +2014,41 @@ class TestShadowSpeed:
         assert time.perf_counter() - start < TIME_LIMIT
         assert out == ("p" + CYR_A + "ssword=[REDACTED] ") * 40_000
 
-    def test_fold_cache_is_bounded_and_stays_correct(self):
-        text = "".join(chr(code) for code in range(0x4E00, 0x4E00 + 30_000))
-        sanitize_error_text(text, limit=10)
-        assert len(redact_module._FOLD) <= redact_module._MAX_FOLD_CACHE + 128
-        assert len(redact_module._KEEP) <= redact_module._MAX_FOLD_CACHE + 128
-        assert "hunter2" not in sanitize_error_text(text + " p" + CYR_A + "ssword=hunter2")
+    def test_timing_does_not_depend_on_what_the_process_saw_before(self, monkeypatch):
+        # 21,000+ distinct characters used to fill a global cache; afterwards every later
+        # occurrence of an uncached character was worked out again (two seconds per million)
+        seen = "".join(chr(code) for code in range(0x20000, 0x20000 + 21_500))
+        sanitize_error_text(seen, limit=10)
+        sanitize_error_text(seen + " p" + CYR_A + "ssword=x", limit=10)
+        calls = []
+        real = redact_module._fold_char
+        monkeypatch.setattr(redact_module, "_fold_char", lambda char: calls.append(1) or real(char))
+        for text in (chr(0x9FA0) * 1_000_000,                         # never folded
+                     chr(0xAC00 + 7000) * 1_000_000,                  # decomposes (Hangul)
+                     chr(0xE9) * 500_000 + " password=hunter2"):      # decomposes (accent)
+            start = time.perf_counter()
+            out = sanitize_error_text(text)
+            assert time.perf_counter() - start < TIME_LIMIT
+            assert "hunter2" not in out
+        assert len(calls) <= 5, len(calls)        # once per distinct character, not per occurrence
+
+    def test_redact_args_after_the_process_saw_many_characters(self):
+        sanitize_error_text("".join(chr(code) for code in range(0x20000, 0x20000 + 21_500)))
+        start = time.perf_counter()
+        redact_args([chr(0x9FA0) * 60_000] * 16)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_a_text_of_300000_different_characters_is_bounded(self):
+        text = "".join(chr(code) for code in range(0x10000, 0x10000 + 300_000))
+        start = time.perf_counter()
+        sanitize_error_text(text)
+        assert time.perf_counter() - start < TIME_LIMIT
+
+    def test_a_text_of_all_different_characters_is_bounded(self):
+        text = "".join(chr(code) for code in range(0x4E00, 0x4E00 + 20_000)) * 5
+        start = time.perf_counter()
+        sanitize_error_text(text)
+        assert time.perf_counter() - start < TIME_LIMIT
 
     def test_pure_ascii_and_cjk_texts_use_no_shadow(self):
         assert redact_module._build_shadow("plain ascii password=x") is None
@@ -2057,8 +2086,9 @@ def fuzz_item(rng):
             index = rng.choice(indexes)
             letters[index] = FUZZ_LOOKALIKES[letters[index]]
     spelled = "".join(letters)
-    start = rng.choice(["", "", ZWSP, " " + ZWSP, SHY, NUL, COMBINING_ACUTE, HANGUL_FILLER])
-    if rng.random() < 0.3:
+    start = rng.choice(["", "", ZWSP, " " + ZWSP, SHY, NUL, COMBINING_ACUTE, HANGUL_FILLER,
+                        "[REDACTED]", ZWSP + "[REDACTED]"])
+    if rng.random() < 0.3 and "[REDACTED]" not in start:    # marker + space means "done"
         start += " "
     end = "\"" if quoted else ""
     return spelled + sep + start + value + end
@@ -2095,3 +2125,63 @@ class TestDifferentialFuzz:
         rng = random.Random(1)
         seen = {char for _ in range(300) for char in fuzz_item(rng) if char in FUZZ_INVISIBLE}
         assert len(seen) >= 12
+
+
+# ─── M3: a value that starts with the marker ─────────────────────────────────
+
+class TestMarkerPrefix:
+    @pytest.mark.parametrize("text, expected", [
+        ("password=[REDACTED]hunter2", "password=[REDACTED]"),
+        ("token: [REDACTED]hunter2 tail", "token: [REDACTED] tail"),
+        ("pwd=[REDACTED]hunter2", "pwd=[REDACTED]"),
+        ("key=[REDACTED]hunter2&x=1", "key=[REDACTED]&x=1"),
+        ("api_key=[REDACTED]hun ter2", "api_key=[REDACTED] ter2"),
+        ("Authorization: [REDACTED]hunter2", "Authorization: [REDACTED]"),
+        ("cookie: [REDACTED]hunter2; a=b", "cookie: [REDACTED]"),
+        ('password="abc"hunter2', "password=[REDACTED]"),
+        ('{"password": "abc"hunter2}', '{"password": [REDACTED]}'),
+    ])
+    def test_marker_followed_by_letters_is_an_ordinary_value(self, text, expected):
+        assert sanitize_error_text(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "password=[REDACTED]", "password=[REDACTED] tail", "password: [REDACTED]\nnext line",
+        "password=[REDACTED]&x=1", "password=[REDACTED],x=1", "password=[REDACTED];x",
+        '{"password": [REDACTED]}', "(password=[REDACTED])", "[password=[REDACTED]]",
+        "Authorization: [REDACTED]", "Authorization: [REDACTED] second", "cookie: [REDACTED]",
+        "token=[REDACTED]'", 'token=[REDACTED]"', "key=[REDACTED]", "secret=[REDACTED]\\",
+        "http://user:[REDACTED]@host/path", "secret=[REDACTED]@host",
+    ])
+    def test_an_already_redacted_value_is_left_alone(self, text):
+        assert sanitize_error_text(text) == text
+
+    def test_a_url_password_followed_by_a_label_keeps_the_host(self):
+        # the URL pattern leaves "[REDACTED]@host"; the label before it must not eat the host
+        assert (sanitize_error_text("http://secret:hunter2@host/x")
+                == "http://secret:[REDACTED]@host/x")
+
+    def test_redact_args(self):
+        out = redact_args({"note": "password=[REDACTED]hunter2", "done": "password=[REDACTED]",
+                           "list": ["token: [REDACTED]hunter2"]})
+        assert out == {"note": "password=[REDACTED]", "done": "password=[REDACTED]",
+                       "list": ["token: [REDACTED]"]}
+
+    def test_with_invisible_characters(self):
+        out = sanitize_error_text("pa" + ZWSP + "ssword=" + ZWSP + "[REDACTED]hunter2 tail")
+        assert "hunter2" not in out and out.endswith("tail")
+
+    def test_applying_it_twice_changes_nothing(self):
+        for text in ("password=[REDACTED]hunter2", "Authorization: [REDACTED]hunter2 x",
+                     'password="abc"def', "cookie: [REDACTED]a\nb",
+                     "key=[REDACTED]k&key=[REDACTED]z", "password=[REDACTED][REDACTED]hunter2",
+                     "token=[REDACTED]]hunter2", "p" + CYR_A + "ssword=[REDACTED]hunter2"):
+            once = sanitize_error_text(text)
+            assert sanitize_error_text(once) == once, text
+
+    def test_marker_rule_is_linear(self):
+        for unit in ("password=[REDACTED]", "token=[REDACTED]x", "cookie: [REDACTED]a\n",
+                     "Authorization: [REDACTED] [REDACTED]"):
+            text = unit * (200_000 // len(unit))
+            start = time.perf_counter()
+            sanitize_error_text(text)
+            assert time.perf_counter() - start < TIME_LIMIT

@@ -33,6 +33,7 @@ import secrets
 import threading
 import unicodedata
 from array import array
+from functools import partial
 from itertools import compress, islice, repeat
 from typing import Any, Optional
 
@@ -68,8 +69,13 @@ _QUOTED = (
 )
 _BARE_CHARS = r"""[^\s,;'"&}\])\\]"""
 _BARE = rf"""\\?["']?{_BARE_CHARS}+"""                # also an unterminated opening quote
-_NOT_DONE = r"(?!\s*\[REDACTED\])"                      # never re-redact our own marker
-_VALUE = rf"{_NOT_DONE}(?:{_QUOTED}|{_BARE})"
+# A value that is exactly our marker, followed by the end of the text or a delimiter, is already
+# redacted and is left alone (so redacting twice changes nothing). A marker followed by anything
+# else ("[REDACTED]hunter2") is NOT ours: it is an ordinary value, marker and rest included.
+_NOT_DONE = r"""(?!\s*\[REDACTED\](?:[\s"',;&@)\]}\\]|\Z))"""
+_MARKED = rf"\[REDACTED\]{_BARE_CHARS}+"
+_QUOTED_FULL = rf"(?:{_QUOTED}){_BARE_CHARS}*"       # a quoted value and what sticks to it
+_VALUE = rf"{_NOT_DONE}(?:{_MARKED}|{_QUOTED_FULL}|{_BARE})"
 
 
 def _label(words: str) -> "re.Pattern[str]":
@@ -91,10 +97,10 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
     # Authorization: <any scheme> <value>  (one or two words, so the value is always hidden)
     (re.compile(
         rf"(?i)(authorization{_SEP}){_NOT_DONE}"
-        rf"(?:{_QUOTED}|{_BARE}(?:[ \t]{{1,10}}(?!\s*\[REDACTED\]){_BARE_CHARS}+)?)"),
+        rf"(?:{_MARKED}|{_QUOTED_FULL}|{_BARE}(?:[ \t]{{1,10}}{_NOT_DONE}{_BARE_CHARS}+)?)"),
      r"\1" + _REDACTED),
     # Cookie: / Set-Cookie: the rest of the header line (or the quoted value)
-    (re.compile(rf"(?i)(cookie{_SEP}){_NOT_DONE}(?:{_QUOTED}|[^\n\r]{{1,2000}})"),
+    (re.compile(rf"(?i)(cookie{_SEP}){_NOT_DONE}(?:{_QUOTED_FULL}|[^\n\r]{{1,2000}})"),
      r"\1" + _REDACTED),
     # password=, passwd=, secret=, token=, api_key=, access_key=, openai-organization= ...
     # (in plain text, JSON, escaped JSON, URL-encoded and with quoted values that hold spaces)
@@ -182,7 +188,6 @@ _SEPARATOR_LOOKALIKES = {
     chr(0x2236): ":", chr(0xA789): ":",              # ratio, modifier letter colon
     chr(0x2254): "=", chr(0x2255): "=", chr(0xA78A): "=",   # colon equals, equals colon, modifier equals
 }
-_MAX_FOLD_CACHE = 20_000        # characters remembered by the fold tables
 _MAX_PASSES = 3                 # sweeps of all patterns over one shadow
 
 
@@ -206,23 +211,38 @@ def _fold_char(char: str) -> str:
     return plain if len(plain) == 1 and plain.isascii() else char
 
 
-class _FoldTable(dict):  # type: ignore[type-arg]
-    """``str.translate`` table that works out each character once (the cache is bounded)."""
-
-    def __init__(self, keep_flags: bool) -> None:
-        super().__init__()
-        self._keep_flags = keep_flags
-
-    def __missing__(self, code: int) -> str:
-        folded = _fold_char(chr(code))
-        value = ("\x01" if folded else "\x00") if self._keep_flags else folded
-        if code < 128 or len(self) < _MAX_FOLD_CACHE:
-            self[code] = value
-        return value
+_NFKD = partial(unicodedata.normalize, "NFKD")
+_ASCII_CONTROLS = frozenset(map(chr, [*range(9), *range(14, 32), 127]))   # dropped from the shadow
 
 
-_FOLD = _FoldTable(False)       # code point -> shadow text ("" or one character)
-_KEEP = _FoldTable(True)        # code point -> "\x01" if it stays in the shadow, else "\x00"
+def _fold_table(chars: "set[str]") -> tuple["set[str]", dict[int, str]]:
+    """
+    How the shadow of a text made of the characters ``chars`` differs from the text: the set
+    of characters that are dropped, and a ``str.translate`` table of the ones that change. It
+    is built per text from its DISTINCT characters, so the work is the number of distinct
+    characters and does not depend on what was seen before. Dropped and unchanged characters
+    are sorted out in bulk; only the characters that decompose or are special go through
+    ``_fold_char``.
+    """
+    others = [char for char in chars if char > "\x7f"]
+    hidden = {
+        char
+        for char, category in zip(others, map(unicodedata.category, others))
+        if category in _INVISIBLE_CATEGORIES or (category == "Cc" and char not in _KEPT_CONTROLS)
+    }
+    hidden.update(chars & _EXTRA_INVISIBLE)
+    hidden.update(chars & _ASCII_CONTROLS)
+    changed = [char for char, plain in zip(others, map(_NFKD, others)) if plain != char]
+    changed.extend(chars & _FOLD_SPECIAL)
+    table: dict[int, str] = {}
+    for char in changed:
+        if char not in hidden:
+            folded = _fold_char(char)
+            if folded != char:
+                table[ord(char)] = folded
+    return hidden, table
+
+
 _ASCII_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _MARKER_RUN = re.compile(rb"\x01+")
 
@@ -234,14 +254,18 @@ def _build_shadow(text: str) -> Optional[tuple[str, "array[int]"]]:
     """
     if text.isascii() and _ASCII_CONTROL.search(text) is None:
         return None
-    shadow = text.translate(_FOLD)
-    if shadow == text:
+    hidden, table = _fold_table(set(text))
+    if not hidden and not table:
         return None
     size = len(text)
-    if len(shadow) == size:                                # nothing dropped: one for one
-        return shadow, array("I", range(size))
-    keep = text.translate(_KEEP).encode("latin-1")
-    return shadow, array("I", compress(range(size), keep))
+    if hidden:
+        kept = [char not in hidden for char in text]
+        shadow = "".join(compress(text, kept))
+        origin = array("I", compress(range(size), kept))
+    else:                                                  # nothing dropped: one for one
+        shadow = text
+        origin = array("I", range(size))
+    return (shadow.translate(table) if table else shadow), origin
 
 
 def _apply_patterns(text: str) -> str:
@@ -427,6 +451,9 @@ _CONFUSABLES = str.maketrans(
     "aeikvoptuxyw"
     "ABEZHIKMNOPTYX",
 )
+
+# characters whose shadow differs although they do not decompose (look-alikes, separators)
+_FOLD_SPECIAL = frozenset(chr(code) for code in _CONFUSABLES) | frozenset(_SEPARATOR_LOOKALIKES)
 
 _CAMEL_LOWER_UPPER = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _CAMEL_ACRONYM = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
