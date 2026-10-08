@@ -29,16 +29,19 @@ import inspect
 import logging
 import math
 import random
-import re
 import socket
 import ssl
 import time
-import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
+# The secret redaction lives in aria/security/redact.py (issue #58) and is re-exported here, so
+# every existing ``from aria.plugins.retry import sanitize_error_text`` keeps working.
+from ..security.redact import MAX_ERROR_TEXT, sanitize_error_text
+
 __all__ = [
+    "MAX_ERROR_TEXT",
     "AttemptRecord",
     "EmptyResponseError",
     "LLMError",
@@ -564,103 +567,6 @@ class RetryPolicy:
         }
 
 
-# ─── Error text safety ────────────────────────────────────────────────────────
-
-MAX_ERROR_TEXT = 500
-
-_REDACTED = "[REDACTED]"
-
-# Building blocks. Every repetition is bounded or applies to a character class that cannot
-# overlap with the next part, and no pattern starts with an open-ended prefix, so matching
-# stays linear in the input size (see the 100k-character timing test).
-_S = r"(?:[-_]|%5[Ff]|%2[Dd])?"                      # optional "_" or "-" inside a label
-_SEP = r"""(?:\\?["'])?\s{0,5}(?:[:=]|%3[AaDd])\s{0,5}"""   # [closing quote] : or = [spaces]
-_QUOTED = r"""\\?"[^"\\]{0,1000}\\?"|\\?'[^'\\]{0,1000}\\?'"""   # also JSON-escaped \"..\"
-_BARE_CHARS = r"""[^\s,;'"&}\])\\]"""
-_BARE = rf"""\\?["']?{_BARE_CHARS}+"""                # also an unterminated opening quote
-_NOT_DONE = r"(?!\s*\[REDACTED\])"                      # never re-redact our own marker
-_VALUE = rf"{_NOT_DONE}(?:{_QUOTED}|{_BARE})"
-
-
-def _label(words: str) -> "re.Pattern[str]":
-    return re.compile(rf"(?i)((?:{words}){_SEP})" + _VALUE)
-
-
-# Applied in order after NFKC normalisation. Each keeps the label and hides only the value.
-_SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
-    # scheme://user:password@host  -> hide the password (proxy and connection errors print these)
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,30}://[^\s/:@?#]{1,200}:)[^\s/@?#]{1,500}(?=@)"),
-     r"\1" + _REDACTED),
-    # Authorization: Digest username="x", nonce="y", response="z"  -> the whole header value
-    (re.compile(r"(?i)(authorization" + _SEP + r")digest\b[^\n\r]{0,2000}"),
-     r"\1" + _REDACTED),
-    # Authorization: <any scheme> <value>  (one or two words, so the value is always hidden)
-    (re.compile(
-        rf"(?i)(authorization{_SEP}){_NOT_DONE}"
-        rf"(?:{_QUOTED}|{_BARE}(?:[ \t]{{1,10}}(?!\s*\[REDACTED\]){_BARE_CHARS}+)?)"),
-     r"\1" + _REDACTED),
-    # Cookie: / Set-Cookie: the rest of the header line (or the quoted value)
-    (re.compile(rf"(?i)(cookie{_SEP}){_NOT_DONE}(?:{_QUOTED}|[^\n\r]{{1,2000}})"),
-     r"\1" + _REDACTED),
-    # password=, passwd=, secret=, token=, api_key=, access_key=, openai-organization= ...
-    # (in plain text, JSON, escaped JSON, URL-encoded and with quoted values that hold spaces)
-    (_label(rf"pass(?:word|wd|phrase)|secret|token|api{_S}key|access{_S}key|private{_S}key"
-            rf"|openai{_S}organization"), r"\1" + _REDACTED),
-    # a bare key=value, such as a URL query ?key=abc (not "monkey=")
-    (re.compile(rf"(?i)((?<![A-Za-z0-9])key(?:=|%3[Dd])){_VALUE}"), r"\1" + _REDACTED),
-    # Bearer tokens anywhere
-    (re.compile(r"(?i)\bbearer\s{1,100}[A-Za-z0-9._~+/=\-]+"), "Bearer " + _REDACTED),
-    # sk-... keys, also with dots (sk-ant-api03-..., sk-proj-..., sk-abc.def.ghi)
-    (re.compile(r"\bsk-[A-Za-z0-9_.\-]{8,}"), "sk-" + _REDACTED),
-    # JSON web tokens
-    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
-     _REDACTED),
-    # AWS access key ids
-    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _REDACTED),
-    # Google API keys
-    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"), _REDACTED),
-    # GitHub tokens
-    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), _REDACTED),
-    # Slack tokens
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{8,}"), _REDACTED),
-)
-
-
-def sanitize_error_text(text: str, limit: int = MAX_ERROR_TEXT) -> str:
-    """
-    Make error text safer to store and print: hide common secrets, then cut it to ``limit``
-    characters (an ellipsis and the original length are added when it is cut).
-
-    BEST EFFORT, NOT A GUARANTEE. The text is first normalised with NFKC (so full-width
-    look-alike letters become plain ones), then these shapes are hidden:
-
-    * values after ``password``, ``passwd``, ``passphrase``, ``secret`` (so also
-      ``client_secret``), ``token`` (``access_token``, ``x-auth-token``), ``api_key``
-      (``x-api-key``), ``access_key`` (``aws_secret_access_key``), ``private_key``,
-      ``openai-organization`` and a bare ``key=``, written with ``=`` or ``:``, in plain
-      text, JSON (also backslash-escaped) and URL-encoded (``api%5Fkey=``, ``key%3D``);
-      quoted values may contain spaces
-    * the password in ``scheme://user:password@host`` URLs
-    * ``Authorization`` / ``Proxy-Authorization`` values with any scheme (Basic, Bearer,
-      Token, Digest ...); for Digest the whole header value
-    * ``Cookie`` / ``Set-Cookie`` header values
-    * ``Bearer`` tokens, ``sk-`` keys (also with dots), JSON web tokens, AWS key ids
-      (``AKIA``/``ASIA``), Google keys (``AIza``), GitHub tokens (``ghp_`` ``gho_``
-      ``ghu_`` ``ghs_`` ``ghr_`` ``github_pat_``), Slack tokens (``xox[abprs]-``)
-
-    Anything else (other secret formats, secrets with no label, personal data, a secret
-    split by markup) is NOT detected. Redaction runs before cutting, and the marker
-    reports the length of the text as it was given.
-    """
-    original_length = len(text)
-    text = unicodedata.normalize("NFKC", text)
-    for pattern, replacement in _SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    if len(text) > limit:
-        text = f"{text[:limit]}... [truncated, original length {original_length} characters]"
-    return text
-
-
 # ─── The retry loop ───────────────────────────────────────────────────────────
 
 def _type_name(exc: BaseException) -> str:
@@ -682,7 +588,11 @@ def _error_text(exc: BaseException) -> str:
     """Redacted and truncated ``ExceptionType: message`` for records and messages."""
     text = _safe_str(exc)
     name = _type_name(exc)
-    return sanitize_error_text(f"{name}: {text}" if text else name)
+    cleaned = sanitize_error_text(f"{name}: {text}" if text else name)
+    if cleaned.startswith("<text, ") and cleaned.endswith(" not scanned>"):
+        # the message was too long to scan: keep the type name, the marker replaces the message
+        cleaned = f"{sanitize_error_text(name)}: {cleaned}"
+    return cleaned
 
 
 async def _notify(

@@ -89,15 +89,22 @@ The list keeps the last 200 records so it cannot grow without limit. The counter
 
 Stored in the records, the counters' `last_error`, `cause_text` and the `LLMError` message: the error type name and the error text, with common secrets hidden and cut to 500 characters. When cut, an ellipsis is added with the length of the text as it was before any redaction or cutting.
 
+The redaction code (`sanitize_error_text`) lives in `aria/security/redact.py` and is re-exported from `aria/plugins/retry.py`, so both import paths work. What it covers, what it does not, and the matching tool for tool arguments are described in [redaction.md](redaction.md).
+
 **Redaction is best effort. It is a list of known shapes, not a guarantee.** Anything not on the list below goes through unchanged, and error text written by a provider can quote part of your request. Treat the records as possibly sensitive and look before you publish them.
 
 The text is first normalised with NFKC (so full-width look-alike letters become normal ones), then these shapes are replaced with `[REDACTED]`:
 
-- Values after `password`, `passwd`, `passphrase`, `secret` (so `client_secret` too), `token` (so `access_token` and `x-auth-token` too), `api_key` (and `x-api-key`), `access_key` (so `aws_secret_access_key` too), `private_key` and `openai-organization`, written with `=` or `:`. This covers plain text, JSON, backslash-escaped JSON (`{\"api_key\": \"X\"}`), URL-encoded labels (`api%5Fkey=X`, `key%3DX`), and quoted values that contain spaces. A bare `key=` (for example in a URL query) is covered too.
+- Values after `password`, `passwd`, `passphrase`, `secret` (so `client_secret` too), `token` (so `access_token` and `x-auth-token` too), `api_key` (and `x-api-key`), `access_key` (so `aws_secret_access_key` too), `private_key`, `openai-organization` and `signature` (so `x-amz-signature` too), and the whole words `pwd`, `pass` (so `DB_PASS`) and `sig`, written with `=` or `:`. This covers plain text, JSON, backslash-escaped JSON (`{\"api_key\": \"X\"}`), URL-encoded labels (`api%5Fkey=X`, `key%3DX`), and quoted values that contain spaces and backslash escapes (`password="ab\"cd ef"`). A bare `key=` (for example in a URL query) is covered too.
 - `Authorization` and `Proxy-Authorization` values with any scheme (Basic, Bearer, Token, Digest and others). For Digest the whole header value, including `nonce` and `response`, is hidden.
 - `Cookie` and `Set-Cookie` header values.
-- The password in `scheme://user:password@host` URLs (proxy and connection errors often print these). A URL with only a user name, or only a port, is left alone.
+- The password in `scheme://user:password@host` URLs (proxy and connection errors often print these). The user name may be empty (`redis://:password@host`). A URL with only a user name, or only a port, is left alone.
+- PEM and PGP private keys (`-----BEGIN ... PRIVATE KEY-----`, also `PRIVATE KEY BLOCK`), from the BEGIN line to the END line, or to the end of the text when there is no END line.
 - `Bearer` tokens anywhere, `sk-` keys (also ones with dots or dashes), JSON web tokens (`eyJ...`), AWS key ids (`AKIA...`, `ASIA...`), Google keys (`AIza...`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`) and Slack tokens (`xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-`).
+
+Labels split by invisible characters (a zero-width space, a soft hyphen, a control character, a combining mark, a Hangul filler inside `password`), written with accents, or with Cyrillic or Greek look-alike letters are read too, and so are look-alikes of `:` and `=` (U+2236, U+A789, U+2254, U+2255, U+A78A), and a value that starts with an invisible character. Only the secret is replaced; the rest of the text, invisible characters and accents included, stays as it was. A label split by a visible character (a space, a dot, a tab) is not read.
+
+A text of more than 1,000,000 characters (counted after NFKC, which can make one character up to 18, and counted before any redaction), or one with a run of more than 32 combining marks at a slice boundary, is not scanned. Every text up to the limit is scanned. The error text then becomes `<text, N characters, not scanned>`, and `ExceptionType: ` is kept in front of it in the attempt records. Nothing from such a text is kept.
 
 Not covered: secrets with no label and no known prefix, secrets split across lines or by markup, an opening quote that is never closed (only the first word after it is hidden), personal data, and anything not listed above.
 
