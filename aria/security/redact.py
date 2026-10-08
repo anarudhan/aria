@@ -33,6 +33,7 @@ import secrets
 import threading
 import unicodedata
 from array import array
+from contextvars import ContextVar
 from functools import partial
 from itertools import compress, islice, repeat
 from typing import Any, Optional
@@ -68,14 +69,21 @@ _QUOTED = (
     r"""|\\?"[^"\\]{0,1000}\\?"|\\?'[^'\\]{0,1000}\\?'"""
 )
 _BARE_CHARS = r"""[^\s,;'"&}\])\\]"""
-_BARE = rf"""\\?["']?{_BARE_CHARS}+"""                # also an unterminated opening quote
-# A value that is exactly our marker, followed by the end of the text or a delimiter, is already
-# redacted and is left alone (so redacting twice changes nothing). A marker followed by anything
-# else ("[REDACTED]hunter2") is NOT ours: it is an ordinary value, marker and rest included.
-_NOT_DONE = r"""(?!\s*\[REDACTED\](?:[\s"',;&@)\]}\\]|\Z))"""
-_MARKED = rf"\[REDACTED\]{_BARE_CHARS}+"
-_QUOTED_FULL = rf"(?:{_QUOTED}){_BARE_CHARS}*"       # a quoted value and what sticks to it
-_VALUE = rf"{_NOT_DONE}(?:{_MARKED}|{_QUOTED_FULL}|{_BARE})"
+# Our own marker counts as ONE ordinary value character, so a value that starts with, or
+# contains, "[REDACTED]" is hidden whole and replaced by one marker. That makes redacting
+# twice change nothing ("password=[REDACTED]" is replaced by itself) and gives a forged
+# marker no special power: "password=[REDACTED]@x" is hidden exactly like "password=y@x".
+_NO_BRACKET = r"""[^\s,;'"&}\])\\\[]"""                   # a value character that is not "["
+_BRACKET = r"(?:\[REDACTED\]|\[)"                          # the marker, or a lone "["
+_UNITS_OPT = rf"{_NO_BRACKET}*(?:{_BRACKET}{_NO_BRACKET}*)*"   # value characters, maybe none
+_UNITS = rf"(?={_BARE_CHARS}){_UNITS_OPT}"                    # at least one (linear: runs
+#                                                            # of plain characters, then "[")
+_BARE = rf"""\\?["']?{_UNITS}"""                       # also an unterminated opening quote
+_QUOTED_FULL = rf"(?:{_QUOTED}){_UNITS_OPT}"          # a quoted value and what sticks to it
+_VALUE = rf"(?:{_QUOTED_FULL}|{_BARE})"
+# After "Authorization:" a value that is only markers is done: it is what a two-word value
+# ("Basic abc extra") leaves in front of the third word, and the third word is not hidden.
+_ONLY_MARKERS = rf"(?:\[REDACTED\])+(?!{_BARE_CHARS})"
 
 
 def _label(words: str) -> "re.Pattern[str]":
@@ -96,11 +104,14 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
      r"\1" + _REDACTED),
     # Authorization: <any scheme> <value>  (one or two words, so the value is always hidden)
     (re.compile(
-        rf"(?i)(authorization{_SEP}){_NOT_DONE}"
-        rf"(?:{_MARKED}|{_QUOTED_FULL}|{_BARE}(?:[ \t]{{1,10}}{_NOT_DONE}{_BARE_CHARS}+)?)"),
+        rf"(?i)(authorization{_SEP})"
+        rf"(?:{_ONLY_MARKERS}|{_QUOTED_FULL}|{_BARE}(?:[ \t]{{1,10}}{_UNITS})?)"),
      r"\1" + _REDACTED),
-    # Cookie: / Set-Cookie: the rest of the header line (or the quoted value)
-    (re.compile(rf"(?i)(cookie{_SEP}){_NOT_DONE}(?:{_QUOTED_FULL}|[^\n\r]{{1,2000}})"),
+    # Cookie: / Set-Cookie: the rest of the header line, or only the quoted value (or our marker)
+    # when it is a whole JSON-style value (followed by "," "}" "]" or the end of the line)
+    (re.compile(rf"(?i)(cookie{_SEP})"
+                rf"(?:(?:{_QUOTED}|(?:\[REDACTED\])+)(?=[ \t]*(?:[,}}\]]|[\n\r]|\Z))"
+                rf"|(?:{_QUOTED})[^\n\r]{{0,2000}}|[^\n\r]{{1,2000}})"),
      r"\1" + _REDACTED),
     # password=, passwd=, secret=, token=, api_key=, access_key=, openai-organization= ...
     # (in plain text, JSON, escaped JSON, URL-encoded and with quoted values that hold spaces)
@@ -111,9 +122,10 @@ _SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
     # a bare key=value, such as a URL query ?key=abc (not "monkey=")
     (re.compile(rf"(?i)((?<![A-Za-z0-9])key(?:=|%3[Dd])){_VALUE}"), r"\1" + _REDACTED),
     # Bearer tokens anywhere
-    (re.compile(r"(?i)\bbearer\s{1,100}[A-Za-z0-9._~+/=\-]+"), "Bearer " + _REDACTED),
+    (re.compile(r"(?i)\bbearer\s{1,100}(?:\[REDACTED\]|[A-Za-z0-9._~+/=\-])+"),
+     "Bearer " + _REDACTED),
     # sk-... keys, also with dots (sk-ant-api03-..., sk-proj-..., sk-abc.def.ghi)
-    (re.compile(r"\bsk-[A-Za-z0-9_.\-]{8,}"), "sk-" + _REDACTED),
+    (re.compile(r"\bsk-(?:\[REDACTED\]|[A-Za-z0-9_.\-]){8,}"), "sk-" + _REDACTED),
     # JSON web tokens
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
      _REDACTED),
@@ -215,32 +227,85 @@ _NFKD = partial(unicodedata.normalize, "NFKD")
 _ASCII_CONTROLS = frozenset(map(chr, [*range(9), *range(14, 32), 127]))   # dropped from the shadow
 
 
-def _fold_table(chars: "set[str]") -> tuple["set[str]", dict[int, str]]:
+class _FoldContext:
+    """
+    What is known about the characters seen so far in ONE call: the characters, the ones that
+    are dropped from the shadow, and the table of the ones that change. A pure memo: it lives
+    for one ``redact_args`` call (or one ``sanitize_error_text`` call), is never shared between
+    calls, and is emptied when it holds more than ``_MAX_CONTEXT_CHARS`` characters.
+    """
+
+    __slots__ = ("known", "hidden", "changed", "table")
+
+    def __init__(self) -> None:
+        self.known: set[str] = set()
+        self.hidden: set[str] = set()
+        self.changed: set[str] = set()
+        self.table: dict[int, str] = {}
+
+    def clear(self) -> None:
+        self.known.clear()
+        self.hidden.clear()
+        self.changed.clear()
+        self.table.clear()
+
+
+_MAX_CONTEXT_CHARS = 50_000
+_HIDE_CATEGORIES = _INVISIBLE_CATEGORIES | {"Cc"}
+_SKIP_CATEGORIES = _HIDE_CATEGORIES | {"Lo"}
+_FOLD_CONTEXT: "ContextVar[Optional[_FoldContext]]" = ContextVar("aria_redact_fold", default=None)
+
+
+def _fold_table(chars: "set[str]") -> _FoldContext:
     """
     How the shadow of a text made of the characters ``chars`` differs from the text: the set
-    of characters that are dropped, and a ``str.translate`` table of the ones that change. It
-    is built per text from its DISTINCT characters, so the work is the number of distinct
-    characters and does not depend on what was seen before. Dropped and unchanged characters
-    are sorted out in bulk; only the characters that decompose or are special go through
-    ``_fold_char``.
+    of characters that are dropped, the set that change and a ``str.translate`` table for them
+    (the three also hold characters of earlier texts of the same call, which does no harm).
+
+    It is built from DISTINCT characters, once per call, so the work is the number of distinct
+    characters and does not depend on what other calls saw. Dropped characters are sorted out
+    in bulk by category. A character that decomposes goes through ``_fold_char`` only when
+    its decomposition holds an ASCII character or a look-alike; a Hangul syllable, an Indic
+    composite or a precomposed non-Latin letter cannot change and is skipped in bulk.
     """
-    others = [char for char in chars if char > "\x7f"]
-    hidden = {
-        char
-        for char, category in zip(others, map(unicodedata.category, others))
-        if category in _INVISIBLE_CATEGORIES or (category == "Cc" and char not in _KEPT_CONTROLS)
-    }
-    hidden.update(chars & _EXTRA_INVISIBLE)
-    hidden.update(chars & _ASCII_CONTROLS)
-    changed = [char for char, plain in zip(others, map(_NFKD, others)) if plain != char]
-    changed.extend(chars & _FOLD_SPECIAL)
-    table: dict[int, str] = {}
-    for char in changed:
+    context = _FOLD_CONTEXT.get()
+    if context is None:
+        context = _FoldContext()
+    fresh = chars - context.known
+    if not fresh:
+        return context
+    if len(context.known) + len(fresh) > _MAX_CONTEXT_CHARS:
+        context.clear()
+        fresh = set(chars)
+    others = [char for char in fresh if char > "\x7f"]
+    categories = list(map(unicodedata.category, others))
+    hidden = {char for char, category in zip(others, categories) if category in _HIDE_CATEGORIES}
+    hidden.difference_update(_KEPT_CONTROLS)               # white space among the controls
+    hidden.update(fresh & _EXTRA_INVISIBLE)
+    hidden.update(fresh & _ASCII_CONTROLS)
+    # Other letters ("Lo": Hangul, CJK, kana, Indic and so on) are never hidden and, once the text
+    # is NFKC-normalised, never change; checked for every code point in tests/test_redact.py.
+    rest = [
+        char for char, category in zip(others, categories)
+        if category not in _SKIP_CATEGORIES and char not in hidden
+    ]
+    decomposed = list(map(_NFKD, rest))
+    candidates: list[str] = []
+    if _MAY_CHANGE.search("".join(decomposed)) is not None:    # one look at all of them first
+        candidates = [
+            char for char, plain in zip(rest, decomposed)
+            if plain != char and _MAY_CHANGE.search(plain) is not None
+        ]
+    candidates.extend(fresh & _FOLD_SPECIAL)
+    for char in candidates:
         if char not in hidden:
             folded = _fold_char(char)
             if folded != char:
-                table[ord(char)] = folded
-    return hidden, table
+                context.table[ord(char)] = folded
+                context.changed.add(char)
+    context.hidden |= hidden
+    context.known |= fresh
+    return context
 
 
 _ASCII_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
@@ -254,18 +319,21 @@ def _build_shadow(text: str) -> Optional[tuple[str, "array[int]"]]:
     """
     if text.isascii() and _ASCII_CONTROL.search(text) is None:
         return None
-    hidden, table = _fold_table(set(text))
-    if not hidden and not table:
+    chars = set(text)
+    context = _fold_table(chars)
+    hidden, table = context.hidden, context.table
+    drops = not chars.isdisjoint(hidden)
+    if not drops and chars.isdisjoint(context.changed):
         return None
     size = len(text)
-    if hidden:
+    if drops:
         kept = [char not in hidden for char in text]
         shadow = "".join(compress(text, kept))
         origin = array("I", compress(range(size), kept))
     else:                                                  # nothing dropped: one for one
         shadow = text
         origin = array("I", range(size))
-    return (shadow.translate(table) if table else shadow), origin
+    return shadow.translate(table), origin
 
 
 def _apply_patterns(text: str) -> str:
@@ -280,12 +348,15 @@ def _sweep(
     """One pass of all patterns over ``shadow``, keeping the three tables in step."""
     changed = False
     for pattern, replacement in _SECRET_PATTERNS:
-        matches = list(pattern.finditer(shadow))
+        keeps_label = replacement.startswith("\\1")
+        marker = replacement[2:] if keeps_label else replacement
+        matches = [
+            match for match in pattern.finditer(shadow)
+            if shadow[match.end(1) if keeps_label else match.start():match.end()] != marker
+        ]                                   # a value that already is the marker is no change
         if not matches:
             continue
         changed = True
-        keeps_label = replacement.startswith("\\1")
-        marker = replacement[2:] if keeps_label else replacement
         size = len(marker)
         new_shadow: list[str] = []
         new_first: "array[int]" = array("I")
@@ -454,6 +525,8 @@ _CONFUSABLES = str.maketrans(
 
 # characters whose shadow differs although they do not decompose (look-alikes, separators)
 _FOLD_SPECIAL = frozenset(chr(code) for code in _CONFUSABLES) | frozenset(_SEPARATOR_LOOKALIKES)
+# a decomposition that can lead to a different shadow: it holds an ASCII character or a look-alike
+_MAY_CHANGE = re.compile("[\x00-\x7f" + re.escape("".join(sorted(_FOLD_SPECIAL))) + "]")
 
 _CAMEL_LOWER_UPPER = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _CAMEL_ACRONYM = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
@@ -753,6 +826,7 @@ def redact_args(
     It never raises for any input (``KeyboardInterrupt`` and ``SystemExit`` excepted).
     BEST EFFORT: a secret under a harmless key name and in an unknown shape is NOT detected.
     """
+    token = _FOLD_CONTEXT.set(_FoldContext())          # the memo of this call only
     try:
         return _redact(
             value,
@@ -765,6 +839,8 @@ def redact_args(
         )
     except Exception:
         return "<redaction failed>"
+    finally:
+        _FOLD_CONTEXT.reset(token)
 
 
 # ─── Keyed digest of arguments ────────────────────────────────────────────────
