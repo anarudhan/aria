@@ -13,7 +13,7 @@ import random
 import sys
 import warnings
 import weakref
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
@@ -3098,3 +3098,208 @@ async def test_waiter_send_from_a_plain_callback_without_a_task() -> None:
     loop.call_soon(finish)
     await turns()
     assert got[1:] == ["stopped"] and log == ["undone"]
+
+
+# ----------------------------------------------------------------------
+# Fifth review round: a ring may close through more than one path
+# ----------------------------------------------------------------------
+
+
+async def _two_paths_to_the_parent() -> List[str]:
+    # No background task, every wait is real. P has a child C. C's undo awaits
+    # P.dispose() and Y.dispose() together; Y's undo awaits P.dispose() too. So
+    # there are two paths from C back to P (C -> P and C -> Y -> P), and waking
+    # one outside wait is not enough to open the ring.
+    p = Scope(name="P")
+    c = p.child("C")
+    y = Scope(name="Y")
+    log: List[str] = []
+    gate = asyncio.Event()
+
+    def eff_c() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            await asyncio.gather(p.dispose(), y.dispose())
+            log.append("C done")
+
+        return undo
+
+    def eff_y() -> Callable[[], Any]:
+        async def undo() -> None:
+            await gate.wait()
+            await p.dispose()
+            log.append("Y done")
+
+        return undo
+
+    p.effect(lambda: (lambda: log.append(f"P own undo, C is {c.state.value}")))
+    c.effect(eff_c)
+    y.effect(eff_y)
+    tc = asyncio.ensure_future(c.dispose())
+    ty = asyncio.ensure_future(y.dispose())
+    await turns()
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(tc, ty), 5)
+    await asyncio.wait_for(p.dispose(), 5)
+    assert p.disposed and c.disposed and y.disposed
+    assert scope_module._WAITS == {}
+    return log
+
+
+async def test_ring_closing_through_two_paths_is_fully_opened() -> None:
+    log = await _two_paths_to_the_parent()
+    assert sorted(log) == ["C done", "P own undo, C is disposed", "Y done"]  # each once
+    assert log.index("C done") < log.index("P own undo, C is disposed")
+
+
+@_EAGER
+async def test_ring_closing_through_two_paths_under_the_eager_task_factory() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        log = await _two_paths_to_the_parent()
+    finally:
+        loop.set_task_factory(None)
+    assert sorted(log) == ["C done", "P own undo, C is disposed", "Y done"]
+    assert log.index("C done") < log.index("P own undo, C is disposed")
+
+
+async def _second_path_from_a_background_task(second_path_last: bool) -> List[str]:
+    # The ring P -> C -> Z -> P is real. A fire-and-forget task of C's undo adds a
+    # second path C -> Y -> P.
+    p = Scope(name="P")
+    c = p.child("C")
+    z = Scope(name="Z")
+    y = Scope(name="Y")
+    log: List[str] = []
+    gate = asyncio.Event()
+
+    def eff_c() -> Callable[[], Any]:
+        async def undo() -> None:
+            if second_path_last:
+                asyncio.ensure_future(y.dispose())
+            await z.dispose()
+            log.append("C done")
+
+        return undo
+
+    def waits_for_parent(name: str) -> Callable[[], Callable[[], Any]]:
+        def effect() -> Callable[[], Any]:
+            async def undo() -> None:
+                await gate.wait()
+                await p.dispose()
+                log.append(f"{name} done")
+
+            return undo
+
+        return effect
+
+    p.effect(lambda: (lambda: log.append(f"P own undo, C is {c.state.value}")))
+    c.effect(eff_c)
+    z.effect(waits_for_parent("Z"))
+    y.effect(waits_for_parent("Y"))
+    tc = asyncio.ensure_future(c.dispose())
+    await turns()
+    gate.set()
+    await asyncio.wait_for(tc, 5)
+    await asyncio.wait_for(asyncio.gather(z.dispose(), y.dispose(), p.dispose()), 5)
+    assert p.disposed and c.disposed and y.disposed and z.disposed
+    assert scope_module._WAITS == {}
+    return log
+
+
+@pytest.mark.parametrize("second_path_last", [True, False])
+async def test_ring_with_a_second_spurious_path_from_a_background_task(
+    second_path_last: bool,
+) -> None:
+    log = await _second_path_from_a_background_task(second_path_last)
+    assert sorted(log) == sorted(
+        ["C done", "Z done", "Y done", "P own undo, C is disposed"]
+    )  # every undo ran once
+    assert log.index("C done") < log.index("P own undo, C is disposed")
+
+
+@_EAGER
+async def test_ring_with_a_second_spurious_path_under_the_eager_task_factory() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        log = await _second_path_from_a_background_task(True)
+    finally:
+        loop.set_task_factory(None)
+    assert log.index("C done") < log.index("P own undo, C is disposed")
+
+
+async def _background_fuzz(first_seed: int, last_seed: int) -> None:
+    # "Start a background task, then await another scope" undos, with parents and
+    # children, staggered starts (counted in loop turns, so no real time passes).
+    for seed in range(first_seed, last_seed):
+        rng = random.Random(seed)
+        n = rng.randint(2, 6)
+        scopes: List[Scope] = [Scope(name="s0")]
+        for i in range(1, n):
+            if rng.random() < 0.5:
+                scopes.append(rng.choice(scopes).child(f"s{i}"))
+            else:
+                scopes.append(Scope(name=f"s{i}"))
+        runs: Dict[Any, int] = {}
+        violations: List[str] = []
+        background: List["asyncio.Future[None]"] = []
+
+        def make(
+            owner: Scope, key: Any, kind: str, tgt: Scope, tgt2: Scope
+        ) -> Callable[[], Callable[[], Any]]:
+            def effect() -> Callable[[], Any]:
+                async def undo() -> None:
+                    runs[key] = runs.get(key, 0) + 1
+                    if owner.children:
+                        violations.append(f"{owner.name} undone while a child is alive")
+                    if kind == "turns":
+                        await turns(rng.randint(0, 3))
+                    elif kind == "bg_then_other":
+                        background.append(asyncio.ensure_future(tgt2.dispose()))
+                        await tgt.dispose()
+                    elif kind == "other":
+                        await tgt.dispose()
+                    elif kind == "gather":
+                        await asyncio.gather(tgt.dispose(), turns(2))
+
+                return undo
+
+            return effect
+
+        expected = 0
+        for owner in scopes:
+            for k in range(rng.randint(0, 3)):
+                kind = rng.choice(["turns", "other", "other", "gather", "bg_then_other"] * 2)
+                owner.effect(
+                    make(owner, (owner.name, k), kind, rng.choice(scopes), rng.choice(scopes))
+                )
+                expected += 1
+        order = list(scopes)
+        rng.shuffle(order)
+        started = []
+        for sc in order:
+            started.append(asyncio.ensure_future(sc.dispose()))
+            await turns(rng.choice([0, 0, 2]))
+        await asyncio.wait_for(asyncio.gather(*started), 5)
+        if background:
+            await asyncio.wait_for(asyncio.gather(*background), 5)
+        assert all(sc.disposed for sc in scopes), f"seed {seed}"
+        assert sum(runs.values()) == expected and set(runs.values()) <= {1}, f"seed {seed}"
+        assert violations == [], f"seed {seed}: {violations[:3]}"
+        assert scope_module._WAITS == {}, f"seed {seed}"
+
+
+async def test_randomized_background_then_wait_rings_never_hang() -> None:
+    await _background_fuzz(40_000, 40_400)
+
+
+@_EAGER
+async def test_randomized_background_then_wait_rings_under_the_eager_task_factory() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        await _background_fuzz(41_000, 41_250)
+    finally:
+        loop.set_task_factory(None)

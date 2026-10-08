@@ -157,8 +157,16 @@ _LIVE_EPOCHS: Dict[int, int] = {}  # live epoch -> serial number of its scope
 _WAITS: Dict[int, Dict[int, List[Optional["asyncio.Future[None]"]]]] = {}
 
 
+def _edge_is_live(entries: List[Optional["asyncio.Future[None]"]]) -> bool:
+    """An edge counts unless every wait on it has been woken (those calls are returning)."""
+    return any(wake is None or not wake.done() for wake in entries)
+
+
 def _waits_path(start: int, goal: int) -> Optional[List[Tuple[int, int]]]:
-    """Edges (waiter, target) of one path from ``start`` to ``goal``, or None."""
+    """Edges (waiter, target) of one path from ``start`` to ``goal``, or None.
+
+    Only live edges are followed, see ``_edge_is_live``.
+    """
     seen: Set[int] = set()
     stack: List[Tuple[int, List[Tuple[int, int]]]] = [(start, [])]
     while stack:
@@ -168,8 +176,9 @@ def _waits_path(start: int, goal: int) -> Optional[List[Tuple[int, int]]]:
         if node in seen:
             continue
         seen.add(node)
-        for target in _WAITS.get(node, ()):
-            stack.append((target, path + [(node, target)]))
+        for target, entries in _WAITS.get(node, {}).items():
+            if _edge_is_live(entries):
+                stack.append((target, path + [(node, target)]))
     return None
 
 
@@ -198,17 +207,35 @@ def _drop_wait(waiter: int, target: int, wake: Optional["asyncio.Future[None]"])
 
 
 def _break_ring(start: int, goal: int) -> None:
-    """A wait from ``goal`` to ``start`` was just added. If ``start`` already waits
-    (through others) for ``goal``, that is a ring: wake one outside-in wait on the
-    path, the one nearest to ``goal``, so that call returns and the ring opens."""
-    path = _waits_path(start, goal)
-    if not path:
-        return
-    for waiter, target in reversed(path):
-        for wake in _WAITS[waiter][target]:
-            if wake is not None and not wake.done():
-                wake.set_result(None)
-                return
+    """A wait from ``goal`` to ``start`` was just added. Open every ring it closes.
+
+    A ring exists while a path leads from ``start`` back to ``goal``. Each round
+    finds a path over live edges and wakes one outside-in wait on it, the one
+    nearest to ``goal``, so that call returns. It repeats until no path is left,
+    because several paths may close the ring (waking one leaves the others).
+
+    It ends, and every round makes progress. A path from a child back up to its
+    parent must contain an outside-in wait: inside waits only ever go from a
+    parent down to a child, so they cannot lead back up. That wait is live, so it
+    has an entry that is not yet woken, and waking it removes the edge from the
+    next search. Each round therefore wakes a new entry, and there are finitely
+    many. Inside waits are never woken, so the parent keeps waiting for its child.
+    """
+    while True:
+        path = _waits_path(start, goal)
+        if not path:
+            return
+        woke = False
+        for waiter, target in reversed(path):
+            for wake in _WAITS[waiter][target]:
+                if wake is not None and not wake.done():
+                    wake.set_result(None)
+                    woke = True
+                    break
+            if woke:
+                break
+        if not woke:  # cannot happen (see above); never loop without progress
+            return
 
 
 def _current_owner() -> Optional[int]:
