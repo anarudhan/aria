@@ -164,6 +164,27 @@ PermissionEngine
     Checks: not exhausted (max_uses is None or uses < max_uses)
     If all pass: increment uses_so_far, log audit event, return True.
     Otherwise: log denied event, return False.
+
+### How scopes are matched
+
+A scope names the resource a grant applies to. The rules live in
+`aria/permissions/scope.py`, and every failure to parse means "not covered".
+
+| Scope kind | Example | Rule |
+|---|---|---|
+| Everything | `*` | A grant of `*` covers all. A specific grant never covers a request for `*` |
+| File path | `/home/u/project`, `~/notes` | `~`, `..` and symlinks are resolved first. A grant covers the folder and what is inside it, matched on whole path parts. `/a/b` covers `/a/b/c` and never `/a/bc` |
+| URL | `https://example.com/api` | Scheme, host and port must be equal. The path matches on whole segments after `..` and `%2e%2e` are removed. A request with embedded credentials is not covered. URLs that clients and servers read differently are refused: backslashes, spaces and control characters, `;` in the path, empty path segments (`//`), and the encoded forms `%2f`, `%5c`, `%25` and `%00` in the path |
+| Anything else | `vuln-12`, `cap-3` | Exact match only |
+
+How grants keep one meaning:
+
+- A path grant is stored as an absolute real path when it is created, so `~` and symlinks are settled once. Relative path grants (`.`, `./src`, `../x`) are refused, because they would mean something different whenever the working folder changes. A saved relative grant from an older version is kept but covers nothing.
+- At check time a stored path must still resolve to itself. If a granted folder is later replaced by a symlink, the grant stops matching instead of following the link.
+- Saved grants obey the same rules as new ones. A saved path that is not in canonical form (for example one with a trailing slash, a `~` or a symlink in it), a saved URL with a query, a fragment or dot segments, and a saved relative path all cover nothing. ARIA prints a warning at load for each, and the grant has to be made again.
+- A path is checked at one moment and used at a later one. Code that writes to a path after a check should use `resolve_path()` and keep that gap short.
+
+Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.
 ```
 
 The hash chain in audit events links each event to the previous one via SHA256. This makes the audit trail tamper-evident — if anyone modifies an old event, all subsequent hashes become invalid.
