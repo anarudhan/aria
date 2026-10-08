@@ -24,6 +24,10 @@ Rules that hold for every mode
     listener failure.
   * Event names are plain strings and all strings are equal. ``__proto__``,
     ``toString`` and ``__class__`` behave like any other name.
+
+Threads: registration, removal and bookkeeping are protected by a lock, so
+they are safe to call from several threads. Dispatch is meant to run on the
+event loop thread. The lock is never held while a listener runs.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple
@@ -79,10 +84,48 @@ class _Entry:
     def __init__(self, token: int, event: str, fn: Listener, label: str, once: bool) -> None:
         self.token = token
         self.event = event
-        self.fn = fn
+        # Cleared when the entry is removed, so a Disposer does not keep the
+        # listener alive.
+        self.fn: Optional[Listener] = fn
         self.label = label
         self.once = once
         self.active = True
+
+
+# Dead entries are compacted away once they outnumber the live ones and there
+# are at least this many of them. This keeps removal amortised O(1).
+_COMPACT_MIN_DEAD = 32
+
+
+class _Bucket:
+    """Listeners of one event.
+
+    Order is ``reversed(front) + back``: ``prepend`` appends to ``front`` and
+    ``on`` appends to ``back``, so both are O(1). Removal is lazy: the entry is
+    only marked inactive (dispatch skips inactive entries) and the lists are
+    compacted when dead entries pile up. ``cache`` is the immutable snapshot
+    handed to dispatches; it is rebuilt only after an add or a compaction.
+    """
+
+    __slots__ = ("front", "back", "live", "cache")
+
+    def __init__(self) -> None:
+        self.front: List[_Entry] = []
+        self.back: List[_Entry] = []
+        self.live = 0
+        self.cache: Optional[Tuple[_Entry, ...]] = None
+
+    def snapshot(self) -> Tuple[_Entry, ...]:
+        if self.cache is None:
+            self.cache = tuple(reversed(self.front)) + tuple(self.back)
+        return self.cache
+
+    def maybe_compact(self) -> None:
+        dead = len(self.front) + len(self.back) - self.live
+        if dead >= _COMPACT_MIN_DEAD and dead > self.live:
+            self.front = [e for e in self.front if e.active]
+            self.back = [e for e in self.back if e.active]
+            self.cache = None
 
 
 class Disposer:
@@ -135,9 +178,11 @@ class Events:
     def __init__(self, *, max_errors: int = DEFAULT_MAX_ERRORS) -> None:
         if max_errors < 1:
             raise ValueError("max_errors must be at least 1")
-        # Copy on write: each event maps to an immutable tuple, so a dispatch
-        # snapshot is just the tuple that was current when it started.
-        self._listeners: Dict[str, Tuple[_Entry, ...]] = {}
+        # One lock guards registration, removal and compaction. It is never held
+        # while a listener runs. It is re-entrant so that a disposer triggered
+        # by garbage collection inside a locked section cannot deadlock.
+        self._lock = threading.RLock()
+        self._listeners: Dict[str, _Bucket] = {}
         self._tokens = itertools.count(1)
         self._errors: Deque[ListenerError] = deque(maxlen=max_errors)
         self._dropped_errors = 0
@@ -187,21 +232,32 @@ class Events:
         self._check_name(name)
         if not callable(listener):
             raise TypeError(f"listener must be callable, got {type(listener).__name__}")
-        entry = _Entry(next(self._tokens), name, listener, label or _label_of(listener), once)
-        current = self._listeners.get(name, ())
-        self._listeners[name] = (entry,) + current if prepend else current + (entry,)
+        label = label or _label_of(listener)
+        with self._lock:
+            entry = _Entry(next(self._tokens), name, listener, label, once)
+            bucket = self._listeners.get(name)
+            if bucket is None:
+                bucket = self._listeners[name] = _Bucket()
+            (bucket.front if prepend else bucket.back).append(entry)
+            bucket.live += 1
+            bucket.cache = None
         return Disposer(self, entry)
 
     def _remove(self, entry: _Entry) -> bool:
-        if not entry.active:
-            return False
-        entry.active = False
-        remaining = tuple(e for e in self._listeners.get(entry.event, ()) if e.token != entry.token)
-        if remaining:
-            self._listeners[entry.event] = remaining
-        else:
-            self._listeners.pop(entry.event, None)
-        return True
+        """Lazy removal: mark inactive, fix the live count, compact if needed."""
+        with self._lock:
+            if not entry.active:
+                return False
+            entry.active = False
+            entry.fn = None
+            bucket = self._listeners.get(entry.event)
+            if bucket is not None:
+                bucket.live -= 1
+                if bucket.live == 0:
+                    del self._listeners[entry.event]
+                else:
+                    bucket.maybe_compact()
+            return True
 
     @staticmethod
     def _check_name(name: Any) -> None:
@@ -210,7 +266,9 @@ class Events:
 
     def listener_count(self, name: str) -> int:
         self._check_name(name)
-        return len(self._listeners.get(name, ()))
+        with self._lock:
+            bucket = self._listeners.get(name)
+            return bucket.live if bucket is not None else 0
 
     # ------------------------------------------------------------------
     # Errors and health
@@ -237,8 +295,10 @@ class Events:
 
     def describe(self) -> Dict[str, Any]:
         """Health report: listeners per event and the collected error count."""
+        with self._lock:
+            listeners = {name: bucket.live for name, bucket in self._listeners.items()}
         return {
-            "listeners": {name: len(entries) for name, entries in self._listeners.items()},
+            "listeners": listeners,
             "error_count": len(self._errors),
             "dropped_errors": self._dropped_errors,
             "pending_async_listeners": len(self._tasks),
@@ -250,19 +310,24 @@ class Events:
 
     def _snapshot(self, name: str) -> Tuple[_Entry, ...]:
         self._check_name(name)
-        return self._listeners.get(name, ())
+        with self._lock:
+            bucket = self._listeners.get(name)
+            return bucket.snapshot() if bucket is not None else ()
 
-    def _claim(self, entry: _Entry) -> bool:
+    def _claim(self, entry: _Entry) -> Optional[Listener]:
         """Decide whether this listener's turn should run.
 
-        A listener removed earlier is skipped. A ``once`` listener is removed
-        here, before it runs.
+        Returns the function to call, or None if the listener was removed
+        before its turn (it is skipped). A ``once`` listener is removed here,
+        before it runs; the caller keeps the function alive for the call and
+        the entry no longer references it.
         """
-        if not entry.active:
-            return False
-        if entry.once:
-            self._remove(entry)
-        return True
+        fn = entry.fn
+        if fn is None or not entry.active:
+            return None
+        if entry.once and not self._remove(entry):
+            return None  # another dispatch or thread claimed it first
+        return fn
 
     # ------------------------------------------------------------------
     # emit
@@ -283,10 +348,11 @@ class Events:
         still run). Use ``serial`` or ``parallel`` if you need to wait.
         """
         for entry in self._snapshot(name):
-            if not self._claim(entry):
+            fn = self._claim(entry)
+            if fn is None:
                 continue
             try:
-                result = entry.fn(*args)
+                result = fn(*args)
                 if inspect.isawaitable(result):
                     self._schedule(name, entry, result)
             except Exception as exc:
@@ -327,9 +393,10 @@ class Events:
         decision. Use ``serial`` for async listeners.
         """
         for entry in self._snapshot(name):
-            if not self._claim(entry):
+            fn = self._claim(entry)
+            if fn is None:
                 continue
-            result = entry.fn(*args)
+            result = fn(*args)
             if inspect.isawaitable(result):
                 _discard_awaitable(result)
                 raise TypeError(
@@ -351,9 +418,10 @@ class Events:
         is not ``None`` and not ``False``. An exception propagates.
         """
         for entry in self._snapshot(name):
-            if not self._claim(entry):
+            fn = self._claim(entry)
+            if fn is None:
                 continue
-            result = entry.fn(*args)
+            result = fn(*args)
             if inspect.isawaitable(result):
                 result = await result
             if result is not None and result is not False:
@@ -368,9 +436,12 @@ class Events:
         """Run all listeners together. All run even if some fail.
 
         If any failed, raise one ``ListenerErrors`` holding every error, in
-        listener order. Returns nothing on success. If the caller is
-        cancelled, the running listeners are cancelled and ``CancelledError``
-        propagates.
+        listener order. Returns nothing on success.
+
+        No listener outlives the call. If the caller is cancelled, or a
+        listener raises ``CancelledError`` or another ``BaseException``, the
+        remaining listeners are cancelled and awaited to completion, and then
+        the exception propagates.
         """
         entries = self._snapshot(name)
         if not entries:
@@ -378,10 +449,11 @@ class Events:
         failures: List[Optional[ListenerError]] = [None] * len(entries)
 
         async def run(index: int, entry: _Entry) -> None:
-            if not self._claim(entry):
+            fn = self._claim(entry)
+            if fn is None:
                 return
             try:
-                result = entry.fn(*args)
+                result = fn(*args)
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
@@ -391,9 +463,13 @@ class Events:
         try:
             await asyncio.gather(*tasks)
         except BaseException:
+            # Whatever went wrong (the caller was cancelled, or a listener
+            # raised CancelledError or another BaseException), no sibling may
+            # outlive this call: cancel the rest, wait for them, then re-raise.
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
         errors = [f for f in failures if f is not None]
         if errors:
@@ -422,9 +498,11 @@ class Events:
 
         def run(start: int) -> Any:
             index = start
+            fn: Optional[Listener] = None
             while index < len(chain):
                 entry = chain[index]
-                if self._claim(entry):
+                fn = self._claim(entry)
+                if fn is not None:
                     break
                 index += 1
             else:
@@ -441,7 +519,7 @@ class Events:
                 called = True
                 return run(index + 1)
 
-            return entry.fn(*args, next_)
+            return fn(*args, next_)
 
         return run(0)
 
