@@ -64,6 +64,7 @@ A pull request is done only when all of these are true:
 - The linked issue's acceptance criteria are met
 - New behaviour has tests, and bug fixes have a test that failed before the fix
 - `ruff check aria/ tests/ examples/` is clean
+- `mypy aria/` reports no errors
 - `python -m pytest tests/` passes
 - `python examples/demo_v11.py` still runs
 - Documentation and the README changelog are updated when behaviour changes

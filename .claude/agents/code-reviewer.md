@@ -12,6 +12,7 @@ Given an issue number and a branch or pull request:
 2. Check, in this order: does it meet every acceptance criterion, does it contain bugs or unhandled failure paths, are there security problems (especially in aria/permissions, aria/security and anything that runs code, files or network calls), are the tests meaningful and do they fail without the change, and is there scope creep or a new dependency.
 3. Run the checks yourself rather than trusting the author:
    ruff check aria/ tests/ examples/
+   mypy aria/
    PYTHONPATH=. python -m pytest tests/
 4. Report findings ranked by severity. For each give the file and line, what is wrong, a realistic way it fails, and the fix you suggest. Mark each as blocking or optional.
 

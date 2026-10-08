@@ -13,6 +13,7 @@ Given an issue number and its acceptance criteria:
 3. Write the tests first or together with the code. A bug fix must include a test that fails without the fix.
 4. Run before every commit:
    ruff check aria/ tests/ examples/
+   mypy aria/
    PYTHONPATH=. python -m pytest tests/
    PYTHONPATH=. python examples/demo_v11.py
 5. Commit with a clear message that mentions the issue number, for example "Fix version drift (#19)".

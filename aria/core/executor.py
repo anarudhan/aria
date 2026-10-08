@@ -100,6 +100,8 @@ class ExecutionEngine:
         self._max_parallel  = max_parallel_agents
         self._semaphore     = asyncio.Semaphore(max_parallel_agents)
         self._message_bus: dict[str, asyncio.Queue] = {}  # agent_id -> inbox
+        # Set by the orchestrator before run(); copied into each run's context.
+        self._initial_context: dict[str, Any] = {}
 
     # ── Main Entry Point ──────────────────────────────────────────────────────
 

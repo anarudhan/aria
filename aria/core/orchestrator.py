@@ -356,7 +356,6 @@ class ARIAOrchestrator:
         )
 
         # Attach PRISM state to result metadata for downstream inspection
-        result.metadata = getattr(result, "metadata", {})
         result.metadata["prism"] = prism_state.to_dict()
 
         # ── Step 5c: ECHO Observe ──────────────────────────────────────────────
@@ -370,10 +369,8 @@ class ARIAOrchestrator:
             status     = outcome,
             prism_state = prism_state,
         )
-        result.metadata["echo_profile"] = (
-            self.echo.get_profile(user_id).to_dict()
-            if self.echo.get_profile(user_id) else {}
-        )
+        echo_profile = self.echo.get_profile(user_id)
+        result.metadata["echo_profile"] = echo_profile.to_dict() if echo_profile else {}
 
         # ── Step 6: Retrospective ──────────────────────────────────────────────
         if self.config.enable_retrospective and result.status == TaskStatus.COMPLETED:
@@ -519,9 +516,9 @@ class ARIAOrchestrator:
         """
         char = self.echo.character_report()
         profiles = {
-            uid: self.echo.get_profile(uid).to_dict()
+            uid: profile.to_dict()
             for uid in self.echo.all_user_ids()
-            if self.echo.get_profile(uid)
+            if (profile := self.echo.get_profile(uid)) is not None
         }
         return {
             "character":       char,

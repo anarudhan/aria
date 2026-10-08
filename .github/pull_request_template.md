@@ -6,6 +6,7 @@ Closes #
 
 ## How it was verified
 - [ ] `ruff check aria/ tests/ examples/` is clean
+- [ ] `mypy aria/` reports no errors
 - [ ] `python -m pytest tests/` passes
 - [ ] `python examples/demo_v11.py` runs
 - [ ] New or changed behaviour has tests (bug fixes include a test that failed before)

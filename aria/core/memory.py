@@ -379,7 +379,7 @@ class TemporalMemory:
                     cur.execute("DELETE FROM memory_entries WHERE entry_id=?", (oldest_id,))
 
     def stats(self) -> dict:
-        s = {
+        s: dict[str, Any] = {
             ring.value: {"count": len(self._rings[ring]), "max": self._max_entries[ring]}
             for ring in MemoryRing
         }

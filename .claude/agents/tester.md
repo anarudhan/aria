@@ -13,6 +13,7 @@ Given an issue number and a branch:
 3. Add the missing tests in tests/. Tests must not need network access or API keys.
 4. Run the full checks and report the real output:
    ruff check aria/ tests/ examples/
+   mypy aria/
    PYTHONPATH=. python -m pytest tests/ -v
    PYTHONPATH=. python examples/demo_v11.py
 5. If a test you wrote reveals a bug, do not fix production code. Report the failing test, the cause you suspect and the file involved.

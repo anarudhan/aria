@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .models import CapabilityFingerprint
+    from ..agents.base import BaseAgent
+    from .models import CapabilityFingerprint, TaskNode
+    from .trust import TrustLedger
 
 from .models import AgentStatus, CapabilityFingerprint
 
@@ -83,7 +85,7 @@ def cosine_similarity(vec_a: dict[str, float], vec_b: dict[str, float]) -> float
 class AgentRegistration:
     """Everything the registry knows about a registered agent."""
     fingerprint: CapabilityFingerprint
-    agent_ref: object              # The actual BaseAgent instance
+    agent_ref: BaseAgent           # The actual BaseAgent instance
     status: AgentStatus = AgentStatus.IDLE
     active_task_count: int = 0
     registered_at: float = field(default_factory=lambda: __import__('time').time())
@@ -128,7 +130,7 @@ class CapabilityRegistry:
 
     # ── Registration ──────────────────────────────────────────────────────────
 
-    def register(self, fingerprint: CapabilityFingerprint, agent_ref: object):
+    def register(self, fingerprint: CapabilityFingerprint, agent_ref: BaseAgent):
         """
         Register an agent with its capability fingerprint.
         Automatically triggers IDF recalculation for the corpus.
@@ -200,7 +202,7 @@ class CapabilityRegistry:
         required_tools: Optional[list[str]] = None,
         required_input_type: Optional[str] = None,
         required_output_type: Optional[str] = None,
-        trust_ledger: Optional[object] = None,
+        trust_ledger: Optional[TrustLedger] = None,
         exclude_agents: Optional[list[str]] = None,
     ) -> Optional[str]:
         """
@@ -271,8 +273,8 @@ class CapabilityRegistry:
 
     def find_coalition(
         self,
-        task_nodes: list[object],    # list of TaskNode
-        trust_ledger: Optional[object] = None,
+        task_nodes: list[TaskNode],
+        trust_ledger: Optional[TrustLedger] = None,
     ) -> dict[str, str]:
         """
         Form a coalition by finding the best agent for each task node.
@@ -308,7 +310,7 @@ class CapabilityRegistry:
         self,
         task_description: str,
         required_tools: list[str],
-        trust_ledger: Optional[object],
+        trust_ledger: Optional[TrustLedger],
         agent_load: dict[str, int],
     ) -> Optional[str]:
         """Like find_best_agent but penalizes agents with existing load."""
@@ -374,7 +376,7 @@ class CapabilityRegistry:
             self._agents[agent_id].status = AgentStatus.SUSPENDED
             print(f"[ARIA Registry] Agent '{agent_id}' suspended (trust too low)")
 
-    def get_agent(self, agent_id: str) -> Optional[object]:
+    def get_agent(self, agent_id: str) -> Optional[BaseAgent]:
         reg = self._agents.get(agent_id)
         return reg.agent_ref if reg else None
 

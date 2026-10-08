@@ -43,9 +43,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .scanner import ScanReport, Vulnerability
+
+if TYPE_CHECKING:
+    from ..permissions.engine import PermissionEngine
 
 # ─── Patch Record ─────────────────────────────────────────────────────────────
 
@@ -193,7 +196,7 @@ class SelfPatcher:
         self,
         vulnerability: Vulnerability,
         user_id:       str,
-        permission_engine: object,
+        permission_engine: PermissionEngine,
     ) -> PatchRecord:
         """
         Apply a security patch for a single vulnerability.
@@ -299,7 +302,7 @@ class SelfPatcher:
         self,
         report: ScanReport,
         user_id: str,
-        permission_engine: object,
+        permission_engine: PermissionEngine,
         only_severity: Optional[list[str]] = None,
     ) -> list[PatchRecord]:
         """

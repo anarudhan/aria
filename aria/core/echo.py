@@ -445,10 +445,10 @@ class ARIACharacter:
             history = history[-50:]
         self._calibration_history = history
 
-        counts = {}
+        counts: dict[str, int] = {}
         for v in history:
             counts[v] = counts.get(v, 0) + 1
-        dominant = max(counts, key=counts.get)
+        dominant = max(counts, key=lambda k: counts[k])
         self.calibration_tendency = dominant
 
     def _update_domain(self, category: str, quality: float) -> None:
@@ -788,7 +788,8 @@ class ECHOEngine:
         task_lower = current_task.lower()
         tech_signals = sum(1 for marker in self._TECHNICAL_MARKERS if marker in task_lower)
         tech_history = getattr(profile, "_tech_signal_count", 0) + tech_signals
-        profile._tech_signal_count = tech_history
+        # Dynamic, non-persisted counter: set via setattr so it stays out of the dataclass fields.
+        setattr(profile, "_tech_signal_count", tech_history)
 
         if profile.total_interactions >= 5:
             avg_tech = tech_history / profile.total_interactions

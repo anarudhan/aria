@@ -111,12 +111,7 @@ jobs:
           twine check dist/*
 
   typecheck:
-    # Informational only. The codebase has existing mypy errors, so this job is
-    # not part of the gate yet. The mypy step is allowed to fail so the job
-    # shows green, and its output stays visible in the log. Remove
-    # continue-on-error and add this job to the gate's needs list once the
-    # errors are cleaned up.
-    name: Type check (informational)
+    name: Type check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -133,7 +128,6 @@ jobs:
         run: pip install "mypy>=1.10.0"
 
       - name: Run mypy
-        continue-on-error: true
         run: mypy aria/
 
   issue-link:
@@ -178,7 +172,7 @@ jobs:
     # unless every blocking job finished with "success".
     name: CI Gate
     if: always()
-    needs: [lint, test, demo, build, issue-link]
+    needs: [lint, test, demo, build, typecheck, issue-link]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

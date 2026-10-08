@@ -24,6 +24,7 @@ This file is read at the start of every Claude session. The full process is in `
 
 ```
 ruff check aria/ tests/ examples/
+mypy aria/
 PYTHONPATH=. python -m pytest tests/
 PYTHONPATH=. python examples/demo_v11.py
 ```
