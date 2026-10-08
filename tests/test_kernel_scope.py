@@ -2897,3 +2897,204 @@ async def test_shared_awaitable_is_cancelled_by_dispose_unless_shielded() -> Non
     protected.cancel()
     with pytest.raises(asyncio.CancelledError):
         await protected
+
+
+# ----------------------------------------------------------------------
+# Fourth review round: a parent never runs its undos before its children
+# ----------------------------------------------------------------------
+
+
+async def _children_first_with_background_wait() -> List[str]:
+    # P has a child C; X is independent. C's undo starts a fire-and-forget task
+    # that awaits X.dispose() (C's undo does not wait for it) and then waits on a
+    # gate. X's undo really awaits P.dispose(). Before P.dispose() is called, the
+    # wait graph holds C -> X -> P from the inherited marker.
+    p = Scope(name="P")
+    c = p.child("C")
+    x = Scope(name="X")
+    order: List[str] = []
+    gate = asyncio.Event()
+
+    async def background() -> None:
+        await x.dispose()
+
+    def eff_c() -> Callable[[], Any]:
+        async def undo() -> None:
+            order.append("C undo start")
+            asyncio.ensure_future(background())
+            await gate.wait()
+            order.append("C undo end")
+
+        return undo
+
+    def eff_x() -> Callable[[], Any]:
+        async def undo() -> None:
+            await p.dispose()
+
+        return undo
+
+    def eff_p() -> Callable[[], Any]:
+        return lambda: order.append(f"P own undo; C is {c.state.value}")
+
+    c.effect(eff_c)
+    x.effect(eff_x)
+    p.effect(eff_p)
+    tc = asyncio.ensure_future(c.dispose())
+    await turns()
+    tp = asyncio.ensure_future(p.dispose())
+    await turns(10)
+    assert order == ["C undo start"]  # P is waiting for its child, whatever the graph says
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(tc, tp), 5)
+    await turns()
+    assert scope_module._WAITS == {}
+    return order
+
+
+async def test_parent_never_runs_its_undos_before_a_child_that_is_unwinding() -> None:
+    order = await _children_first_with_background_wait()
+    assert order == ["C undo start", "C undo end", "P own undo; C is disposed"]
+
+
+@_EAGER
+async def test_parent_waits_for_its_child_under_the_eager_task_factory_too() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+    try:
+        order = await _children_first_with_background_wait()
+    finally:
+        loop.set_task_factory(None)
+    assert order == ["C undo start", "C undo end", "P own undo; C is disposed"]
+
+
+@pytest.mark.parametrize("child_first", [True, False])
+async def test_a_real_ring_through_a_child_is_opened_at_the_childs_call(
+    child_first: bool,
+) -> None:
+    # The child's undo awaits parent.dispose() while the parent waits for the
+    # child: a real ring. The child's call must be the one that returns early.
+    p = Scope(name="P")
+    c = p.child("C")
+    log: List[str] = []
+    seen: List[str] = []
+
+    def eff_c() -> Callable[[], Any]:
+        async def undo() -> None:
+            log.append("C undo start")
+            await p.dispose()  # returns early: the parent waits for this very undo
+            seen.append(f"P is {p.state.value} when C's call returned")
+            await turns(3)
+            log.append("C undo end")
+
+        return undo
+
+    c.effect(eff_c)
+    p.effect(lambda: (lambda: log.append("P own undo")))
+    if child_first:
+        first = asyncio.ensure_future(c.dispose())
+        await turns()
+        second = asyncio.ensure_future(p.dispose())
+    else:
+        first = asyncio.ensure_future(p.dispose())
+        await turns()
+        second = asyncio.ensure_future(c.dispose())
+    await asyncio.wait_for(asyncio.gather(first, second), 5)
+    assert log == ["C undo start", "C undo end", "P own undo"]
+    assert seen and "disposed" not in seen[0]  # it did not wait for the parent to finish
+    assert p.disposed and c.disposed and scope_module._WAITS == {}
+
+
+async def test_ring_through_a_child_via_helper_task_completes() -> None:
+    p = Scope(name="P")
+    c = p.child("C")
+    log: List[str] = []
+
+    def eff_c() -> Callable[[], Any]:
+        async def undo() -> None:
+            await asyncio.gather(p.dispose())
+            log.append("C undo end")
+
+        return undo
+
+    c.effect(eff_c)
+    p.effect(lambda: (lambda: log.append("P own undo")))
+    await asyncio.wait_for(asyncio.gather(c.dispose(), p.dispose()), 5)
+    assert log == ["C undo end", "P own undo"]
+
+
+# ----------------------------------------------------------------------
+# Fourth review round: every awaiter of a remover result has its own shield
+# ----------------------------------------------------------------------
+
+
+async def test_second_await_after_a_wait_for_timeout_is_not_cancelled() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log, gate))()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(result, 0.02)
+    assert log == []  # the undo is still running
+    waiter = asyncio.ensure_future(_run(result))  # later wait, by a task never cancelled
+    await turns()
+    assert not waiter.done()
+    gate.set()
+    await asyncio.wait_for(waiter, 5)  # no spurious CancelledError
+    assert log == ["undone"]
+
+
+async def test_cancelling_one_of_two_tasks_on_one_waiter_leaves_the_other_alone() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log, gate))()
+    t1 = asyncio.create_task(result)
+    t2 = asyncio.create_task(result)
+    await turns()
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+    await turns()
+    assert not t2.done() and log == []
+    gate.set()
+    await asyncio.wait_for(t2, 5)  # got the result, not a cancellation
+    assert log == ["undone"] and not t2.cancelled()
+
+
+async def test_gather_of_the_same_waiter_twice_and_cancel_before_first_step() -> None:
+    log: List[str] = []
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log))()
+    await asyncio.wait_for(asyncio.gather(result, result), 5)
+    assert log == ["undone"]
+    again = s.effect(_slow_undo_effect(log))()
+    t = asyncio.create_task(again)
+    t.cancel()  # before the task ever ran
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    await asyncio.wait_for(again, 5)  # a later await still sees the finished undo
+    assert log == ["undone", "undone"]
+
+
+async def test_waiter_send_from_a_plain_callback_without_a_task() -> None:
+    log: List[str] = []
+    gate = asyncio.Event()
+    s = Scope(name="s")
+    result = s.effect(_slow_undo_effect(log, gate))()
+    loop = asyncio.get_running_loop()
+    got: List[Any] = []
+    loop.call_soon(lambda: got.append(result.send(None)))  # no current task here
+    await turns()
+    assert len(got) == 1 and not got[0].done()
+    gate.set()
+    await asyncio.wait_for(_run(result), 5)
+
+    def finish() -> None:
+        try:
+            result.send(None)
+        except StopIteration:
+            got.append("stopped")
+
+    loop.call_soon(finish)
+    await turns()
+    assert got[1:] == ["stopped"] and log == ["undone"]

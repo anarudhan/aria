@@ -40,6 +40,7 @@ import functools
 import inspect
 import itertools
 import time
+import weakref
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -139,46 +140,75 @@ _SERIALS = itertools.count(1)
 _DISPOSING: ContextVar[Tuple[int, ...]] = ContextVar("aria_scope_disposing", default=())
 _LIVE_EPOCHS: Dict[int, int] = {}  # live epoch -> serial number of its scope
 
-# Who is waiting for whose disposal: waiter serial -> {target serial: how many
-# waits}. A wait is recorded when a dispose() call is made from inside some
-# scope's live unwinding, directly or from any task that unwinding started. It
-# lets two scopes that dispose each other at the same time notice the ring and
-# return instead of waiting for each other forever. The price: a background task
-# an undo started counts as part of that undo while the undo is live, so a
-# dispose() it makes may return early when waiting would close a ring.
-_WAITS: Dict[int, Dict[int, int]] = {}
+# Who is waiting for whose disposal: waiter serial -> {target serial: [wake, ...]},
+# one list entry per wait. A wait is recorded in two cases.
+#  * A dispose() call is made from inside some scope's live unwinding, directly or
+#    from any task that unwinding started. These "outside-in" waits may be cut
+#    short: the entry holds a future ("wake") that, when set, makes that call
+#    return without waiting.
+#  * A parent's unwinding waits for a child scope to finish ("inside" waits, wake
+#    is None). These are never cut short, because a parent must not run its own
+#    undos before its children are done.
+# The graph lets rings be noticed and broken at an outside-in wait, instead of
+# hanging: a new outside-in wait that would close a ring returns at once, and a
+# new inside wait that closes a ring wakes one outside-in wait on the ring. The
+# price: a background task an undo started counts as part of that undo while the
+# undo is live, so a dispose() it makes can be treated as a wait of the undo.
+_WAITS: Dict[int, Dict[int, List[Optional["asyncio.Future[None]"]]]] = {}
 
 
-def _waits_reach(start: int, goal: int) -> bool:
+def _waits_path(start: int, goal: int) -> Optional[List[Tuple[int, int]]]:
+    """Edges (waiter, target) of one path from ``start`` to ``goal``, or None."""
     seen: Set[int] = set()
-    stack = [start]
+    stack: List[Tuple[int, List[Tuple[int, int]]]] = [(start, [])]
     while stack:
-        node = stack.pop()
+        node, path = stack.pop()
         if node == goal:
-            return True
+            return path
         if node in seen:
             continue
         seen.add(node)
-        stack.extend(_WAITS.get(node, ()))
-    return False
+        for target in _WAITS.get(node, ()):
+            stack.append((target, path + [(node, target)]))
+    return None
 
 
-def _add_wait(waiter: int, target: int) -> None:
-    edges = _WAITS.setdefault(waiter, {})
-    edges[target] = edges.get(target, 0) + 1
+def _waits_reach(start: int, goal: int) -> bool:
+    return _waits_path(start, goal) is not None
 
 
-def _drop_wait(waiter: int, target: int) -> None:
+def _add_wait(waiter: int, target: int, wake: Optional["asyncio.Future[None]"]) -> None:
+    _WAITS.setdefault(waiter, {}).setdefault(target, []).append(wake)
+
+
+def _drop_wait(waiter: int, target: int, wake: Optional["asyncio.Future[None]"]) -> None:
     edges = _WAITS.get(waiter)
     if edges is None:
         return
-    left = edges.get(target, 0) - 1
-    if left > 0:
-        edges[target] = left
-    else:
-        edges.pop(target, None)
-        if not edges:
-            del _WAITS[waiter]
+    entries = edges.get(target)
+    if entries is not None:
+        for i, entry in enumerate(entries):
+            if entry is wake:
+                del entries[i]
+                break
+        if not entries:
+            del edges[target]
+    if not edges:
+        del _WAITS[waiter]
+
+
+def _break_ring(start: int, goal: int) -> None:
+    """A wait from ``goal`` to ``start`` was just added. If ``start`` already waits
+    (through others) for ``goal``, that is a ring: wake one outside-in wait on the
+    path, the one nearest to ``goal``, so that call returns and the ring opens."""
+    path = _waits_path(start, goal)
+    if not path:
+        return
+    for waiter, target in reversed(path):
+        for wake in _WAITS[waiter][target]:
+            if wake is not None and not wake.done():
+                wake.set_result(None)
+                return
 
 
 def _current_owner() -> Optional[int]:
@@ -226,24 +256,47 @@ class _Waiter(Coroutine[Any, Any, None]):
     ``asyncio.run`` and ``asyncio.create_task`` all work, and ignoring it is
     harmless (the scheduled work happens either way).
 
-    It keeps no state of its own: ``send`` does what ``Future.__await__`` does,
-    looking at the future each time. So the same object may be awaited, wrapped
-    in several tasks one after the other, or in several tasks at once.
+    Every awaiter gets its own ``asyncio.shield`` around the scheduled task, so
+    cancelling or timing out one wait never cancels another and never stops the
+    undo. The same object may be awaited many times, by one task or several, and
+    wrapped in several tasks one after the other or at once. ``send`` works like
+    ``Future.__await__`` and keeps one shield per driving task.
     """
 
-    __slots__ = ("_fut",)
+    __slots__ = ("_task", "_shields", "_loose")
 
-    def __init__(self, fut: "asyncio.Future[Any]") -> None:
-        self._fut = fut
+    def __init__(self, task: "asyncio.Future[Any]") -> None:
+        self._task = task
+        self._shields: Optional["weakref.WeakKeyDictionary[Any, asyncio.Future[Any]]"] = None
+        self._loose: Optional["asyncio.Future[Any]"] = None  # driver that is not a task
 
     def __await__(self) -> Generator[Any, None, None]:
-        return self._fut.__await__()
+        return asyncio.shield(self._task).__await__()
 
     def send(self, value: Any) -> Any:
-        fut = self._fut
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if task is None:
+            fut = self._loose
+        else:
+            fut = None if self._shields is None else self._shields.get(task)
+        if fut is None or (fut.done() and fut.cancelled()):
+            fut = asyncio.shield(self._task)
+            if task is None:
+                self._loose = fut
+            else:
+                if self._shields is None:
+                    self._shields = weakref.WeakKeyDictionary()
+                self._shields[task] = fut
         if not fut.done():
             fut._asyncio_future_blocking = True  # type: ignore[attr-defined]
             return fut  # the task waits for it and calls send again
+        if task is None:
+            self._loose = None
+        elif self._shields is not None:
+            self._shields.pop(task, None)
         raise StopIteration(fut.result())
 
     def throw(self, *args: Any) -> Any:  # type: ignore[override]
@@ -472,7 +525,7 @@ class Scope:
         return eff
 
     def _attach(self, child: "Scope") -> None:
-        eff = _Effect(next(self._ids), f"scope {child.name}", [child.dispose])
+        eff = _Effect(next(self._ids), f"scope {child.name}", [functools.partial(child._dispose_as_child, self)])
         self._children[eff.id] = eff
         eff.child = child
         child._link = (self, eff.id)
@@ -745,7 +798,7 @@ class Scope:
         task = loop.create_task(self._marked(aw))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
-        return _Waiter(asyncio.shield(task))
+        return _Waiter(task)
 
     async def _marked(self, aw: Awaitable[Any]) -> None:
         epoch = next(_EPOCHS)
@@ -801,6 +854,10 @@ class Scope:
             raise bag[0]
 
     async def _run(self) -> None:
+        # Under an eager task factory this body starts running inside create_task(),
+        # before the caller could store the task; others may look at ``self._task``
+        # meanwhile, so it is set here, as the very first thing.
+        self._task = asyncio.current_task()
         epoch = next(_EPOCHS)
         self._live.add(epoch)
         _LIVE_EPOCHS[epoch] = self._serial
@@ -880,19 +937,47 @@ class Scope:
         waiter = _current_owner()
         if waiter is not None and _waits_reach(self._serial, waiter):
             return  # waiting would close a cycle: two disposals waiting for each other
+        await self._dispose_wait(waiter, breakable=True)
+
+    async def _dispose_as_child(self, parent: "Scope") -> None:
+        """Dispose this scope on behalf of its parent's unwinding.
+
+        Unlike ``dispose()`` this never returns early because of the wait graph or
+        because of an inherited marker: a parent must not go on to its own undos
+        before the child is done. If waiting closes a ring, the ring is opened at
+        an outside-in wait instead (see ``_break_ring``).
+        """
+        if self._state is ScopeState.DISPOSED:
+            return
+        await self._dispose_wait(parent._serial, breakable=False)
+
+    async def _dispose_wait(self, waiter: Optional[int], breakable: bool) -> None:
         self._closing = True
         task = self._task
         if (task is None or task.done()) and not self._has_work():
             self._finish_dispose()
             return
+        wake: Optional["asyncio.Future[None]"] = None
         if waiter is not None:
-            _add_wait(waiter, self._serial)
+            if breakable:
+                wake = asyncio.get_running_loop().create_future()
+            _add_wait(waiter, self._serial, wake)
+            if not breakable:
+                _break_ring(self._serial, waiter)
         try:
             while self._state is not ScopeState.DISPOSED:
-                await asyncio.shield(self._ensure_task())
+                unwind = self._ensure_task()
+                if wake is None:
+                    # Do not cancel the unwind if this waiter is cancelled.
+                    await asyncio.wait({unwind})
+                else:
+                    await asyncio.wait({unwind, wake}, return_when=asyncio.FIRST_COMPLETED)
+                    if wake.done():
+                        return  # the wait was cut short to open a ring
+                unwind.result()  # re-raise what the unwind raised, as before
         finally:
             if waiter is not None:
-                _drop_wait(waiter, self._serial)
+                _drop_wait(waiter, self._serial, wake)
 
     # ------------------------------------------------------------------
     # Start, restart
