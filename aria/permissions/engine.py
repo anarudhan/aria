@@ -49,6 +49,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from .scope import (
+    canonical_scope,
+    grant_is_stable,
+    is_path_scope,
+    is_relative_path,
+    resolve_path,
+    scope_covers,
+)
+
 # ─── Capability Definitions ───────────────────────────────────────────────────
 
 class Capability(Enum):
@@ -149,6 +158,16 @@ class PermissionGrant:
     use_count:      int = 0
     max_uses:       Optional[int] = None   # None = unlimited
 
+    def __post_init__(self):
+        # Path scopes are stored as absolute real paths, so the grant keeps one
+        # meaning. This must never raise: grants are rebuilt from disk, and a
+        # failure there would discard every saved permission. Relative paths
+        # are left as they are, and they never match anything.
+        if is_path_scope(self.scope) and not is_relative_path(self.scope):
+            resolved = resolve_path(self.scope)
+            if resolved is not None:
+                self.scope = resolved
+
     @property
     def is_expired(self) -> bool:
         if self.expires_at == 0:
@@ -166,10 +185,16 @@ class PermissionGrant:
         return not self.is_expired and not self.is_exhausted
 
     def matches_scope(self, requested_scope: str) -> bool:
-        if self.scope == "*":
-            return True
-        # Scope matching: granted scope must be an ancestor of requested
-        return requested_scope == self.scope or requested_scope.startswith(self.scope)
+        """
+        True if this grant covers the requested scope.
+
+        Paths and URLs match on whole parts, never on a text prefix, so a
+        grant for /home/u/project does not cover /home/u/project-secrets.
+        Other scopes (ids, names) must be equal. See aria/permissions/scope.py.
+        """
+        if not grant_is_stable(self.scope):
+            return False
+        return scope_covers(self.scope, requested_scope)
 
 
 # ─── Audit Entry ─────────────────────────────────────────────────────────────
@@ -311,6 +336,9 @@ class PermissionEngine:
         The hours parameter defaults to the capability's safe default.
         Users can override it but ARIA will warn about long-lived grants.
         """
+        # Stored in canonical form. Raises ValueError for a relative path.
+        scope = canonical_scope(scope)
+
         effective_hours = hours if hours is not None else DEFAULT_EXPIRY_HOURS[capability]
         expires_at = time.time() + (effective_hours * 3600) if effective_hours > 0 else 0
 
@@ -353,6 +381,10 @@ class PermissionEngine:
         Revoke all grants for a user/capability/scope combination.
         Returns number of grants revoked.
         """
+        try:
+            scope = canonical_scope(scope)
+        except ValueError:
+            pass  # cannot be canonical, so only an exact text match can revoke it
         grants = self._grants.get(user_id, {}).get(capability.value, [])
         before = len(grants)
         self._grants[user_id][capability.value] = [
