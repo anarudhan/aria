@@ -198,10 +198,17 @@ class AuditEntry:
     reason:     str = ""
     agent_id:   str = ""
     task_id:    str = ""
-    # Hash of previous entry — makes audit trail tamper-evident
+    # Hash of the previous entry. It links entries in order. It is NOT a
+    # tamper-proof seal: see compute_hash and docs/architecture.md.
     prev_hash:  str = ""
 
     def compute_hash(self) -> str:
+        """
+        Short fingerprint of this entry. Covers entry_id, timestamp, user_id,
+        capability, action and prev_hash. It does NOT cover scope, reason,
+        agent_id or task_id, it is cut to 16 hex characters (64 bits), and no
+        function verifies the chain yet. Do not treat it as tamper evidence.
+        """
         data = f"{self.entry_id}{self.timestamp}{self.user_id}{self.capability}{self.action}{self.prev_hash}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
@@ -212,17 +219,23 @@ class PermissionEngine:
     """
     ARIA's zero-trust permission guardian.
 
-    Every single capability check flows through this class.
-    If check() returns False, the action does not happen. Period.
-    No exceptions. No bypasses. No internal overrides.
+    Every capability check that is made flows through this class, and it
+    denies by default: with no valid grant, check() returns False and logs
+    the denial.
 
-    The only thing ARIA can do without user permission is:
-      - Read its own source files for self-analysis (but not modify them)
-      - Access in-memory data it created in the current session
-      - Log to the audit trail
-      - Display text responses to the user
+    What this class can and cannot do. It ANSWERS questions. It cannot stop
+    code that never asks. A tool or agent body that does not call check() or
+    require() is not blocked by it. Today these places ask: the orchestrator
+    (required_capabilities and memory writes), the web agent, the improvement
+    engine (AGENT_SPAWN, CODE_EXECUTE) and the patcher (SELF_MODIFY). Agent
+    tool calls and most agent bodies do not. Enforcing the check at tool call
+    time is tracked in issue #42. See "What is and is not enforced today" in
+    docs/architecture.md.
 
-    Everything else requires explicit user permission.
+    The intent is that ARIA does nothing with user data or resources without
+    an explicit grant, apart from: reading its own source for self-analysis,
+    using in-memory data from the current session, logging to the audit
+    trail, and showing text responses to the user.
     """
 
     def __init__(self, persist_path: Optional[str] = None):
@@ -238,7 +251,7 @@ class PermissionEngine:
         if self._persist_path and self._persist_path.exists():
             self._load()
 
-    # ── Permission Checking (called before EVERY action) ──────────────────────
+    # ── Permission Checking (callers must ask: see "What is and is not enforced") ─
 
     def check(
         self,
@@ -251,8 +264,9 @@ class PermissionEngine:
         """
         Check if a user has granted ARIA permission for a capability.
 
-        This is called before EVERY tool execution, file access,
-        network call, or any action that touches user data or resources.
+        Code that touches user data or resources is meant to call this
+        first. The engine cannot make it do so: callers that skip the check
+        are not blocked (see the class docstring and docs/architecture.md).
 
         Returns True only if a valid, non-expired, in-scope grant exists.
         Everything else returns False and logs the denial.

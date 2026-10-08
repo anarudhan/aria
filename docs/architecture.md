@@ -187,7 +187,35 @@ How grants keep one meaning:
 Behaviour change from earlier versions: scopes used to match on a text prefix. Bare relative paths such as `src/` and host-only names such as `example.com/api` were covered by a grant for their start. They now match only when equal. Use an absolute path or a full URL for a grant that covers children.
 ```
 
-The hash chain in audit events links each event to the previous one via SHA256. This makes the audit trail tamper-evident — if anyone modifies an old event, all subsequent hashes become invalid.
+Each audit event carries a hash that includes the previous event's hash, so the events form an ordered chain. Be clear about what that does and does not give you today:
+
+- The hash covers `entry_id`, `timestamp`, `user_id`, `capability`, `action` and the previous hash. It does **not** cover `scope`, `reason`, `agent_id` or `task_id`, so changing those is not detectable.
+- It is cut to 16 hex characters (64 bits) of SHA256.
+- **Nothing verifies the chain yet.** There is no function that walks it and reports a break.
+- The audit list lives in memory only. It is not saved with the grants, so it is gone after a restart.
+- Anyone who can change process memory can recompute the whole chain.
+
+So the audit trail is an ordered log, not tamper evidence. A full hash over every field, a verify function, and saving to disk are planned as part of the guarded pipeline work (issue #42).
+
+### What is and is not enforced today
+
+The permission engine answers questions and denies by default. It does not stop code that never asks.
+
+| Place | Asks the permission engine? |
+|---|---|
+| Orchestrator, for `required_capabilities` passed by the caller | Yes |
+| Orchestrator, memory writes | Yes (`MEMORY_WRITE`) |
+| Web agent, search and browse | Yes (`WEB_SEARCH`, `WEB_BROWSE`, with scope `*` only) |
+| Improvement engine, spawning and loading a synthesized agent | Yes (`AGENT_SPAWN`, `CODE_EXECUTE`) |
+| Patcher, applying a patch | Yes (`SELF_MODIFY`, with the vulnerability id as scope) |
+| `LLMAgent` tool calls | **No** |
+| `@aria_agent` and `BaseAgent.execute` bodies, other than the web agent | **No** |
+| Patcher `rollback` and `rollback_all` | **No** |
+| LLM provider calls (task data leaves the machine) | **No** |
+| State files (memory, trust, permissions) | **No** |
+| Running a synthesized agent after it was loaded | **No**, and it runs inside the ARIA process |
+
+The guarded execution pipeline (issue #42, design in `docs/design/0042-guarded-pipeline.md`) is the planned fix for tool calls. Until it lands, code you write that calls tools or touches files must ask the engine itself.
 
 ---
 
