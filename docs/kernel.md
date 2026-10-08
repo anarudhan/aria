@@ -181,3 +181,298 @@ Two things the library cannot fix for you:
     "pending_async_listeners": 0,              # async listeners started by emit still running
 }
 ```
+
+# Kernel scopes
+
+`aria.kernel.Scope` makes sure that everything one part of ARIA registers is
+undone when that part is unloaded. A plugin, a synthesized agent or a
+background service registers things as it loads: event listeners, child
+parts, tasks, connections. When it is unloaded, the scope undoes all of them
+automatically, in a safe order, so nothing is left behind. If an undo fails,
+the failure is recorded and visible. It uses only the Python standard library.
+The idea comes from the Cordis "fibers and effects" model.
+
+**What this is and is not.** A scope gives CLEANUP. It is NOT isolation or
+sandboxing. Code that runs inside a scope has all the privileges of the
+process, and a scope does not stop it from doing anything. It only makes sure
+that what the code registered through the scope is removed again. Do not use it
+to contain untrusted code.
+
+## Example
+
+```python
+from aria.kernel import Events, Scope, ScopeState
+
+events = Events()
+root = Scope(events, name="app")
+
+async def load_plugin(scope: Scope) -> None:
+    scope.on("task.done", on_done)                 # listener, removed with the scope
+
+    def open_log():
+        f = open("plugin.log", "a")
+        return f.close                             # the "undo" is returned
+    scope.effect(open_log, label="log file")
+
+    async def connect():
+        conn = await db.connect()
+        return conn.close                          # sync or async undo
+    scope.effect(connect, label="database")
+
+    helper = scope.child("helper")                 # a part inside the part
+    helper.on("task.done", helper_handler)
+
+plugin = root.child("plugin")
+await plugin.start(load_plugin)
+if plugin.state is ScopeState.FAILED:
+    print(plugin.errors)                           # why it failed
+
+await plugin.dispose()   # helper first, then database, log file, listener
+```
+
+`async with scope:` starts the scope when you enter and disposes it when you
+leave, also when the block raises.
+
+## Effects
+
+`scope.effect(fn, label="")` runs `fn()` right away and keeps what it returns
+as the undo. `fn` may return:
+
+- `None`: there is nothing to undo.
+- A callable: the undo. It may be sync, or return an awaitable (an `async def`,
+  or a function that returns a task).
+- A list or tuple of callables: all of them are run, last one first.
+- An awaitable that resolves to one of the above. It is started as a task, so
+  this needs a running event loop. The scope owns that task: `dispose()` and
+  removers cancel it if it has not finished, even if someone else also awaits it.
+  If the awaitable is shared, pass `asyncio.shield(shared)` so only your wait is
+  cancelled.
+
+`effect` returns a **remover**. Calling it takes the effect out of the scope and
+starts its undo now. A remover only ever touches the effect it was made for, so
+removing effect A can never remove effect B, whatever was removed before. The
+result is awaitable, and the contract is:
+
+- A sync undo (all `scope.on` listeners) has already finished when the call
+  returns. Awaiting is optional.
+- If an undo is async, or the effect is still resolving, then **with a running
+  event loop** the rest of the work is scheduled as a task. It happens even if
+  you never await the result, and `dispose()` waits for it. `await` the result
+  if you want to wait for it yourself. Cancelling your wait does not stop the
+  undo. Failures are recorded in `scope.errors` either way. Each wait on the
+  result is protected on its own: a timeout (`asyncio.wait_for`) or a cancel of
+  one wait never cancels another wait, so you can await the same result again
+  later, or from several tasks.
+- With **no running loop**, the rest of the work is handed back as a coroutine
+  that you must run yourself (for example with `asyncio.run(remove())`).
+- The result is something you can `await`, pass to `asyncio.run`, or wrap with
+  `asyncio.create_task`. It is a `collections.abc.Coroutine`, not necessarily a
+  native coroutine object, so ignoring it never causes a "coroutine was never
+  awaited" warning.
+- Calling a remover again does nothing. If an undo started by a remover calls
+  `await scope.dispose()` on its own scope, that call returns at once.
+
+`scope.on(event, fn, *, prepend=False, once=False)` registers an `Events`
+listener as an effect. It needs the scope to have an `Events` instance
+(`Scope(events, ...)`). Child scopes use their parent's events unless you pass
+`scope.child(name, events=other)`. The same function registered twice is two
+effects. A `once` listener that has fired no longer takes up space in the scope.
+
+## Rules
+
+1. **Reverse order, one at a time.** Undos run strictly one after the other,
+   last registered first. An async undo is awaited before the next one starts.
+   (Cordis starts async undos together, which breaks the order.)
+2. **Children first.** A child scope is an effect of its parent. Disposing a
+   parent disposes its children first, newest child first, and then the
+   parent's own effects, newest first. A child depends on the parent, so it goes
+   before what the parent set up.
+3. **One failure never stops the rest.** Every undo runs on its own. If one
+   raises, the others still run. (Cordis stops at the first error and loses the
+   rest.)
+4. **Failures are recorded, never swallowed.** `scope.errors` is a list of
+   `ScopeError` records with `scope`, `label`, `exception` and `when`
+   (`time.time()`). `scope.take_errors()` reads and clears them, and the list is
+   bounded (`Scope(max_errors=...)`, default 1000). When a child scope ends with
+   errors, its parent records a `ChildScopeErrors` entry, so they stay visible
+   after the child is gone; it holds only a count (`count`) and the text of the
+   last three errors (`recent`), so a parent does not keep the child's error
+   objects alive. Like `Events.errors`, a record keeps the exception and its
+   traceback alive until you take or clear it. `str()` of a record never
+   raises, even if the exception's own `__str__` does.
+5. **Dispose is safe to repeat.** `await scope.dispose()` a second time does
+   nothing. Calls made while the first is running wait for it. After disposal,
+   `effect`, `on` and `child` raise `ScopeDisposedError`. They also raise it
+   while the scope is being unwound.
+6. **No deadlock.** An undo may call `await scope.dispose()` on its own scope (or
+   on a parent): it returns at once. This covers the task that is unwinding and
+   every task an undo starts. It does not matter how the undo waits:
+   `await other.dispose()`, `asyncio.gather(...)`, `asyncio.create_task(...)`,
+   `asyncio.shield(...)` and `asyncio.wait_for(...)` all work, also with
+   `asyncio.eager_task_factory`. Rings are opened too. Suppose scopes whose undos
+   wait for each other's disposal (A waits for B while B waits for A, or a longer
+   ring), or a child whose undo waits for its parent while the parent waits for
+   that child. One of the waits is cut short, so that its `dispose()` call returns
+   without waiting. The rules for which one:
+   - A parent never runs its own undos before its children have finished. The
+     parent's wait for a child is never cut short, whatever else is going on.
+   - A `dispose()` call made from inside another scope's undo (an "outside" wait)
+     is the one that returns early: either at once, if it would close a ring, or
+     later, when the parent's wait for a child closes the ring. For a ring through
+     a child, that is the call the child's undo makes on its parent.
+   - A ring can close through more than one path (for example the child's undo
+     waits for its parent directly and also through a third scope). The parent's
+     wait for a child is therefore followed by a search that keeps cutting short
+     outside waits until no path leads from the child back to the parent. Each
+     round cuts a wait that was not cut before, and any path from a child up to
+     its parent has to contain an outside wait (a parent's wait for a child only
+     ever points down the tree), so the search ends and the ring is open.
+   - What is guaranteed: a ring made of waits that go through `dispose()` calls
+     (directly, or through helper tasks) cannot make the scopes hang, because
+     the bookkeeping always opens it at an outside wait; a parent never runs
+     its own undos before its children have finished; and every undo runs
+     exactly once. What is not guaranteed: that an outside `dispose()` call
+     waits. It can return early, also when the ring was not real (next
+     paragraph). A hang caused by something else, for example an undo that waits
+     forever on a gate of its own, is still a hang.
+
+   **This can return early without a real ring.** Every task that an undo starts
+   (helper tasks and also fire-and-forget background tasks) inherits the marker
+   "inside this unwind" for as long as that unwind is live, and a `dispose()` call
+   by such a task counts as a wait of the undo, even if the undo does not wait for
+   that task. So a background task started by an undo of A that awaits
+   `B.dispose()` makes A look as if it waits for B. If an outside `dispose()` call
+   would then complete a ring through A, it can return without waiting, although
+   nothing was really circular: for example B's undo calling `A.dispose()` returns
+   at once while A is still unwinding. This is the price for never hanging because
+   of the scope bookkeeping. The marker stops counting as soon as that unwind is
+   over. A task left over from an earlier unwind that calls `dispose()` later makes
+   a normal request, and so does a new scope that happens to reuse a dead scope's
+   `id()`.
+
+   An undo that tries to register a new effect gets `ScopeDisposedError`, which
+   is recorded. No lock is held while your code runs.
+7. **Nothing leaks while something is still pending.** If you dispose a scope
+   (or remove an effect) while an async effect has not resolved, the effect is
+   asked to stop once, by cancelling its task, and then disposal waits for it in
+   its place in the order. An effect that has not even started never runs. An
+   effect that stops is not undone, because it never produced an undo; an effect
+   that ignores the request and finishes anyway is undone, exactly once. So a
+   hanging effect cannot make `dispose()` hang. If an effect is not cancel-safe,
+   let it finish before you dispose (`start()` waits for the effects of setup).
+   If you dispose while an async setup is still running, what the setup already
+   registered is undone, and its next attempt to register raises
+   `ScopeDisposedError`.
+8. **Cancellation is not failure.** `asyncio.CancelledError` is never recorded
+   as an error and a real cancellation is never swallowed. Every async undo runs
+   as a task of its own, so an undo that stops another task (`t.cancel(); await t`)
+   or cancels itself does not make `dispose()` raise `CancelledError` at a caller
+   that was not cancelled: the undo's own cancellation is simply dropped. A real
+   cancellation is different. Cancelling the task that waits for `dispose()` (for
+   example `asyncio.wait_for` timing out) stops the waiting only: the
+   unwinding runs on as its own task until it is finished. Cancelling the
+   unwinding task itself cancels the undo in flight, still runs all the
+   remaining undos, and then raises the cancellation.
+9. **Other `BaseException`s.** If an undo raises something like `SystemExit` or
+   `KeyboardInterrupt`, the remaining undos still run, the scope ends `DISPOSED`,
+   and then that exception is raised from `dispose()` (or from the remover).
+   It is not recorded in `errors`.
+
+Two small conveniences: a sync or async generator returned as an undo is run to
+the end (calling a generator function does nothing by itself, and silently
+skipping it would hide a bug), and any other non-awaitable value an undo
+returns, such as `True`, is ignored.
+
+## Lifecycle
+
+| State | Meaning |
+|---|---|
+| `PENDING` | Created, setup has not finished. You can already register effects. |
+| `ACTIVE` | `start` finished without error. |
+| `FAILED` | Setup raised. Everything it registered has been undone. |
+| `DISPOSED` | Finished for good. |
+
+`await scope.start(setup=None)` runs an optional `setup(scope)` (sync or async).
+Async effects registered during setup are awaited first.
+
+- On success the scope is `ACTIVE`.
+- If setup raises, the effects registered so far are undone, the error is
+  recorded in `scope.errors`, and the scope is `FAILED`. **The exception is
+  not raised again.** One failing plugin must not crash its siblings, so you
+  check `scope.state` (or `scope.errors`) instead. A `FAILED` scope never tries
+  again by itself.
+- `await scope.restart(setup)` tries again from `FAILED` (or from `ACTIVE`, which
+  undoes everything first). It moves the scope to `PENDING` before it undoes the
+  old effects, so a cancelled restart leaves a `PENDING` scope with no effects
+  that you can `start` again, never an `ACTIVE` scope with nothing in it.
+- If setup is cancelled, what it registered is undone, the scope goes back to
+  `PENDING`, and the `CancelledError` propagates. Async effects that have not
+  resolved yet are cancelled first, so `asyncio.wait_for(scope.start(setup), 5)`
+  times out on time even if an effect never resolves (the same happens when
+  setup fails). Undos that were already registered still run to the end, so a
+  slow undo delays the timeout by its own duration and not more. An effect that
+  ignores its cancellation and resolves anyway is still undone, exactly once.
+
+If the scope has an `Events` instance, each state change is announced with a
+plain `emit`: `events.emit("scope/state", scope_name, new_state)`. A listener
+that fails is recorded by `Events` and does not affect the scope.
+
+## Health report
+
+`scope.describe()` returns plain data (safe for `json.dumps`):
+
+```python
+{
+    "name": "plugin",
+    "state": "active",
+    "closing": false,             # dispose() was requested (stays true afterwards)
+    "unwinding": false,           # undos are running right now
+    "effects": 3,                 # this scope's own effects, children not counted
+    "error_count": 0,
+    "dropped_errors": 0,          # errors discarded because the list was full
+    "recent_errors": [],          # the last few errors as text
+    "children": [ {...same shape...} ],   # live child scopes
+}
+```
+
+Very deep trees are cut off after 16 levels (`children_truncated` tells how
+many children were left out). While a disposal runs, `state` still shows the old
+state; `closing` and `unwinding` tell you it is in progress, which is what to
+look at when a scope seems stuck.
+
+## Limits
+
+- A scope is meant to be used from the event loop thread. It is not thread
+  safe.
+- The sync part of a remover and of `effect` needs no loop, but an async effect,
+  `start`, `restart` and `dispose` do.
+- A `dispose()` call made from inside another scope's undo, or from a task that
+  undo started, can return without waiting when waiting would complete a ring,
+  and this includes cases where the ring was not real because the undo never
+  waited for that task (rule 6). A parent still never runs its own undos before
+  its children have finished, and every undo still runs exactly once.
+- Every unwind starts by asking the effects that are still resolving to stop
+  (rule 7). That includes `restart()` of an `ACTIVE` scope: async effects that
+  were registered after `start` and have not finished are cancelled too.
+- Cancelling the unwinding task cancels the undo that is running at that moment
+  (the remaining undos still run, see rule 8), so an undo that was in flight can
+  be left half done. Write undos so that a cancel at any `await` is safe.
+- If an event loop is closed while a disposal is still pending, that scope is
+  stuck: its unwinding task belongs to the dead loop. Finish (or cancel and
+  await) disposals before you close the loop. `asyncio.run` does this for you,
+  because it cancels the remaining tasks, and the unwinding still runs the
+  remaining undos.
+- There is no time limit per undo. An undo that waits forever makes `dispose()`
+  wait forever (the scope then shows `closing: true, unwinding: true` in
+  `describe()`). Wrap the call in `asyncio.wait_for` if you need a time limit for
+  your own code: the unwinding continues in the background and the scope still
+  ends up clean once the undo returns. Put a timeout inside the undo if you want
+  it abandoned.
+- `dispose()` during an async setup undoes the effects registered so far at once
+  and returns while `setup()` is still running. Later `effect()` calls from that
+  setup raise `ScopeDisposedError`. A resource that setup acquired but did not
+  register with the scope is not tracked, so it would leak. This is a deliberate
+  difference from a model where dispose waits for setup to end; the maintainer
+  may decide to change it.
+- Out of scope for now: service injection, reactive reloads and context
+  isolation.

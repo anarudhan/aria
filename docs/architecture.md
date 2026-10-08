@@ -319,6 +319,12 @@ That is it. ARIA handles routing, quality scoring, trust tracking, and learning 
 
 ---
 
+## Kernel scopes: cleanup when a part is unloaded
+
+`aria.kernel.Scope` (`aria/kernel/scope.py`) records everything one part of ARIA registers (event listeners from `aria.kernel.Events`, child parts, background tasks, anything with an undo) and undoes it automatically, in reverse order and one at a time, when that part is unloaded. Children are disposed before the parent's own effects, one failing undo never stops the others, and every failure is recorded on the scope and shown by `describe()`, so unloading a plugin or a synthesized agent leaves nothing behind and nothing fails silently. A scope gives CLEANUP, not isolation or sandboxing: code in a scope still runs with the full privileges of the process. It uses only the standard library. The rules, the lifecycle and the limits are in `docs/kernel.md`.
+
+---
+
 ## Security model
 
 **What ARIA cannot do by default:**
